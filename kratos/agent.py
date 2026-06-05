@@ -125,11 +125,12 @@ Output ONLY the summary. No preamble."""
 
 # ── token predict limits ──────────────────────────────────────────────────────
 
-_PLAN_PREDICT       = 2048    # concise plan for simple tasks
-_PLAN_PREDICT_HEAVY = 4096    # complex multi-file / architecture tasks
-_CODE_PREDICT       = 16384   # up to ~2 500 lines of code
-_VERIFY_PREDICT     = 512     # short VERIFIED / NEEDS_REVISION response
-_RELAY_PREDICT      = 1200    # compact extract
+_PLAN_PREDICT        = 2048   # concise plan, no CoT
+_PLAN_PREDICT_HEAVY  = 3072   # first attempt with CoT (diagnostic route only)
+_PLAN_PREDICT_RETRY  = 6144   # retry with CoT — extra room so thinking doesn't crowd out output
+_CODE_PREDICT        = 16384  # up to ~2 500 lines of code
+_VERIFY_PREDICT      = 512    # short VERIFIED / NEEDS_REVISION response
+_RELAY_PREDICT       = 1200   # compact extract
 
 
 # ── output parsers ────────────────────────────────────────────────────────────
@@ -182,22 +183,15 @@ def _coder_scope_for(intent: Intent) -> ScopeType:
 def _needs_thinking(
     task: str, scope: ScopeType, route: Route, is_retry: bool, n_files: int
 ) -> bool:
-    """Use chain-of-thought only when the task genuinely needs it.
+    """CoT only when it genuinely helps — retries and explicit diagnostic runs.
 
-    Signals: complex scope, retry, multi-file context, long task description,
-    error/diagnostic route. Saves VRAM time on simple tasks.
+    First attempts are always fast (think=False): all context is already in the
+    prompt, so CoT adds latency without improving the plan.  On retries the model
+    needs to reason about why the previous attempt failed, so CoT is valuable.
     """
-    if is_retry:
+    if route == Route.DIAGNOSTIC_LOOP:
         return True
-    if scope in ("architecture", "diagnostic"):
-        return True
-    if route in (Route.DIAGNOSTIC_LOOP,):
-        return True
-    if n_files > 5:
-        return True
-    if len(task.split()) > 40:
-        return True
-    return False
+    return is_retry
 
 
 # ── message builders ──────────────────────────────────────────────────────────
@@ -662,7 +656,14 @@ class KratosAgent:
         needs_thinking = _needs_thinking(task, scope, route, is_retry, 0)
         planner_think: bool | None = None if needs_thinking else False
 
-        # Choose num_ctx dynamically
+        # Larger budget on retry+CoT so thinking doesn't crowd out the actual plan
+        if needs_thinking and is_retry:
+            num_predict = _PLAN_PREDICT_RETRY
+        elif needs_thinking:
+            num_predict = _PLAN_PREDICT_HEAVY
+        else:
+            num_predict = _PLAN_PREDICT
+
         prompt_msgs = [
             {"role": "system", "content": PLANNER_SYSTEM},
             *self._planner_history,
@@ -672,10 +673,9 @@ class KratosAgent:
         num_ctx = choose_num_ctx(
             model=self.config.planner_model,
             prompt_tokens=prompt_tok,
-            max_new_tokens=_PLAN_PREDICT_HEAVY if needs_thinking else _PLAN_PREDICT,
+            max_new_tokens=num_predict,
             vram_ceiling=self.config.vram_ctx_ceiling,
         )
-        # Cap at model's actual hardware max
         num_ctx = min(num_ctx, model_max_ctx(self.config.planner_model))
 
         self._auto_compress_if_needed(self._planner_history, self.config.planner_model, num_ctx)
@@ -694,13 +694,14 @@ class KratosAgent:
                 model=self.config.planner_model,
                 messages=prompt_msgs,
                 temperature=self.config.planner_temp,
-                num_predict=_PLAN_PREDICT_HEAVY if needs_thinking else _PLAN_PREDICT,
+                num_predict=num_predict,
                 num_ctx=num_ctx,
                 keep_alive=keep_alive,
                 think=planner_think,
             ):
                 if kind == "think":
                     thinking += token
+                    yield ("planner", token, "think")   # stream so user sees progress
                 elif kind == "usage":
                     self._record_usage(token)
                     yield ("usage", token, "usage")
@@ -711,6 +712,29 @@ class KratosAgent:
             yield ("warn", "Planner interrupted.", "warn")
         except Exception as exc:
             yield ("error", f"Planner failed: {exc}", "error")
+
+        # Guard: if CoT exhausted the token budget before producing any output,
+        # re-run immediately with think=False using the same prompt.
+        if not full.strip() and needs_thinking:
+            yield ("warn", "CoT used all token budget — retrying without chain-of-thought", "warn")
+            try:
+                for token, kind in self.bridge.chat(
+                    model=self.config.planner_model,
+                    messages=prompt_msgs,
+                    temperature=self.config.planner_temp,
+                    num_predict=_PLAN_PREDICT,
+                    num_ctx=num_ctx,
+                    keep_alive=keep_alive,
+                    think=False,
+                ):
+                    if kind == "usage":
+                        self._record_usage(token)
+                        yield ("usage", token, "usage")
+                    elif kind != "think":
+                        full += token
+                        yield ("planner", token, kind)
+            except Exception as exc:
+                yield ("error", f"Planner no-think retry failed: {exc}", "error")
 
         if thinking:
             yield ("log", json.dumps({"type": "model_thinking", "role": "planner",
