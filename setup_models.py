@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Kratos model setup wizard.
+"""Kratos model setup wizard — idempotent.
 
-Sets up:
-  • Planner: kratos-planner  (Phi-4-mini-abliterated-Q5_K_M, local GGUF)
-  • Coder:   huihui_ai/qwen2.5-coder-abliterate:7b-instruct-q4_K_M  (pulled from Ollama hub)
+Sets up all three abliterated models required by Kratos:
 
-Both models are abliterated (safety-filter removed), as required.
-Hardware: RTX 4050 Laptop (4 GB VRAM) — planner fits fully in VRAM,
-coder uses partial GPU offload (~20 layers on GPU, rest on CPU RAM).
+  Planner    : huihui_ai/qwen3-abliterated:8b    (pull from Ollama hub, ~5 GB)
+  Coder      : huihui_ai/qwen3.5-abliterated:4b  (pull from Ollama hub, ~3.3 GB)
+  Compressor : kratos-planner                    (local GGUF if available, else pull qwen3:8b)
+
+All models are abliterated (no safety filters).
+Hardware assumed: RTX 4050 Laptop (6 GB VRAM) — models load sequentially.
 """
 
 from __future__ import annotations
@@ -25,26 +26,19 @@ except ImportError:
     sys.exit("pip install rich")
 
 from kratos.bridge import OllamaBridge, win_to_wsl
-from kratos.ui import console  # UTF-8 / VT-enabled console
+from kratos.ui import console
 from kratos.config import (
     KratosConfig,
     PLANNER_MODEL_NAME,
     CODER_MODEL_NAME,
-    FALLBACK_CODER_MODEL,
+    COMPRESSOR_MODEL,
     ALT_PLANNER_MODEL,
     _find_planner_gguf,
 )
 
-
-PLANNER_SYSTEM = """\
-You are Kratos Planner — a strategic AI that creates structured execution plans.
-When given a task respond with a numbered list of clear, concrete, actionable steps.
-Be concise and precise. Do NOT write code. Finish with: PLAN_COMPLETE"""
-
-CODER_SYSTEM = """\
-You are Kratos Coder — an expert software engineer and technical executor.
-Implement tasks fully with clean, production-quality code.
-Be direct and complete. Never leave TODOs unimplemented."""
+COMPRESSOR_SYSTEM = """\
+You summarize conversation history and extract durable facts.
+Be concise. Output only what was asked. No preamble."""
 
 
 def _header(title: str) -> None:
@@ -52,80 +46,87 @@ def _header(title: str) -> None:
     console.print(Rule(f"[bold cyan]{title}[/bold cyan]", style="cyan"))
 
 
+def _pull(bridge: OllamaBridge, model: str, label: str) -> None:
+    console.print(f"  Pulling [bold]{model}[/bold]…  (this may take several minutes)")
+    last = ""
+    for status in bridge.pull_model(model):
+        if status != last:
+            console.print(f"  [dim]{status}[/dim]", end="\r")
+            last = status
+    console.print(f"\n[green]✓[/green]  {label} ready.")
+
+
 def setup() -> None:
     console.print(Panel.fit(
         "[bold cyan]Kratos Model Setup[/bold cyan]\n"
-        "[dim]RTX 4050 Laptop · 4 GB VRAM · WSL2 + CUDA[/dim]",
+        "[dim]All models are abliterated — no safety filters[/dim]",
         box=box.ROUNDED, border_style="cyan",
     ))
 
     bridge = OllamaBridge()
 
     # ── Start Ollama ──────────────────────────────────────────────────────────
-    _header("Starting Ollama in WSL (CUDA)")
+    _header("Starting Ollama")
     if bridge.is_running():
         console.print("[green]✓[/green]  Ollama already running.")
     else:
-        console.print("[dim]Launching Ollama in WSL…[/dim]")
+        console.print("[dim]Starting Ollama…[/dim]")
         if bridge.start():
-            console.print("[green]✓[/green]  Ollama started with CUDA.")
+            console.print("[green]✓[/green]  Ollama started.")
         else:
-            console.print("[red]✗[/red]  Could not start Ollama.")
-            console.print("  Install Ollama in WSL first:")
-            console.print("  [cyan]bash setup_wsl.sh[/cyan]  (or run it inside WSL)")
+            console.print("[red]✗[/red]  Cannot start Ollama.")
+            console.print("  Start it manually:  [cyan]ollama serve[/cyan]  then re-run.")
             sys.exit(1)
 
-    # ── Planner: create from local GGUF ──────────────────────────────────────
+    # ── Planner: huihui_ai/qwen3-abliterated:8b ───────────────────────────────
     _header(f"Planner: {PLANNER_MODEL_NAME}")
-    gguf_win = _find_planner_gguf()
-
-    if not gguf_win:
-        console.print("[red]✗[/red]  Planner GGUF not found in models/ directory.")
-        console.print("  Expected: models/Phi-4-mini-instruct-abliterated-Q5_K_M-GGUF/")
-        _offer_alt_planner(bridge)
-    elif bridge.model_exists(PLANNER_MODEL_NAME):
-        console.print(f"[green]✓[/green]  [cyan]{PLANNER_MODEL_NAME}[/cyan] already exists.")
+    if bridge.model_exists(PLANNER_MODEL_NAME):
+        console.print(f"[green]✓[/green]  [cyan]{PLANNER_MODEL_NAME}[/cyan] already installed.")
     else:
-        gguf_wsl = win_to_wsl(gguf_win)
-        console.print(f"  GGUF: [dim]{gguf_wsl}[/dim]")
-        console.print("  Creating model from GGUF (first time may take ~30 s)…")
-        for status in bridge.create_from_gguf(
-            model_name=PLANNER_MODEL_NAME,
-            gguf_win_path=gguf_win,
-            system_prompt=PLANNER_SYSTEM,
-            gpu_layers=50,   # Ollama caps at available VRAM; all 32 layers fit in 4 GB
-            ctx=4096,
-            temp=0.7,
-        ):
-            console.print(f"  [dim]{status}[/dim]", end="\r")
-        console.print(f"\n[green]✓[/green]  [cyan]{PLANNER_MODEL_NAME}[/cyan] ready.")
+        _pull(bridge, PLANNER_MODEL_NAME, f"Planner ({PLANNER_MODEL_NAME})")
 
-    # ── Coder: prefer already-installed abliterated models ────────────────────
-    # Priority: qwen3-abliterated:8b (already on disk) > NeuralDaredevil (on disk) > pull
-    effective_coder = CODER_MODEL_NAME
+    # ── Coder: huihui_ai/qwen3.5-abliterated:4b ──────────────────────────────
+    _header(f"Coder: {CODER_MODEL_NAME}")
     if bridge.model_exists(CODER_MODEL_NAME):
-        _header(f"Coder: {CODER_MODEL_NAME}")
-        console.print(f"[green]✓[/green]  [green]{CODER_MODEL_NAME}[/green] already installed — no download needed.")
-    elif bridge.model_exists(FALLBACK_CODER_MODEL):
-        effective_coder = FALLBACK_CODER_MODEL
-        _header(f"Coder: {FALLBACK_CODER_MODEL}")
-        console.print(f"[green]✓[/green]  Using [green]{FALLBACK_CODER_MODEL}[/green] (already installed, abliterated).")
+        console.print(f"[green]✓[/green]  [green]{CODER_MODEL_NAME}[/green] already installed.")
     else:
-        _header(f"Coder: {CODER_MODEL_NAME}")
-        console.print(f"  Pulling {CODER_MODEL_NAME} (~5 GB)…")
-        console.print("  [dim]This may take several minutes.[/dim]")
-        last = ""
-        for status in bridge.pull_model(CODER_MODEL_NAME):
-            if status != last:
+        _pull(bridge, CODER_MODEL_NAME, f"Coder ({CODER_MODEL_NAME})")
+
+    # ── Compressor: kratos-planner (Phi-4-mini-abliterated local GGUF) ────────
+    _header(f"Compressor: {COMPRESSOR_MODEL}")
+    if bridge.model_exists(COMPRESSOR_MODEL):
+        console.print(f"[green]✓[/green]  [magenta]{COMPRESSOR_MODEL}[/magenta] already installed.")
+    else:
+        gguf_win = _find_planner_gguf()
+        if gguf_win:
+            console.print(f"  Creating from local GGUF: [dim]{gguf_win}[/dim]")
+            for status in bridge.create_from_gguf(
+                model_name=COMPRESSOR_MODEL,
+                gguf_win_path=gguf_win,
+                system_prompt=COMPRESSOR_SYSTEM,
+                gpu_layers=50,
+                ctx=8192,
+                temp=0.3,
+            ):
                 console.print(f"  [dim]{status}[/dim]", end="\r")
-                last = status
-        console.print(f"\n[green]✓[/green]  [green]{CODER_MODEL_NAME}[/green] ready.")
+            console.print(f"\n[green]✓[/green]  [magenta]{COMPRESSOR_MODEL}[/magenta] created.")
+        else:
+            console.print(
+                f"  [yellow]⚠[/yellow]  GGUF not found in models/ — "
+                f"using [cyan]{ALT_PLANNER_MODEL}[/cyan] as compressor instead."
+            )
+            if not bridge.model_exists(ALT_PLANNER_MODEL):
+                _pull(bridge, ALT_PLANNER_MODEL, "Compressor (fallback)")
+            # Save alt model name so config uses it
+            global _effective_compressor
+            _effective_compressor = ALT_PLANNER_MODEL
 
     # ── Save config ───────────────────────────────────────────────────────────
     _header("Saving configuration")
     cfg = KratosConfig.load()
-    cfg.planner_model = PLANNER_MODEL_NAME
-    cfg.coder_model = effective_coder
+    cfg.planner_model    = PLANNER_MODEL_NAME
+    cfg.coder_model      = CODER_MODEL_NAME
+    cfg.compressor_model = globals().get("_effective_compressor", COMPRESSOR_MODEL)
     cfg_path = cfg.save("project")
     console.print(f"[green]✓[/green]  Config saved: [dim]{cfg_path}[/dim]")
 
@@ -133,35 +134,16 @@ def setup() -> None:
     console.print()
     console.print(Panel.fit(
         "[bold green]✓  Setup complete![/bold green]\n\n"
-        "Start Kratos:  [cyan]python kratos.py[/cyan]\n\n"
-        f"  Planner : [cyan]{PLANNER_MODEL_NAME}[/cyan]  (Phi-4-mini-abliterated Q5_K_M)\n"
-        f"  Coder   : [green]{effective_coder}[/green]\n\n"
-        "Both models are abliterated — no safety filters.",
+        "Start Kratos:  [cyan]kratos[/cyan]  (or [cyan]python kratos.py[/cyan])\n\n"
+        f"  Planner    : [cyan]{PLANNER_MODEL_NAME}[/cyan]  (qwen3-abliterated:8b, 40K ctx)\n"
+        f"  Coder      : [green]{CODER_MODEL_NAME}[/green]  (qwen3.5-abliterated:4b, 262K ctx)\n"
+        f"  Compressor : [magenta]{cfg.compressor_model}[/magenta]  (history compression)\n\n"
+        "All models are abliterated — no safety filters.",
         box=box.ROUNDED, border_style="green",
     ))
 
 
-def _offer_alt_planner(bridge: OllamaBridge) -> None:
-    """Offer to pull the alternative abliterated planner from Ollama hub."""
-    console.print()
-    console.print(f"  Alternatively, pull [cyan]{ALT_PLANNER_MODEL}[/cyan] as planner?")
-    try:
-        answer = input("  Pull qwen3-abliterated:8b as planner? [y/N] ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        answer = "n"
-    if answer == "y":
-        console.print(f"  Pulling {ALT_PLANNER_MODEL} (~5 GB)…")
-        last = ""
-        for status in bridge.pull_model(ALT_PLANNER_MODEL):
-            if status != last:
-                console.print(f"  [dim]{status}[/dim]", end="\r")
-                last = status
-        console.print(f"\n[green]✓[/green]  {ALT_PLANNER_MODEL} ready.")
-        # Patch the global for the config save
-        import kratos.config as _cfg
-        _cfg.PLANNER_MODEL_NAME = ALT_PLANNER_MODEL  # type: ignore[attr-defined]
-    else:
-        console.print("  Skipped. Edit [cyan]/models planner <name>[/cyan] in the REPL to change later.")
+_effective_compressor = COMPRESSOR_MODEL   # may be overridden during setup()
 
 
 if __name__ == "__main__":

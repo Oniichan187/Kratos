@@ -108,8 +108,12 @@ def handle(
             config.coder_model = args[1]
             config.save(scope)
             print_success(f"Coder → [green]{config.coder_model}[/green]")
+        elif args[0] == "compressor" and len(args) >= 2:
+            config.compressor_model = args[1]
+            config.save(scope)
+            print_success(f"Compressor → [magenta]{config.compressor_model}[/magenta]")
         else:
-            print_error("Usage: /models  |  /models planner <name>  |  /models coder <name>")
+            print_error("Usage: /models  |  /models planner <name>  |  /models coder <name>  |  /models compressor <name>")
 
     # ── status ────────────────────────────────────────────────────────────────
     elif cmd == "status":
@@ -236,6 +240,13 @@ def handle(
                 print_info(f"Logging: {state}")
                 if logger.log_path:
                     print_info(f"Log file: [cyan]{logger.log_path}[/cyan]")
+
+    # ── tokens ────────────────────────────────────────────────────────────────
+    elif cmd == "tokens":
+        if agent is None:
+            print_warn("Agent not available.")
+        else:
+            return config, scope, "show_tokens"
 
     # ── unknown ───────────────────────────────────────────────────────────────
     else:

@@ -1,9 +1,9 @@
-"""Ollama bridge — supports native Windows Ollama and WSL Ollama.
+"""Ollama bridge — native Windows + WSL fallback.
 
-Detects automatically which variant is running. On this machine Ollama runs
-as a native Windows process (ollama.exe / ollama app.exe), so Windows paths
-are used directly for model creation and the start() method uses the Windows
-Ollama CLI. WSL-based startup is kept as a fallback.
+chat() yields (token, kind) where kind is "think" | "text".
+After the stream it emits one final ("usage", json_str, "usage") tuple
+containing prompt_eval_count + eval_count from Ollama's done-message,
+so callers can track real token consumption.
 """
 
 from __future__ import annotations
@@ -27,7 +27,6 @@ _START_TIMEOUT = 45
 # ── Ollama runtime detection ──────────────────────────────────────────────────
 
 def _is_native_windows_ollama() -> bool:
-    """Return True if ollama.exe is available on Windows PATH."""
     return sys.platform == "win32" and shutil.which("ollama") is not None
 
 
@@ -48,7 +47,7 @@ def _run_wsl(args: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
 
 
 def win_to_wsl(win_path: str | Path) -> str:
-    """Convert C:\\... to /mnt/c/... for WSL-side Ollama (fallback only)."""
+    """Convert C:\\... to /mnt/c/... for WSL-side Ollama."""
     p = Path(win_path)
     try:
         p = p.resolve()
@@ -84,12 +83,11 @@ class OllamaBridge:
             return False
 
     def start(self) -> bool:
-        """Start Ollama. Prefers native Windows ollama.exe, falls back to WSL."""
+        """Start Ollama — prefers native Windows, falls back to WSL."""
         if self.is_running():
             return True
 
         if _is_native_windows_ollama():
-            # Native Windows — start as background process
             try:
                 subprocess.Popen(
                     ["ollama", "serve"],
@@ -100,7 +98,6 @@ class OllamaBridge:
             except Exception:
                 pass
         else:
-            # WSL fallback
             try:
                 _run_wsl(
                     ["-e", "bash", "-c",
@@ -142,12 +139,6 @@ class OllamaBridge:
         ctx: int = 4096,
         temp: float = 0.7,
     ) -> Generator[str, None, None]:
-        """Create an Ollama model from a local GGUF file.
-
-        Uses the Windows-native ``ollama create`` CLI when available
-        (the HTTP /api/create endpoint has trouble parsing Windows paths).
-        Falls back to the HTTP API with the WSL path for WSL-side Ollama.
-        """
         if _is_native_windows_ollama():
             yield from self._create_from_gguf_cli(
                 model_name, gguf_win_path, system_prompt, gpu_layers, ctx, temp
@@ -166,7 +157,6 @@ class OllamaBridge:
         ctx: int,
         temp: float,
     ) -> Generator[str, None, None]:
-        """Create via ``ollama create`` subprocess — handles Windows paths correctly."""
         lines = [f"FROM {gguf_win_path}"]
         if system_prompt:
             escaped = system_prompt.replace('"""', '\\"\\"\\"')
@@ -179,7 +169,6 @@ class OllamaBridge:
             "PARAMETER repeat_penalty 1.1",
         ]
         modelfile_content = "\n".join(lines)
-
         tmp = tempfile.NamedTemporaryFile(
             mode="w", suffix=".modelfile", delete=False, encoding="utf-8"
         )
@@ -188,18 +177,14 @@ class OllamaBridge:
             tmp.close()
             proc = subprocess.run(
                 ["ollama", "create", model_name, "-f", tmp.name],
-                capture_output=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=120,
+                capture_output=True, encoding="utf-8", errors="replace", timeout=120,
             )
             if proc.stdout:
                 for line in proc.stdout.splitlines():
                     if line.strip():
                         yield line.strip()
             if proc.returncode != 0:
-                err = proc.stderr or proc.stdout or "unknown error"
-                yield f"ERROR: {err.strip()[-200:]}"
+                yield f"ERROR: {(proc.stderr or proc.stdout or 'unknown').strip()[-200:]}"
             else:
                 yield "success"
         finally:
@@ -217,7 +202,6 @@ class OllamaBridge:
         ctx: int,
         temp: float,
     ) -> Generator[str, None, None]:
-        """Create via HTTP API (WSL Ollama with /mnt/c/... paths)."""
         lines = [f"FROM {gguf_path}"]
         if system_prompt:
             escaped = system_prompt.replace('"""', '\\"\\"\\"')
@@ -230,8 +214,7 @@ class OllamaBridge:
         r = requests.post(
             f"{self.host}/api/create",
             json={"name": model_name, "modelfile": "\n".join(lines), "stream": True},
-            stream=True,
-            timeout=300,
+            stream=True, timeout=300,
         )
         for line in r.iter_lines():
             if line:
@@ -244,12 +227,10 @@ class OllamaBridge:
                     pass
 
     def pull_model(self, name: str) -> Generator[str, None, None]:
-        """Pull a model from Ollama hub."""
         r = requests.post(
             f"{self.host}/api/pull",
             json={"name": name, "stream": True},
-            stream=True,
-            timeout=None,
+            stream=True, timeout=None,
         )
         last = ""
         for line in r.iter_lines():
@@ -259,7 +240,7 @@ class OllamaBridge:
                     status = data.get("status", "")
                     completed = data.get("completed", 0)
                     total = data.get("total", 0)
-                    msg = f"{status} {int(completed/total*100)}%" if total else status
+                    msg = f"{status} {int(completed / total * 100)}%" if total else status
                     if msg != last and msg:
                         yield msg
                         last = msg
@@ -278,44 +259,66 @@ class OllamaBridge:
         think: bool | None = None,
         keep_alive: str = "0",
     ) -> Generator[tuple[str, str], None, None]:
-        """Stream chat response tokens via /api/chat.
+        """Stream chat response.
 
-        Yields ``(token, kind)`` tuples where ``kind`` is:
-          - ``"think"``  internal reasoning tokens (Qwen3 / thinking models)
-          - ``"text"``   final response tokens
+        Yields (token, kind) where kind is "think" | "text".
+        After the last token, yields one final ("", "usage") tuple whose
+        token field is a JSON string:
+            {"prompt_tokens": N, "completion_tokens": M, "total_tokens": N+M}
+        Callers that don't care about usage can ignore tuples where kind=="usage".
         """
         options: dict = {"temperature": temperature, "num_predict": num_predict}
         if num_ctx:
             options["num_ctx"] = num_ctx
-        payload = {
+        payload: dict = {
             "model": model,
             "messages": messages,
             "stream": True,
-            "keep_alive": keep_alive,   # "0" = unload immediately after response
+            "keep_alive": keep_alive,
             "options": options,
         }
         if think is not None:
-            payload["think"] = think   # top-level field, not in options
+            payload["think"] = think
+
         r = requests.post(
             f"{self.host}/api/chat",
             json=payload,
             stream=True,
             timeout=None,
         )
+
+        prompt_tokens = 0
+        completion_tokens = 0
+
         for line in r.iter_lines():
-            if line:
-                try:
-                    data = json.loads(line)
-                    # Surface Ollama errors immediately instead of silently skipping
-                    if "error" in data:
-                        raise RuntimeError(f"Ollama: {data['error']}")
-                    if not data.get("done", False):
-                        msg = data.get("message", {})
-                        think = msg.get("thinking", "")
-                        text = msg.get("content", "")
-                        if think:
-                            yield (think, "think")
-                        if text:
-                            yield (text, "text")
-                except json.JSONDecodeError:
-                    pass
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if "error" in data:
+                raise RuntimeError(f"Ollama: {data['error']}")
+
+            if data.get("done", False):
+                # Harvest real token counts from the done-message
+                prompt_tokens     = data.get("prompt_eval_count", 0)
+                completion_tokens = data.get("eval_count", 0)
+                break
+
+            msg   = data.get("message", {})
+            think_tok = msg.get("thinking", "")
+            text_tok  = msg.get("content", "")
+            if think_tok:
+                yield (think_tok, "think")
+            if text_tok:
+                yield (text_tok, "text")
+
+        # Always emit a usage tuple so the agent can track consumption
+        usage = json.dumps({
+            "prompt_tokens":     prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens":      prompt_tokens + completion_tokens,
+        })
+        yield (usage, "usage")
