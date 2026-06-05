@@ -7,10 +7,6 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Literal
 
-# Permission levels
-# low  — read only  (index, read files, answer questions)
-# mid  — read + write (default: coder can create/overwrite files)
-# high — read + write + delete
 PermissionLevel = Literal["low", "mid", "high"]
 
 _PERMISSION_CAPS: dict[str, frozenset[str]] = {
@@ -21,34 +17,28 @@ _PERMISSION_CAPS: dict[str, frozenset[str]] = {
 
 GLOBAL_DIR = Path.home() / ".kratos"
 
-# PROJECT_DIR is always relative to CWD at runtime (wherever `kratos` was invoked).
-# Do NOT resolve at import time — this module is imported once, CWD is the project.
 def _project_dir() -> Path:
     return Path.cwd() / ".kratos"
 
-PROJECT_DIR = Path(".kratos")   # kept for backward-compat imports; use _project_dir() for new code
+PROJECT_DIR = Path(".kratos")   # backward-compat; use _project_dir() for new code
 
-_KRATOS_INSTALL_DIR = Path(__file__).resolve().parents[1]  # C:\Tools\Kratos
+_KRATOS_INSTALL_DIR = Path(__file__).resolve().parents[1]
 
-# Abliterated GGUF — path relative to install dir, not CWD
+# ── verified model names ──────────────────────────────────────────────────────
+# These are the ACTUALLY installed abliterated models (confirmed 2026-06-05).
+PLANNER_MODEL_NAME  = "huihui_ai/qwen3-abliterated:8b"
+CODER_MODEL_NAME    = "huihui_ai/qwen3.5-abliterated:4b"
+COMPRESSOR_MODEL    = "kratos-planner"         # Phi-4-mini-abliterated local GGUF
+FALLBACK_CODER_MODEL = "huihui_ai/qwen2.5-coder-abliterate:7b"
+ALT_PLANNER_MODEL   = "huihui_ai/qwen3-abliterated:8b"
+
+# GGUF for kratos-planner (Phi-4-mini-abliterated) — relative to install dir
 _PLANNER_GGUF: Path = (
     _KRATOS_INSTALL_DIR
     / "models"
     / "Phi-4-mini-instruct-abliterated-Q5_K_M-GGUF"
     / "phi-4-mini-instruct-abliterated-q5_k_m.gguf"
 )
-
-# Planner: qwen3-abliterated:8b — chain-of-thought reasoning, structured plans
-PLANNER_MODEL_NAME = "huihui_ai/qwen3-abliterated:8b"
-# Coder: qwen3.5-abliterated:4B — code changes, fixes, refactoring; fits well in 6 GB VRAM
-CODER_MODEL_NAME = "huihui_ai/qwen3.5-abliterated:4B"
-
-# Fallback coder if primary not available
-FALLBACK_CODER_MODEL = "huihui_ai/qwen2.5-coder-abliterate:7b"
-
-# Local GGUF planner (Phi-4-mini-abliterated) — registered as kratos-planner
-LOCAL_PLANNER_MODEL = "kratos-planner"
-ALT_PLANNER_MODEL = "huihui_ai/qwen3-abliterated:8b"
 
 
 def _find_planner_gguf() -> str:
@@ -64,36 +54,52 @@ def _find_planner_gguf() -> str:
 
 @dataclass
 class KratosConfig:
-    # Models
-    planner_model: str = field(default_factory=lambda: PLANNER_MODEL_NAME)
-    coder_model: str = field(default_factory=lambda: CODER_MODEL_NAME)
+    # ── Models ────────────────────────────────────────────────────────────────
+    planner_model:    str = field(default_factory=lambda: PLANNER_MODEL_NAME)
+    coder_model:      str = field(default_factory=lambda: CODER_MODEL_NAME)
+    compressor_model: str = field(default_factory=lambda: COMPRESSOR_MODEL)
     planner_gguf_win: str = field(default_factory=_find_planner_gguf)
-    # Session
-    scope: Literal["global", "project"] = "project"
-    goal: str | None = None
-    # Permission level: low=read | mid=read+write | high=read+write+delete
+
+    # ── Session ───────────────────────────────────────────────────────────────
+    scope:      Literal["global", "project"] = "project"
+    goal:       str | None = None
     permission: PermissionLevel = "mid"
-    # Ollama
+
+    # ── Ollama ────────────────────────────────────────────────────────────────
     ollama_host: str = "http://localhost:11434"
-    gpu_layers: int = 50       # let Ollama auto-cap at VRAM limit
-    context_length: int = 4096
-    # Temperatures
-    planner_temp: float = 0.7
-    coder_temp: float = 0.2
-    # Context windows (num_ctx): planner 4096–8192, coder 8192–16384
-    planner_num_ctx: int = 8192
-    coder_num_ctx: int = 16384
-    # Build / test commands (optional — enables diagnostic loop)
-    build_cmd: str | None = None
-    test_cmd: str | None = None
-    build_test_retries: int = 3
-    # Planner→Coder→Verify loop: keep going until VERIFIED or UNSOLVABLE
+    gpu_layers:  int = 50
+
+    # ── Context windows (num_ctx) ─────────────────────────────────────────────
+    # Default VRAM-safe values; choose_num_ctx() adjusts dynamically per call.
+    planner_num_ctx:    int = 12288    # qwen3:8b max=40960; 12K default is fast+safe
+    coder_num_ctx:      int = 24576    # qwen3.5:4b max=262144; 24K for normal coding
+    compressor_num_ctx: int = 8192     # Phi-4-mini max≈16K; 8K for history compression
+    relay_num_ctx:      int = 32768    # Coder in relay mode — bigger window for huge inputs
+
+    # VRAM ceiling: choose_num_ctx() will never exceed this regardless of model max.
+    # Raise this if you have more VRAM (e.g. 48576 for 12 GB GPU).
+    vram_ctx_ceiling: int = 32768
+
+    # ── Temperatures ──────────────────────────────────────────────────────────
+    planner_temp:    float = 0.6
+    coder_temp:      float = 0.15
+    compressor_temp: float = 0.3
+
+    # ── Auto-compression ──────────────────────────────────────────────────────
+    auto_compress:       bool  = True    # compress history when it overflows
+    compress_threshold:  float = 0.75   # trigger when prompt > X × num_ctx
+    relay_threshold:     float = 0.80   # trigger relay when input > X × planner_num_ctx
+    max_history_pairs:   int   = 8      # hard cap per model before forced compress
+
+    # ── Build / test / verify ─────────────────────────────────────────────────
+    build_cmd:             str | None = None
+    test_cmd:              str | None = None
+    build_test_retries:    int = 3
     max_verify_iterations: int = 10
 
-    # ── persistence ──────────────────────────────────────────────────────────
+    # ── Persistence ───────────────────────────────────────────────────────────
 
     def save(self, scope: Literal["global", "project"] = "project") -> Path:
-        # project dir is always CWD/.kratos — correct regardless of where kratos was installed
         target = GLOBAL_DIR if scope == "global" else _project_dir()
         target.mkdir(parents=True, exist_ok=True)
         cfg_file = target / "config.json"
@@ -102,11 +108,10 @@ class KratosConfig:
 
     @classmethod
     def load(cls) -> "KratosConfig":
-        """Merge global + project config; project overrides global.
+        """Merge global + project config. Project overrides global.
 
-        Global config  (~/.kratos/config.json)   — machine-wide defaults.
-        Project config (CWD/.kratos/config.json) — per-project overrides.
-        CWD is wherever `kratos` was invoked, not the install directory.
+        Global  : ~/.kratos/config.json
+        Project : CWD/.kratos/config.json  (wherever `kratos` was invoked)
         """
         merged: dict = {}
         for path in [GLOBAL_DIR / "config.json", _project_dir() / "config.json"]:
@@ -118,10 +123,10 @@ class KratosConfig:
         valid = {f for f in cls.__dataclass_fields__}
         return cls(**{k: v for k, v in merged.items() if k in valid})
 
-    # ── permission helpers ────────────────────────────────────────────────────
+    # ── Permission helpers ────────────────────────────────────────────────────
 
     def can_read(self) -> bool:
-        return True  # always
+        return True
 
     def can_write(self) -> bool:
         return "write" in _PERMISSION_CAPS.get(self.permission, _PERMISSION_CAPS["mid"])
