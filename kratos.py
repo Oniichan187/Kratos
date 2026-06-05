@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Kratos — abliterated dual-model CLI AI agent.
 
-Planner: huihui_ai/qwen3-abliterated:8b  (chain-of-thought planning, ~4.8 GB)
-Coder:   NeuralDaredevil-8B-abliterated Q4_K_M  (code generation, ~4.7 GB)
+Planner  : huihui_ai/qwen3-abliterated:8b   (chain-of-thought planning, 40K ctx)
+Coder    : huihui_ai/qwen3.5-abliterated:4b (code generation, 262K ctx)
+Compressor: kratos-planner (Phi-4-mini-abliterated, history compression)
 
-Both models are abliterated (safety-filter removed).
-Ollama runs natively on Windows; GPU offload via RTX 4050 Laptop (4 GB VRAM).
+All models are abliterated (no safety filters).
+Ollama runs natively on Windows with RTX 4050 Laptop GPU.
 
 Usage:
-    python kratos.py            # start interactive REPL
-    python kratos.py --setup    # run model setup wizard
+    python kratos.py            # interactive REPL
+    python kratos.py --setup    # model setup wizard
 """
 
 from __future__ import annotations
@@ -17,7 +18,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# Make the project root importable
 sys.path.insert(0, str(Path(__file__).parent))
 
 try:
@@ -44,46 +44,46 @@ from kratos.logger import SessionLogger
 from kratos.ui import (
     console,
     print_banner, print_error, print_info, print_warn, print_success,
-    planner_header, coder_header, verify_header, section_end,
-    route_info, direct_header, tool_call,
+    planner_header, coder_header, verify_header, relay_header, section_end,
+    route_info, direct_header, tool_call, print_usage,
 )
 
 _HISTORY_FILE = GLOBAL_DIR / "history.txt"
 _PT_STYLE = PTStyle.from_dict({
-    "prompt":                "ansicyan bold",
-    "completion-menu.completion":          "bg:#1e2a35 #aaaaaa",
-    "completion-menu.completion.current":  "bg:#0078d4 #ffffff bold",
-    "completion-menu.meta.completion":     "bg:#1e2a35 #666666",
+    "prompt":                               "ansicyan bold",
+    "completion-menu.completion":           "bg:#1e2a35 #aaaaaa",
+    "completion-menu.completion.current":   "bg:#0078d4 #ffffff bold",
+    "completion-menu.meta.completion":      "bg:#1e2a35 #666666",
     "completion-menu.meta.completion.current": "bg:#005fa3 #cccccc",
 }) if _HAS_PT else None
 
-# ── slash-command completer ───────────────────────────────────────────────────
-#
-# Structure: { "cmd": ( {sub: description, ...} | None, "short description" ) }
+# ── slash-command autocomplete tree ──────────────────────────────────────────
 _SLASH_TREE: dict[str, tuple[dict[str, str] | None, str]] = {
-    "exit":       (None,                                          "Quit Kratos"),
-    "quit":       (None,                                          "Quit Kratos"),
-    "q":          (None,                                          "Quit Kratos"),
-    "help":       (None,                                          "Show all commands"),
-    "clear":      (None,                                          "Clear screen"),
-    "status":     (None,                                          "Show status bar"),
-    "setup":      (None,                                          "Model setup info"),
-    "goal":       ({"clear": "Clear goal"},                       "Set or show goal"),
+    "exit":       (None,                                               "Quit Kratos"),
+    "quit":       (None,                                               "Quit Kratos"),
+    "q":          (None,                                               "Quit Kratos"),
+    "help":       (None,                                               "Show all commands"),
+    "clear":      (None,                                               "Clear screen"),
+    "status":     (None,                                               "Show status bar"),
+    "setup":      (None,                                               "Model setup info"),
+    "tokens":     (None,                                               "Show session token usage"),
+    "goal":       ({"clear": "Clear goal"},                            "Set or show goal"),
     "scope":      ({"global": "Machine-wide config",
                     "project": "Per-project config",
-                    "info":    "Show paths"},                     "Config file scope"),
+                    "info":    "Show paths"},                          "Config scope"),
     "permission": ({"low":  "Read only",
-                    "mid":  "Read + write  (default)",
-                    "high": "Read + write + delete"},             "Coder permission level"),
-    "models":     ({"planner": "Change planner model",
-                    "coder":   "Change coder model"},             "Model config"),
-    "index":      ({"rebuild": "Rescan project files"},           "Project file index"),
+                    "mid":  "Read + write",
+                    "high": "Read + write + delete"},                  "Coder permissions"),
+    "models":     ({"planner":    "Change planner model",
+                    "coder":      "Change coder model",
+                    "compressor": "Change compressor model"},          "Model config"),
+    "index":      ({"rebuild": "Rescan project files"},                "Project file index"),
     "memory":     ({"list":    "Show all entries",
-                    "clear":   "Clear session/project/all"},      "Persistent memory"),
-    "history":    ({"clear": "Reset conversation"},               "Conversation history"),
-    "build":      ({"clear": "Remove build command"},             "Build command for test loop"),
-    "test":       ({"clear": "Remove test command"},              "Test command for diagnostic loop"),
-    "logging":    ({"on": "Start logging session", "off": "Stop logging"}, "Session logging"),
+                    "clear":   "Clear session/project/all"},           "Persistent memory"),
+    "history":    ({"clear": "Reset conversation"},                    "Conversation history"),
+    "build":      ({"clear": "Remove build command"},                  "Build command"),
+    "test":       ({"clear": "Remove test command"},                   "Test command"),
+    "logging":    ({"on": "Start logging", "off": "Stop logging"},     "Session logging"),
 }
 
 if _HAS_PT:
@@ -92,25 +92,18 @@ if _HAS_PT:
             text = document.text_before_cursor
             if not text.startswith("/"):
                 return
-
-            # Split into command part and (optional) subcommand part
             after_slash = text[1:]
-            space_idx = after_slash.find(" ")
-
+            space_idx   = after_slash.find(" ")
             if space_idx == -1:
-                # Still typing the command name  e.g. "/per"
                 partial_cmd = after_slash.lower()
                 for name, (_, desc) in sorted(_SLASH_TREE.items()):
                     if name.startswith(partial_cmd):
                         yield Completion(
-                            "/" + name,
-                            start_position=-len(text),
-                            display=f"/{name}",
-                            display_meta=desc,
+                            "/" + name, start_position=-len(text),
+                            display=f"/{name}", display_meta=desc,
                         )
             else:
-                # Command complete, completing subcommand  e.g. "/permission m"
-                cmd = after_slash[:space_idx].lower()
+                cmd         = after_slash[:space_idx].lower()
                 partial_sub = after_slash[space_idx + 1:].lower()
                 if cmd in _SLASH_TREE:
                     subcmds, _ = _SLASH_TREE[cmd]
@@ -118,18 +111,15 @@ if _HAS_PT:
                         for sub, sub_desc in sorted(subcmds.items()):
                             if sub.startswith(partial_sub):
                                 yield Completion(
-                                    sub,
-                                    start_position=-len(partial_sub),
-                                    display=sub,
-                                    display_meta=sub_desc,
+                                    sub, start_position=-len(partial_sub),
+                                    display=sub, display_meta=sub_desc,
                                 )
-
     _COMPLETER: "Completer | None" = _SlashCompleter()
 else:
     _COMPLETER = None
 
 
-# ── input helper ─────────────────────────────────────────────────────────────
+# ── input helper ──────────────────────────────────────────────────────────────
 
 def _input(session: "PromptSession | None") -> str:
     if session and _HAS_PT:
@@ -137,159 +127,114 @@ def _input(session: "PromptSession | None") -> str:
     return input("kratos ❯ ")
 
 
-# ── file operations (auto — no confirmation needed within project scope) ──────
+# ── file operation display (agent already wrote files mid-loop) ───────────────
 
-def _apply_file_ops(
-    agent: KratosAgent, project_root: "Path", logger: "SessionLogger | None" = None
-) -> None:
-    """Apply all file writes and deletes that the coder produced.
+def _show_file_ops(agent: KratosAgent, logger: "SessionLogger | None" = None) -> None:
+    """Display and log the file operations that the agent already applied to disk.
 
-    Scope rule: operations are only executed within project_root.
-    Anything referencing paths outside is skipped with a warning.
-    No user confirmation is required — the user opened this directory as
-    their project and the coder operates inside it by design.
+    The agent writes files during the verify loop so verifier and test_cmd see
+    the updated state. This function only handles display + logging — no writes.
     """
-    from pathlib import Path as _Path
-
-    changes = agent.pending_file_changes
+    changes   = agent.pending_file_changes
     deletions = agent.pending_file_deletions
-
     if not changes and not deletions:
         return
 
     console.print()
-
     perm = agent.config.permission
 
-    # ── writes ────────────────────────────────────────────────────────────────
-    written = 0
-    if changes:
+    for rel_path, content in changes:
         if not agent.config.can_write():
             print_warn(f"Write blocked (permission={perm}). Use /permission mid or high.")
-        else:
-            for rel_path, content in changes:
-                target = (project_root / rel_path).resolve()
-                try:
-                    target.relative_to(project_root.resolve())
-                except ValueError:
-                    print_warn(f"Skipped write (outside project): {rel_path}")
-                    continue
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(content, encoding="utf-8")
-                size_str = f"{len(content.encode()) / 1024:.1f} KB"
-                tool_call(f"write_file({rel_path!r}) → {size_str}  [written]")
-                if logger:
-                    logger.log_file_write(rel_path, content)
-                written += 1
+            break
+        size_str = f"{len(content.encode()) / 1024:.1f} KB"
+        tool_call(f"write_file({rel_path!r}) → {size_str}  [applied]")
+        if logger:
+            logger.log_file_write(rel_path, content)
 
-    # ── deletes ───────────────────────────────────────────────────────────────
-    deleted = 0
-    if deletions:
+    for rel_path in deletions:
         if not agent.config.can_delete():
             print_warn(f"Delete blocked (permission={perm}). Use /permission high.")
-        else:
-            for rel_path in deletions:
-                target = (project_root / rel_path).resolve()
-                try:
-                    target.relative_to(project_root.resolve())
-                except ValueError:
-                    print_warn(f"Skipped delete (outside project): {rel_path}")
-                    continue
-                if target.exists():
-                    target.unlink()
-                    tool_call(f"delete_file({rel_path!r})  [deleted]")
-                    if logger:
-                        logger.log_file_delete(rel_path)
-                    deleted += 1
-                else:
-                    print_warn(f"Delete skipped (not found): {rel_path}")
+            break
+        tool_call(f"delete_file({rel_path!r})  [applied]")
+        if logger:
+            logger.log_file_delete(rel_path)
 
-    if written or deleted:
+    if changes or deletions:
         console.print()
 
 
 # ── coder output filter ───────────────────────────────────────────────────────
 
 class _CoderFilter:
-    """Line-buffer that shows only file-operations and the summary section.
+    """Line-buffer that shows only file-operation markers and the SUMMARY section.
 
-    The actual code content is suppressed — only these markers are printed:
-      ### FILE: path      → "Writing: path"
-      ### DELETE: path    → "Deleting: path"
-      ### SUMMARY         → show the following lines as summary
+    The raw code bodies are suppressed — the agent wrote them to disk.
+    Markers shown:
+      ### FILE: path   → "Writing: path"
+      ### DELETE: path → "Deleting: path"
+      ### SUMMARY      → show following lines as summary
     """
     def __init__(self) -> None:
-        self._buf = ""
+        self._buf        = ""
         self._in_summary = False
-        self._in_code_block = False
+        self._in_code    = False
         self._seen: set[str] = set()
 
     def feed(self, token: str) -> None:
         self._buf += token
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
-            self._process_line(line)
+            self._process(line)
 
     def flush(self) -> None:
         if self._buf.strip():
-            self._process_line(self._buf)
+            self._process(self._buf)
         self._buf = ""
 
-    def _process_line(self, line: str) -> None:
-        stripped = line.strip()
-
-        if stripped.startswith("### FILE:"):
-            path = stripped[9:].strip()
+    def _process(self, line: str) -> None:
+        s = line.strip()
+        if s.startswith("### FILE:"):
+            path = s[9:].strip()
             if path and path not in self._seen:
                 self._seen.add(path)
                 tool_call(f"write_file({path!r})")
             self._in_summary = False
-            self._in_code_block = False
-            return
-
-        if stripped.startswith("### DELETE:"):
-            path = stripped[11:].strip()
+            self._in_code    = False
+        elif s.startswith("### DELETE:"):
+            path = s[11:].strip()
             if path:
                 tool_call(f"delete_file({path!r})")
             self._in_summary = False
-            self._in_code_block = False
-            return
-
-        if stripped.startswith("### SUMMARY"):
+            self._in_code    = False
+        elif s.startswith("### SUMMARY"):
             self._in_summary = True
-            self._in_code_block = False
+            self._in_code    = False
             console.print()
             console.print("[dim]  Summary:[/dim]")
-            return
-
-        if stripped.startswith("```"):
-            self._in_code_block = not self._in_code_block
-
-        if self._in_summary and not self._in_code_block and stripped:
-            console.print(f"  [dim]{stripped}[/dim]", highlight=False)
+        elif s.startswith("```"):
+            self._in_code = not self._in_code
+        elif self._in_summary and not self._in_code and s:
+            console.print(f"  [dim]{s}[/dim]", highlight=False)
 
 
 # ── agent streaming ───────────────────────────────────────────────────────────
 
-def _stream_agent(
-    agent: KratosAgent, task: str, logger: "SessionLogger"
-) -> None:
-    """Run intelligent pipeline and print streaming output with Rich UI."""
-
-    coder_filter = _CoderFilter()
+def _stream_agent(agent: KratosAgent, task: str, logger: "SessionLogger") -> None:
+    """Run the pipeline and render streaming output via Rich."""
+    coder_filter  = _CoderFilter()
     current_section: str | None = None
-    planner_buf = ""
-    coder_buf = ""
+    planner_buf  = ""
+    coder_buf    = ""
 
     try:
         for source, content, kind in agent.process(task):
 
             if source == "log":
-                # Internal log event from agent — write to file only, no display
                 if logger.enabled:
                     try:
                         import json as _json
-                        data = _json.loads(content)
+                        data       = _json.loads(content)
                         event_type = data.pop("type", "unknown")
                         logger._write(event_type, **data)
                     except Exception:
@@ -298,17 +243,13 @@ def _stream_agent(
             elif source == "router":
                 route_info(content)
                 parts = dict(p.split("=", 1) for p in content.split("  ") if "=" in p)
-                logger.log_route(
-                    intent=parts.get("intent", ""),
-                    route=parts.get("route", ""),
-                )
+                logger.log_route(intent=parts.get("intent", ""), route=parts.get("route", ""))
 
             elif source == "tool":
                 tool_call(content)
-                # Parse name(args) format for structured logging
                 if "(" in content:
-                    name = content[:content.index("(")]
-                    args_str = content[content.index("(")+1:content.rindex(")")]
+                    name     = content[:content.index("(")]
+                    args_str = content[content.index("(") + 1:content.rindex(")")]
                     logger.log_tool(name=name, args={"raw": args_str},
                                     result=content.split("→")[-1].strip() if "→" in content else "")
                 else:
@@ -322,6 +263,8 @@ def _stream_agent(
                     coder_header(agent.config.coder_model)
                 elif content == "verify":
                     verify_header(agent.config.planner_model)
+                elif content == "relay":
+                    relay_header(agent.config.coder_model)
 
             elif source == "planner":
                 if kind == "think":
@@ -331,7 +274,6 @@ def _stream_agent(
                     console.print(content, end="", highlight=False)
 
             elif source == "verify":
-                # Show verifier output — it's short (VERIFIED / NEEDS_REVISION)
                 if kind == "think":
                     console.print(content, end="", style="dim italic", highlight=False)
                 else:
@@ -344,10 +286,22 @@ def _stream_agent(
                     coder_buf += content
                     coder_filter.feed(content)
 
+            elif source == "relay":
+                pass   # relay output not shown (internal pre-processing)
+
             elif source == "direct":
                 direct_header()
                 console.print(content, highlight=False)
                 section_end()
+
+            elif source == "usage":
+                # Token usage emitted by bridge after each model call
+                try:
+                    import json as _json
+                    d = _json.loads(content)
+                    logger._write("token_usage", **d)
+                except Exception:
+                    pass
 
             elif source == "end":
                 if current_section == "planner" and planner_buf:
@@ -359,7 +313,7 @@ def _stream_agent(
                         logger.log_model_output("coder", agent.config.coder_model, coder_buf)
                     coder_buf = ""
                 elif current_section == "verify":
-                    console.print()   # newline after VERIFIED / NEEDS_REVISION
+                    console.print()
                 section_end()
                 current_section = None
 
@@ -384,33 +338,41 @@ def _stream_agent(
         print_warn("Interrupted.")
         return
 
-    # Auto-apply all file operations after streaming completes
-    _apply_file_ops(agent, agent.indexer.root, logger)
+    # Show which files the agent already wrote mid-loop
+    _show_file_ops(agent, logger)
+
+    # Show session token usage after each task
+    usage = agent.session_usage
+    if usage.get("total_tokens", 0) > 0:
+        print_usage(usage["prompt_tokens"], usage["completion_tokens"])
 
 
 # ── startup checks ────────────────────────────────────────────────────────────
 
 def _ensure_ready(bridge: OllamaBridge, config: KratosConfig) -> bool:
-    print_info("Connecting to Ollama (WSL + CUDA)…")
+    print_info("Connecting to Ollama…")
     if bridge.is_running():
         print_success("Ollama ready.")
     else:
-        print_info("Starting Ollama in WSL…")
+        print_info("Starting Ollama…")
         if bridge.start():
             print_success("Ollama started.")
         else:
             print_warn(
                 "Cannot reach Ollama. Start it manually:\n"
-                "  wsl -e bash -c 'OLLAMA_HOST=0.0.0.0 ollama serve &'\n"
+                "  ollama serve\n"
                 "Then re-run Kratos."
             )
             return False
 
     missing = []
-    if not bridge.model_exists(config.planner_model):
-        missing.append(f"[cyan]{config.planner_model}[/cyan] (planner)")
-    if not bridge.model_exists(config.coder_model):
-        missing.append(f"[green]{config.coder_model}[/green] (coder)")
+    for model, role in [
+        (config.planner_model,    "planner"),
+        (config.coder_model,      "coder"),
+        (config.compressor_model, "compressor"),
+    ]:
+        if not bridge.model_exists(model):
+            missing.append(f"{model} ({role})")
     if missing:
         print_warn("Missing models: " + ", ".join(missing))
         print_info("Run [cyan]python setup_models.py[/cyan] to install them.")
@@ -422,10 +384,10 @@ def _ensure_ready(bridge: OllamaBridge, config: KratosConfig) -> bool:
 
 def main() -> None:
     config = KratosConfig.load()
-    scope = config.scope or "project"
+    scope  = config.scope or "project"
 
     bridge = OllamaBridge(config.ollama_host)
-    agent = KratosAgent(config, bridge)
+    agent  = KratosAgent(config, bridge)
 
     from pathlib import Path as _Path
     from kratos.config import _project_dir
@@ -439,7 +401,6 @@ def main() -> None:
     print_info("Enter your task, or [cyan]/help[/cyan] for commands.  [dim]/exit[/dim] to quit.")
     console.print()
 
-    # Setup prompt_toolkit session with history + slash-command autocomplete
     session = None
     if _HAS_PT:
         GLOBAL_DIR.mkdir(parents=True, exist_ok=True)
@@ -447,7 +408,7 @@ def main() -> None:
             history=FileHistory(str(_HISTORY_FILE)),
             auto_suggest=AutoSuggestFromHistory(),
             completer=_COMPLETER,
-            complete_while_typing=True,  # dropdown opens the moment "/" is typed
+            complete_while_typing=True,
         )
 
     while True:
@@ -477,9 +438,11 @@ def main() -> None:
                 print_success("Conversation history cleared.")
             elif signal == "clear_screen":
                 console.clear()
+            elif signal == "show_tokens":
+                usage = agent.session_usage
+                print_usage(usage["prompt_tokens"], usage["completion_tokens"])
             continue
 
-        # Normal task → run agent pipeline
         logger.log_input(line)
         try:
             _stream_agent(agent, line, logger)

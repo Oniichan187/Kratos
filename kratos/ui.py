@@ -140,6 +140,11 @@ def verify_header(model: str) -> None:
     console.print(Rule(f"[bold yellow]◈  VERIFY  ·  {model}[/bold yellow]", style="yellow"))
 
 
+def relay_header(model: str) -> None:
+    console.print()
+    console.print(Rule(f"[bold magenta]◈  RELAY  ·  {model}[/bold magenta]", style="magenta"))
+
+
 def section_end() -> None:
     console.print()
 
@@ -183,14 +188,16 @@ def print_help() -> None:
         ("/permission mid",               "Read + write (default)"),
         ("/permission high",              "Read + write + delete"),
         ("/models",                       "Show configured models"),
-        ("/models planner <name>",        "Change planner model"),
+        ("/models planner <name>",         "Change planner model"),
         ("/models coder <name>",          "Change coder model"),
+        ("/models compressor <name>",     "Change compressor model"),
         ("/index",                        "Show indexed project files"),
         ("/index rebuild",                "Rescan project directory"),
         ("/memory list",                  "Show all memory entries"),
         ("/memory clear [session|project|all]", "Clear memory tier"),
         ("/build [cmd]",                  "Set or show build command"),
         ("/test [cmd]",                   "Set or show test command"),
+        ("/tokens",                        "Show session token usage"),
         ("/status",                       "Show current status bar"),
         ("/history clear",                "Reset conversation history + session memory"),
         ("/clear",                        "Clear screen"),
@@ -228,6 +235,15 @@ def show_permission_level(level: str) -> None:
             f"[{'white' if lvl == level else 'dim'}]{desc}[/{'white' if lvl == level else 'dim'}]",
         )
     console.print(Panel(table, title=f"[bold]Permission[/bold]  current=[bold]{level}[/bold]", border_style="dim", box=box.ROUNDED))
+
+
+def print_usage(prompt_tokens: int, completion_tokens: int) -> None:
+    total = prompt_tokens + completion_tokens
+    console.print(
+        f"  [dim]tokens  prompt=[cyan]{prompt_tokens:,}[/cyan]  "
+        f"completion=[green]{completion_tokens:,}[/green]  "
+        f"total=[bold]{total:,}[/bold][/dim]"
+    )
 
 
 def show_models(planner: str, coder: str) -> None:
