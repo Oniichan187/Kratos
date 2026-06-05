@@ -78,7 +78,7 @@ BANNER = r"""
 
 def print_banner(planner: str, coder: str, scope: str, permission: str = "mid") -> None:
     console.print(Align.center(Text(BANNER, style="bold cyan")))
-    console.print(Align.center(Text("CLI AI Agent  v2.0  —  local coding agent", style="dim")))
+    console.print(Align.center(Text("CLI AI Agent  v3.0  —  local abliterated coding agent", style="dim")))
     console.print()
     _status_line(planner, coder, scope, permission)
     console.print()
