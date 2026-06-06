@@ -22,6 +22,20 @@ from .ui import (
 )
 
 
+def _ctx_display(config: KratosConfig) -> dict[str, int]:
+    d = {
+        "planner": config.planner_num_ctx,
+        "coder": config.coder_num_ctx,
+        "verifier": config.verifier_num_ctx,
+        "compressor": config.compressor_num_ctx,
+        "relay": config.relay_num_ctx,
+        "vram_cap": config.vram_ctx_ceiling,
+    }
+    if getattr(config, "always_max_ctx", True):
+        d["max_policy"] = 1  # signal in show
+    return d
+
+
 def handle(
     line: str,
     config: KratosConfig,
@@ -99,25 +113,74 @@ def handle(
     # ── models ────────────────────────────────────────────────────────────────
     elif cmd == "models":
         if not args:
-            show_models(config.planner_model, config.coder_model)
+            show_models(
+                config.planner_model,
+                config.coder_model,
+                verifier=config.verifier_model,
+                compressor=config.compressor_model,
+                ctx=_ctx_display(config),
+            )
         elif args[0] == "planner" and len(args) >= 2:
             config.planner_model = args[1]
             config.save(scope)
             print_success(f"Planner → [cyan]{config.planner_model}[/cyan]")
+            refresh_status(config.planner_model, config.coder_model, scope, config.permission, config.goal, verifier=config.verifier_model, compressor=config.compressor_model, ctx=_ctx_display(config))
         elif args[0] == "coder" and len(args) >= 2:
             config.coder_model = args[1]
             config.save(scope)
             print_success(f"Coder → [green]{config.coder_model}[/green]")
+            refresh_status(config.planner_model, config.coder_model, scope, config.permission, config.goal, verifier=config.verifier_model, compressor=config.compressor_model, ctx=_ctx_display(config))
+        elif args[0] == "verifier" and len(args) >= 2:
+            config.verifier_model = args[1]
+            config.save(scope)
+            print_success(f"Verifier → [yellow]{config.verifier_model}[/yellow]")
+            refresh_status(config.planner_model, config.coder_model, scope, config.permission, config.goal, verifier=config.verifier_model, compressor=config.compressor_model, ctx=_ctx_display(config))
         elif args[0] == "compressor" and len(args) >= 2:
             config.compressor_model = args[1]
             config.save(scope)
             print_success(f"Compressor → [magenta]{config.compressor_model}[/magenta]")
+            refresh_status(config.planner_model, config.coder_model, scope, config.permission, config.goal, verifier=config.verifier_model, compressor=config.compressor_model, ctx=_ctx_display(config))
         else:
-            print_error("Usage: /models  |  /models planner <name>  |  /models coder <name>  |  /models compressor <name>")
+            print_error("Usage: /models  |  /models planner|coder|verifier|compressor <name>")
+
+    # ── prompts (JSON externalized systems + snippets; /prompts reload after edit) ─
+    elif cmd == "prompts":
+        from .prompts import load_prompts, reload_prompts
+        pm = load_prompts()
+        if not args or args[0] in ("list", "show"):
+            from .ui import show_prompts
+            show_prompts(pm)
+            print_info("Override files checked: ~/.kratos/prompts.json then ./.kratos/prompts.json")
+            print_info("Use /prompts dump or /prompts reload")
+        elif args[0] == "reload":
+            reload_prompts()
+            if agent is not None:
+                # Rebind so this agent instance sees the fresh manager (with cached overrides)
+                try:
+                    agent.prompts = load_prompts()
+                except Exception:
+                    pass
+            print_success("Prompts reloaded from disk (next LLM calls will use updates).")
+        elif args[0] == "dump":
+            target = args[1] if len(args) > 1 else ".kratos/prompts.json"
+            from pathlib import Path as _P
+            out = pm.dump_defaults(_P(target))
+            print_success(f"Dumped defaults to {out} — edit and /prompts reload")
+        else:
+            print_error("Usage: /prompts [list|reload|dump [path]]")
 
     # ── status ────────────────────────────────────────────────────────────────
     elif cmd == "status":
-        refresh_status(config.planner_model, config.coder_model, scope, config.permission, config.goal)
+        refresh_status(
+            config.planner_model,
+            config.coder_model,
+            scope,
+            config.permission,
+            config.goal,
+            verifier=config.verifier_model,
+            compressor=config.compressor_model,
+            ctx=_ctx_display(config),
+        )
 
     # ── history ───────────────────────────────────────────────────────────────
     elif cmd == "history":

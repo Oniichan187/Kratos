@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Kratos model setup wizard — idempotent.
 
-Sets up all three abliterated models required by Kratos:
+Sets up all FOUR abliterated models (max-context, play perfectly together):
 
-  Planner    : huihui_ai/qwen3-abliterated:8b    (pull from Ollama hub, ~5 GB)
-  Coder      : huihui_ai/qwen3.5-abliterated:4b  (pull from Ollama hub, ~3.3 GB)
-  Compressor : kratos-planner                    (local GGUF if available, else pull qwen3:8b)
+  Planner    : huihui_ai/qwen3-abliterated:8b    (reasoning + plans, 40K full ctx)
+  Coder      : huihui_ai/qwen3.5-abliterated:4b  (implementation, 262K full ctx — giant repo capable)
+  Verifier   : huihui_ai/qwen3-abliterated:8b    (strict step-by-step PROVEN_WORK judge)
+  Compressor : kratos-planner                    (Phi-4-mini-abliterated GGUF) — LOSSLESS .kratos memory + history
 
 All models are abliterated (no safety filters).
-Hardware assumed: RTX 4050 Laptop (6 GB VRAM) — models load sequentially.
+Kratos forces MAXIMUM context window on every single call to every model.
+Hardware: laptop (RTX 4050 6 GB class) — roles load sequentially, never simultaneous.
 """
 
 from __future__ import annotations
@@ -31,14 +33,17 @@ from kratos.config import (
     KratosConfig,
     PLANNER_MODEL_NAME,
     CODER_MODEL_NAME,
+    VERIFIER_MODEL_NAME,
     COMPRESSOR_MODEL,
     ALT_PLANNER_MODEL,
     _find_planner_gguf,
 )
 
-COMPRESSOR_SYSTEM = """\
-You summarize conversation history and extract durable facts.
-Be concise. Output only what was asked. No preamble."""
+from kratos.prompts import get_system
+
+# COMPRESSOR_SYSTEM for the GGUF modelfile bake is now loaded from the central prompts JSON
+# (key "compressor_model_system"). This keeps it in sync with runtime prompts and editable.
+COMPRESSOR_SYSTEM = get_system("compressor_model_system")
 
 
 def _header(title: str) -> None:
@@ -78,22 +83,29 @@ def setup() -> None:
             console.print("  Start it manually:  [cyan]ollama serve[/cyan]  then re-run.")
             sys.exit(1)
 
-    # ── Planner: huihui_ai/qwen3-abliterated:8b ───────────────────────────────
+    # ── Planner (reasoning) ──────────────────────────────────────────────────
     _header(f"Planner: {PLANNER_MODEL_NAME}")
     if bridge.model_exists(PLANNER_MODEL_NAME):
         console.print(f"[green]✓[/green]  [cyan]{PLANNER_MODEL_NAME}[/cyan] already installed.")
     else:
         _pull(bridge, PLANNER_MODEL_NAME, f"Planner ({PLANNER_MODEL_NAME})")
 
-    # ── Coder: huihui_ai/qwen3.5-abliterated:4b ──────────────────────────────
+    # ── Coder (huge-ctx implementation) ──────────────────────────────────────
     _header(f"Coder: {CODER_MODEL_NAME}")
     if bridge.model_exists(CODER_MODEL_NAME):
         console.print(f"[green]✓[/green]  [green]{CODER_MODEL_NAME}[/green] already installed.")
     else:
         _pull(bridge, CODER_MODEL_NAME, f"Coder ({CODER_MODEL_NAME})")
 
-    # ── Compressor: kratos-planner (Phi-4-mini-abliterated local GGUF) ────────
-    _header(f"Compressor: {COMPRESSOR_MODEL}")
+    # ── Verifier (same strong ablit model — strict judge) ────────────────────
+    _header(f"Verifier: {VERIFIER_MODEL_NAME}")
+    if bridge.model_exists(VERIFIER_MODEL_NAME):
+        console.print(f"[green]✓[/green]  [yellow]{VERIFIER_MODEL_NAME}[/yellow] already installed.")
+    else:
+        _pull(bridge, VERIFIER_MODEL_NAME, f"Verifier ({VERIFIER_MODEL_NAME})")
+
+    # ── Compressor / Auto-Composer (lossless memory in .kratos) ──────────────
+    _header(f"Compressor (auto-composer): {COMPRESSOR_MODEL}")
     if bridge.model_exists(COMPRESSOR_MODEL):
         console.print(f"[green]✓[/green]  [magenta]{COMPRESSOR_MODEL}[/magenta] already installed.")
     else:
@@ -105,7 +117,7 @@ def setup() -> None:
                 gguf_win_path=gguf_win,
                 system_prompt=COMPRESSOR_SYSTEM,
                 gpu_layers=50,
-                ctx=8192,
+                ctx=32768,  # max-ctx friendly
                 temp=0.3,
             ):
                 console.print(f"  [dim]{status}[/dim]", end="\r")
@@ -117,7 +129,6 @@ def setup() -> None:
             )
             if not bridge.model_exists(ALT_PLANNER_MODEL):
                 _pull(bridge, ALT_PLANNER_MODEL, "Compressor (fallback)")
-            # Save alt model name so config uses it
             global _effective_compressor
             _effective_compressor = ALT_PLANNER_MODEL
 
@@ -126,6 +137,7 @@ def setup() -> None:
     cfg = KratosConfig.load()
     cfg.planner_model    = PLANNER_MODEL_NAME
     cfg.coder_model      = CODER_MODEL_NAME
+    cfg.verifier_model   = VERIFIER_MODEL_NAME
     cfg.compressor_model = globals().get("_effective_compressor", COMPRESSOR_MODEL)
     cfg_path = cfg.save("project")
     console.print(f"[green]✓[/green]  Config saved: [dim]{cfg_path}[/dim]")
@@ -135,10 +147,12 @@ def setup() -> None:
     console.print(Panel.fit(
         "[bold green]✓  Setup complete![/bold green]\n\n"
         "Start Kratos:  [cyan]kratos[/cyan]  (or [cyan]python kratos.py[/cyan])\n\n"
-        f"  Planner    : [cyan]{PLANNER_MODEL_NAME}[/cyan]  (qwen3-abliterated:8b, 40K ctx)\n"
-        f"  Coder      : [green]{CODER_MODEL_NAME}[/green]  (qwen3.5-abliterated:4b, 262K ctx)\n"
-        f"  Compressor : [magenta]{cfg.compressor_model}[/magenta]  (history compression)\n\n"
-        "All models are abliterated — no safety filters.",
+        f"  Planner    : [cyan]{PLANNER_MODEL_NAME}[/cyan]   (full 40K ctx every call)\n"
+        f"  Coder      : [green]{CODER_MODEL_NAME}[/green]   (full 262K — stepwise per plan item + test)\n"
+        f"  Verifier   : [yellow]{VERIFIER_MODEL_NAME}[/yellow]   (full 40K — every test + step proven)\n"
+        f"  Compressor : [magenta]{cfg.compressor_model}[/magenta] (lossless .kratos memory, max ctx)\n\n"
+        "All models abliterated. Prompts live in JSON (edit .kratos/prompts.json or ~/.kratos/prompts.json).\n"
+        "Every call uses MAX context window. The prompt *flow* is fully programmed.",
         box=box.ROUNDED, border_style="green",
     ))
 

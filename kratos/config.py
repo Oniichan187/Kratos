@@ -25,10 +25,18 @@ PROJECT_DIR = Path(".kratos")   # backward-compat; use _project_dir() for new co
 _KRATOS_INSTALL_DIR = Path(__file__).resolve().parents[1]
 
 # ── verified model names ──────────────────────────────────────────────────────
-# These are the ACTUALLY installed abliterated models (confirmed 2026-06-05).
+# All models MUST be abliterated (uncensored, no safety filters).
+# These are strong abliterated models that play well together on a laptop
+# (RTX 4050 6 GB class, sequential loading only — never all in VRAM at once).
+# Each role uses the *best suitable* abliterated model for its job:
+#   Planner   : strong reasoning + CoT (8b class, 40k native)
+#   Coder     : huge context (262k) + solid coding, small enough for laptop
+#   Verifier  : same strong reasoning as planner (strict PROVEN_WORK judge)
+#   Compressor: tiny but faithful summarizer/memory extractor (Phi-4-mini ablit)
 PLANNER_MODEL_NAME  = "huihui_ai/qwen3-abliterated:8b"
 CODER_MODEL_NAME    = "huihui_ai/qwen3.5-abliterated:4b"
-COMPRESSOR_MODEL    = "kratos-planner"         # Phi-4-mini-abliterated local GGUF
+VERIFIER_MODEL_NAME = "huihui_ai/qwen3-abliterated:8b"
+COMPRESSOR_MODEL    = "kratos-planner"         # Phi-4-mini-instruct-abliterated GGUF
 FALLBACK_CODER_MODEL = "huihui_ai/qwen2.5-coder-abliterate:7b"
 ALT_PLANNER_MODEL   = "huihui_ai/qwen3-abliterated:8b"
 
@@ -57,6 +65,7 @@ class KratosConfig:
     # ── Models ────────────────────────────────────────────────────────────────
     planner_model:    str = field(default_factory=lambda: PLANNER_MODEL_NAME)
     coder_model:      str = field(default_factory=lambda: CODER_MODEL_NAME)
+    verifier_model:   str = field(default_factory=lambda: VERIFIER_MODEL_NAME)
     compressor_model: str = field(default_factory=lambda: COMPRESSOR_MODEL)
     planner_gguf_win: str = field(default_factory=_find_planner_gguf)
 
@@ -70,19 +79,27 @@ class KratosConfig:
     gpu_layers:  int = 50
 
     # ── Context windows (num_ctx) ─────────────────────────────────────────────
-    # Default VRAM-safe values; choose_num_ctx() adjusts dynamically per call.
-    planner_num_ctx:    int = 12288    # qwen3:8b max=40960; 12K default is fast+safe
-    coder_num_ctx:      int = 24576    # qwen3.5:4b max=262144; 24K for normal coding
-    compressor_num_ctx: int = 8192     # Phi-4-mini max≈16K; 8K for history compression
-    relay_num_ctx:      int = 32768    # Coder in relay mode — bigger window for huge inputs
+    # KRATOS ALWAYS USES THE MAXIMUM CONTEXT WINDOW THE MODEL SUPPORTS
+    # (capped only by vram_ctx_ceiling). This is intentional:
+    # every planner, coder, verifier and compressor call gets the full window.
+    # This is required for huge projects that massively exceed "normal" ctx,
+    # and for the coder/verifier to see complete plans + full file state + memory.
+    # choose_num_ctx(..., force_max_context=True) implements this.
+    planner_num_ctx:    int = 40960    # full max for huihui_ai/qwen3-abliterated:8b
+    coder_num_ctx:      int = 262144   # full max for huihui_ai/qwen3.5-abliterated:4b (huge-repo hero)
+    verifier_num_ctx:   int = 40960    # full max — same strong ablit model as planner
+    compressor_num_ctx: int = 32768    # generous for kratos-planner (Phi-4-mini-abliterated). Use its real max when known
+    relay_num_ctx:      int = 131072   # coder relay gets big window for giant inputs before planner sees them
 
-    # VRAM ceiling: choose_num_ctx() will never exceed this regardless of model max.
-    # Raise this if you have more VRAM (e.g. 48576 for 12 GB GPU).
-    vram_ctx_ceiling: int = 32768
+    # VRAM ceiling: hard cap for all roles even if model advertises more.
+    # On 6 GB laptop keep conservative; raise on bigger cards.
+    # The "always max" policy still respects this.
+    vram_ctx_ceiling: int = 65536
 
     # ── Temperatures ──────────────────────────────────────────────────────────
     planner_temp:    float = 0.6
     coder_temp:      float = 0.15
+    verifier_temp:   float = 0.15
     compressor_temp: float = 0.3
 
     # ── Auto-compression ──────────────────────────────────────────────────────
@@ -91,13 +108,24 @@ class KratosConfig:
     relay_threshold:     float = 0.80   # trigger relay when input > X × planner_num_ctx
     max_history_pairs:   int   = 8      # hard cap per model before forced compress
 
+    # ── Max-context policy (user requirement) ─────────────────────────────────
+    # When True (default), planner/coder/verifier/compressor ALWAYS receive
+    # the model's full context window (within vram cap). No "small prompt = small ctx".
+    always_max_ctx: bool = True
+
     # ── Build / test / verify ─────────────────────────────────────────────────
     build_cmd:             str | None = None
     test_cmd:              str | None = None
     build_test_retries:    int = 3
     max_verify_iterations: int = 10
+    auto_discover_verification: bool = True
+    require_proven_work:        bool = True
+    require_test_for_verified:  bool = True
+    verification_timeout_seconds: int = 120
 
     # ── Persistence ───────────────────────────────────────────────────────────
+    # Prompts are loaded independently via kratos/prompts.py (same GLOBAL_DIR / _project_dir pattern).
+    # See .kratos/prompts.json or ~/.kratos/prompts.json for system prompts + snippets (edit + /prompts reload).
 
     def save(self, scope: Literal["global", "project"] = "project") -> Path:
         target = GLOBAL_DIR if scope == "global" else _project_dir()
@@ -121,7 +149,21 @@ class KratosConfig:
                 except (json.JSONDecodeError, OSError):
                     pass
         valid = {f for f in cls.__dataclass_fields__}
-        return cls(**{k: v for k, v in merged.items() if k in valid})
+        inst = cls(**{k: v for k, v in merged.items() if k in valid})
+
+        # Enforce "use maximum context window for every model" when requested.
+        # This upgrades old/small saved configs automatically to the model's true max.
+        if getattr(inst, "always_max_ctx", True):
+            try:
+                from .tokens import model_max_ctx
+                inst.planner_num_ctx = max(inst.planner_num_ctx, model_max_ctx(inst.planner_model))
+                inst.coder_num_ctx = max(inst.coder_num_ctx, model_max_ctx(inst.coder_model))
+                inst.verifier_num_ctx = max(inst.verifier_num_ctx, model_max_ctx(inst.verifier_model))
+                inst.compressor_num_ctx = max(inst.compressor_num_ctx, model_max_ctx(inst.compressor_model))
+                inst.relay_num_ctx = max(inst.relay_num_ctx, 65536)
+            except Exception:
+                pass
+        return inst
 
     # ── Permission helpers ────────────────────────────────────────────────────
 

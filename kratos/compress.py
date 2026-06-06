@@ -30,31 +30,9 @@ if TYPE_CHECKING:
     from .bridge import OllamaBridge
     from .config import KratosConfig
 
-# ── system prompts (hardcoded, generic, caveman-short) ────────────────────────
-
-_COMPRESS_SYSTEM = """\
-Summarize the conversation below into one dense paragraph (max 300 words).
-Preserve: task goal, files written/modified, errors encountered, decisions made.
-Output ONLY the summary paragraph. No preamble, no labels."""
-
-_MEMORY_SYSTEM = """\
-Extract durable facts from this completed coding task.
-Output ONLY a JSON array of objects: [{"category": "...", "content": "..."}]
-Categories: decision | convention | file_role | error_cause | solution
-Rules:
-- Generic only — no project-specific API names, no hardcoded module names.
-- Each content max 120 chars.
-- Max 6 entries.
-- If nothing worth keeping: output []"""
-
-_RELAY_SYSTEM = """\
-Extract the essential information from the large input below.
-Produce a compact structured summary (max 600 words):
-1. Project structure (file tree, key files)
-2. Relevant code snippets (only what matters for the task)
-3. Errors or constraints mentioned
-4. Anything the planner absolutely needs to answer the task.
-Output ONLY the summary. No preamble."""
+# Prompts externalized to JSON (see kratos/prompts.py). Import the getters so the
+# programmed flow (user_text construction, token est, _call_model) stays dynamic.
+from .prompts import get_system, get_snippet, load_prompts
 
 
 # ── algo fallbacks ────────────────────────────────────────────────────────────
@@ -137,7 +115,9 @@ class Compressor:
         num_predict: int,
         temperature: float,
     ) -> str:
-        """Run a model call and return the full text response (no streaming display)."""
+        """Run a model call and return the full text response (no streaming display).
+        num_ctx passed in should already be the MAX for the model (enforced by caller).
+        """
         full = ""
         try:
             for token, kind in self._bridge.chat(
@@ -190,11 +170,22 @@ class Compressor:
             transcript_parts.append(f"User: {u}\nAssistant: {a}")
         transcript = "\n\n---\n\n".join(transcript_parts)
 
+        from .tokens import choose_num_ctx, estimate as _est
+        _sys = get_system("compress")
+        _ptok = _est(transcript) + _est(_sys)
+        _fmax = getattr(self._config, "always_max_ctx", True)
+        _nctx = choose_num_ctx(
+            model=self._config.compressor_model,
+            prompt_tokens=_ptok,
+            max_new_tokens=512,
+            vram_ceiling=self._config.compressor_num_ctx,
+            force_max_context=_fmax,
+        )
         summary = self._call_model(
             model=self._config.compressor_model,
-            system=_COMPRESS_SYSTEM,
+            system=_sys,
             user=transcript,
-            num_ctx=self._config.compressor_num_ctx,
+            num_ctx=_nctx,
             num_predict=512,
             temperature=self._config.compressor_temp,
         )
@@ -233,11 +224,22 @@ class Compressor:
             f"Key output: {coder_output[:600]}\n\n"
             f"Files changed: {', '.join(changed_files[:8])}"
         )
+        from .tokens import choose_num_ctx, estimate as _est
+        _sys = get_system("memory")
+        _ptok = _est(user_text) + _est(_sys)
+        _fmax = getattr(self._config, "always_max_ctx", True)
+        _nctx = choose_num_ctx(
+            model=self._config.compressor_model,
+            prompt_tokens=_ptok,
+            max_new_tokens=256,
+            vram_ceiling=self._config.compressor_num_ctx,
+            force_max_context=_fmax,
+        )
         raw = self._call_model(
             model=self._config.compressor_model,
-            system=_MEMORY_SYSTEM,
+            system=_sys,
             user=user_text,
-            num_ctx=self._config.compressor_num_ctx,
+            num_ctx=_nctx,
             num_predict=256,
             temperature=self._config.compressor_temp,
         )
@@ -252,9 +254,9 @@ class Compressor:
                     e for e in entries
                     if isinstance(e, dict)
                     and "category" in e and "content" in e
-                    and len(str(e["content"])) <= 200
+                    and len(str(e["content"])) <= 220
                 ]
-                return valid[:6]
+                return valid[:12]
         except (json.JSONDecodeError, ValueError):
             pass
 
@@ -281,17 +283,20 @@ class Compressor:
         )
 
         from .tokens import choose_num_ctx, estimate
-        prompt_tokens = estimate(user_text) + estimate(_RELAY_SYSTEM)
+        _sys = get_system("relay_detailed") or get_system("relay")
+        prompt_tokens = estimate(user_text) + estimate(_sys)
+        force_max = getattr(self._config, "always_max_ctx", True)
         num_ctx = choose_num_ctx(
             model=self._config.coder_model,
             prompt_tokens=prompt_tokens,
             max_new_tokens=1024,
             vram_ceiling=self._config.relay_num_ctx,
+            force_max_context=force_max,
         )
 
         result = self._call_model(
             model=self._config.coder_model,
-            system=_RELAY_SYSTEM,
+            system=_sys,
             user=user_text,
             num_ctx=num_ctx,
             num_predict=1200,

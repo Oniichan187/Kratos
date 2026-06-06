@@ -21,8 +21,9 @@ _MODEL_MAX_CTX: dict[str, int] = {
     "huihui_ai/qwen3.5-abliterated:4B":     262144,  # tag alias
     "huihui_ai/qwen3-abliterated:4b":       40960,
     "huihui_ai/qwen2.5-coder-abliterate:7b": 32768,
-    "kratos-planner":                        16384,
-    "kratos-planner:latest":                 16384,
+    "qwen3:4b":                              262144,
+    "kratos-planner":                        131072,
+    "kratos-planner:latest":                 131072,
 }
 
 # VRAM-safe ceiling: even if the model supports more, loading a giant KV-cache
@@ -106,20 +107,30 @@ def choose_num_ctx(
     vram_ceiling: int = _DEFAULT_VRAM_CEILING,
     *,
     overhead: float = 1.30,   # 30 % headroom above prompt+output
+    force_max_context: bool = True,
 ) -> int:
-    """Pick the smallest safe num_ctx for an Ollama call.
+    """Pick num_ctx for an Ollama call.
 
-    Rules (applied in order):
-      1. Must fit prompt + expected output with overhead.
-      2. Must not exceed model's hardware maximum.
-      3. Must not exceed vram_ceiling (VRAM budget).
-      4. Round up to nearest power-of-two-friendly value for KV-cache alignment.
+    When force_max_context=True (default for Kratos "use every model's full window"):
+      - Always allocate the largest supported context for that model (capped only by
+        explicit vram_ceiling). This is what the user asked for: maximum context
+        window on EVERY call for planner, coder, verifier and compressor.
+      - Enables reliable work on huge repos that far exceed "small" budgets.
+      - Small tasks still get the full window (Ollama only materializes used pages).
+
+    When False: classic conservative "just big enough" calculation.
     """
-    needed = int((prompt_tokens + max_new_tokens) * overhead)
-    cap    = min(model_max_ctx(model), vram_ceiling)
-    chosen = max(min(needed, cap), 1024)
+    cap = min(model_max_ctx(model), vram_ceiling)
 
-    # Round up to nearest multiple of 1024 (KV-cache alignment)
+    if force_max_context:
+        # Use the absolute maximum the model advertises (within hardware limit).
+        # Align for KV cache friendliness (many backends like 1k/4k/8k boundaries).
+        chosen = cap
+    else:
+        needed = int((prompt_tokens + max_new_tokens) * overhead)
+        chosen = max(min(needed, cap), 1024)
+
+    # Round up to nearest multiple of 1024
     rem = chosen % 1024
     if rem:
         chosen += 1024 - rem
