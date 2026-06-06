@@ -67,16 +67,17 @@ from kratos.ui import (
     route_info, tool_call,
     LiveBuffer, status_bar, user_message_panel, task_summary_panel,
     section_banner, elapsed_str,
-    input_capsule,
 )
 
 _HISTORY_FILE = GLOBAL_DIR / "history.txt"
 _PT_STYLE = PTStyle.from_dict({
-    "prompt":                               "ansicyan bold",
-    "completion-menu.completion":           "bg:#1e2a35 #aaaaaa",
-    "completion-menu.completion.current":   "bg:#0078d4 #ffffff bold",
-    "completion-menu.meta.completion":      "bg:#1e2a35 #666666",
-    "completion-menu.meta.completion.current": "bg:#005fa3 #cccccc",
+    "prompt":                                   "ansicyan bold",
+    "bottom-toolbar":                           "bg:#0d1117 #4a5a6a",
+    "bottom-toolbar.text":                      "bg:#0d1117 #4a5a6a",
+    "completion-menu.completion":               "bg:#1e2a35 #aaaaaa",
+    "completion-menu.completion.current":       "bg:#0078d4 #ffffff bold",
+    "completion-menu.meta.completion":          "bg:#1e2a35 #666666",
+    "completion-menu.meta.completion.current":  "bg:#005fa3 #cccccc",
 }) if _HAS_PT else None
 
 # ── slash-command autocomplete tree ──────────────────────────────────────────
@@ -145,12 +146,16 @@ else:
 
 # ── input helper ──────────────────────────────────────────────────────────────
 
-def _input(session: "PromptSession | None") -> str:
+def _input(session: "PromptSession | None", *, bottom_toolbar=None) -> str:
     """Read one line using prompt_toolkit (with history/completion) or plain input."""
     if session and _HAS_PT:
+        kwargs: dict = {}
+        if bottom_toolbar is not None:
+            kwargs["bottom_toolbar"] = bottom_toolbar
         return session.prompt(
             [("class:prompt", "  kratos ❯ ")],
             style=_PT_STYLE,
+            **kwargs,
         )
     return input("kratos ❯ ")
 
@@ -569,7 +574,7 @@ def main() -> None:
             complete_while_typing=True,
         )
 
-    # Live ctx tracking: pre-seeded so the capsule shows real numbers from the start.
+    # Live ctx tracking: updated by _stream_agent as model calls report token counts.
     _ctx_live: dict[str, tuple[int, int]] = {
         "planner": (0, config.planner_num_ctx),
         "coder":   (0, config.coder_num_ctx),
@@ -577,16 +582,63 @@ def main() -> None:
     }
     _last_task_s: float | None = None
 
+    # ── bottom toolbar (always visible while user types) ──────────────────────
+    def _make_toolbar() -> list[tuple[str, str]]:
+        """Builds prompt_toolkit bottom-toolbar: ⏱ lifetime · ∑ tokens · %→compose · project · perm."""
+        import time as _t
+        SEP = "   │   "
+        out: list[tuple[str, str]] = [("", "  ")]
+
+        # Session lifetime
+        age_s = _t.time() - _session_start
+        if age_s < 60:
+            life = "<1m"
+        elif age_s < 3600:
+            life = f"{int(age_s // 60)}m"
+        else:
+            _h, _m = int(age_s // 3600), int((age_s % 3600) // 60)
+            life = f"{_h}h {_m}m"
+        out += [("", "⏱ "), ("bold", life), ("", SEP)]
+
+        # Cumulative token usage
+        _tok = agent.session_usage
+        _total = _tok.get("prompt_tokens", 0) + _tok.get("completion_tokens", 0)
+        if _total >= 1_000_000:
+            tok_str = f"{_total / 1_000_000:.1f}M"
+        elif _total >= 1000:
+            tok_str = f"{_total // 1000}k"
+        else:
+            tok_str = str(_total)
+        out += [("", "∑ "), ("ansicyan", tok_str), ("", SEP)]
+
+        # % until auto-compose
+        _coder_total = config.coder_num_ctx
+        _threshold = float(getattr(config, "compress_threshold", 0.75))
+        _coder_used = _ctx_live.get("coder", (0, _coder_total))[0]
+        _compose_at = max(1, _threshold * _coder_total)
+        _pct = min(100, int(_coder_used * 100 / _compose_at))
+        _bw = 8
+        _filled = min(_bw, int(_bw * _pct / 100))
+        _bar = "▓" * _filled + "░" * (_bw - _filled)
+        _bc = "ansired" if _pct > 80 else "ansiyellow" if _pct > 50 else "ansibrightblack"
+        out += [(_bc, _bar), ("", f" {_pct}%→compose"), ("", SEP)]
+
+        # Project name + permission
+        _perm = config.permission
+        _pc = {"low": "ansiyellow", "mid": "ansigreen", "high": "ansired"}.get(_perm, "ansigreen")
+        out += [("", f"{project_root.name}  "), (f"{_pc} bold", _perm)]
+
+        # Last task duration
+        if _last_task_s is not None:
+            _t_str = f"{_last_task_s:.0f}s" if _last_task_s < 60 else f"{_last_task_s / 60:.1f}m"
+            out += [("", SEP), ("", f"last {_t_str}")]
+
+        out.append(("", "  "))
+        return out
+
     while True:
         try:
-            _tok = agent.session_usage
-            input_capsule(
-                _ctx_live, config, _last_task_s,
-                session_start=_session_start,
-                total_tokens=_tok.get("prompt_tokens", 0) + _tok.get("completion_tokens", 0),
-                project_name=project_root.name,
-            )
-            line = _input(session).strip()
+            line = _input(session, bottom_toolbar=_make_toolbar).strip()
         except KeyboardInterrupt:
             console.print()
             print_info("Use [cyan]/exit[/cyan] to quit.")
