@@ -38,11 +38,7 @@ except ImportError:
     sys.exit("Install dependencies first:  pip install -r requirements.txt")
 
 try:
-    from prompt_toolkit import PromptSession
-    from prompt_toolkit.history import FileHistory
-    from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
     from prompt_toolkit.completion import Completer, Completion
-    from prompt_toolkit.styles import Style as PTStyle
     _HAS_PT = True
 except ImportError:
     _HAS_PT = False
@@ -70,15 +66,6 @@ from kratos.ui import (
 )
 
 _HISTORY_FILE = GLOBAL_DIR / "history.txt"
-_PT_STYLE = PTStyle.from_dict({
-    "prompt":                                   "ansicyan bold",
-    "bottom-toolbar":                           "bg:#0d1117 #4a5a6a",
-    "bottom-toolbar.text":                      "bg:#0d1117 #4a5a6a",
-    "completion-menu.completion":               "bg:#1e2a35 #aaaaaa",
-    "completion-menu.completion.current":       "bg:#0078d4 #ffffff bold",
-    "completion-menu.meta.completion":          "bg:#1e2a35 #666666",
-    "completion-menu.meta.completion.current":  "bg:#005fa3 #cccccc",
-}) if _HAS_PT else None
 
 # ── slash-command autocomplete tree ──────────────────────────────────────────
 _SLASH_TREE: dict[str, tuple[dict[str, str] | None, str]] = {
@@ -144,20 +131,141 @@ else:
     _COMPLETER = None
 
 
-# ── input helper ──────────────────────────────────────────────────────────────
+# ── framed bottom prompt panel ────────────────────────────────────────────────
 
-def _input(session: "PromptSession | None", *, bottom_toolbar=None) -> str:
-    """Read one line using prompt_toolkit (with history/completion) or plain input."""
-    if session and _HAS_PT:
-        kwargs: dict = {}
-        if bottom_toolbar is not None:
-            kwargs["bottom_toolbar"] = bottom_toolbar
-        return session.prompt(
-            [("class:prompt", "  kratos ❯ ")],
-            style=_PT_STYLE,
-            **kwargs,
-        )
-    return input("kratos ❯ ")
+if _HAS_PT:
+    class _BottomPanel:
+        """Non-fullscreen prompt_toolkit Application — framed input + live info bar.
+
+        Terminal layout while waiting for input:
+          ╭────────────────────────────────────────────────────────╮
+          │  ⏱ 3m  ∑ 8k  ░░░░░░░░ 0%→compose  project  mid       │
+          ├────────────────────────────────────────────────────────┤
+          │  kratos ❯ _                                            │
+          ╰────────────────────────────────────────────────────────╯
+
+        erase_when_done=True erases the frame on Enter so the chat log above
+        grows cleanly and the frame always re-renders at the bottom.
+        """
+
+        def __init__(
+            self,
+            get_info: "Callable[[], list[tuple[str, str]]]",
+            history_path: "Path",
+            completer: "Completer | None" = None,
+        ) -> None:
+            from prompt_toolkit.buffer import Buffer as _Buf
+            from prompt_toolkit.history import FileHistory as _FH
+            from prompt_toolkit.auto_suggest import AutoSuggestFromHistory as _ASFH
+            self._get_info = get_info
+            self._buf = _Buf(
+                history=_FH(str(history_path)),
+                completer=completer,
+                complete_while_typing=True,
+                auto_suggest=_ASFH(),
+            )
+
+        def prompt(self) -> str:
+            """Block until Enter; return stripped text. Raises KeyboardInterrupt / EOFError."""
+            import shutil
+            from prompt_toolkit.application import Application as _App
+            from prompt_toolkit.layout import Layout as _Lay
+            from prompt_toolkit.layout.containers import HSplit as _HS, Window as _W
+            from prompt_toolkit.layout.controls import (
+                BufferControl as _BC,
+                FormattedTextControl as _FTC,
+            )
+            from prompt_toolkit.layout.processors import BeforeInput as _BI
+            from prompt_toolkit.key_binding import KeyBindings as _KB
+            from prompt_toolkit.key_binding.defaults import load_key_bindings as _lkb
+            from prompt_toolkit.key_binding import merge_key_bindings as _mkb
+            from prompt_toolkit.styles import Style as _Sty
+
+            buf = self._buf
+
+            def _cols() -> int:
+                return shutil.get_terminal_size((80, 24)).columns
+
+            def _top() -> list[tuple[str, str]]:
+                return [("class:bdr", "╭" + "─" * (_cols() - 2) + "╮")]
+
+            def _mid() -> list[tuple[str, str]]:
+                return [("class:bdr", "├" + "─" * (_cols() - 2) + "┤")]
+
+            def _bot() -> list[tuple[str, str]]:
+                return [("class:bdr", "╰" + "─" * (_cols() - 2) + "╯")]
+
+            def _info() -> list[tuple[str, str]]:
+                row: list[tuple[str, str]] = [("class:bdr", "│  ")]
+                row.extend(self._get_info())
+                return row
+
+            kb = _KB()
+
+            @kb.add("enter")
+            def _enter(event) -> None:
+                text = buf.text
+                buf.reset(append_to_history=True)
+                event.app.exit(result=text)
+
+            @kb.add("c-c")
+            def _cc(event) -> None:
+                buf.reset()
+                event.app.exit(exception=KeyboardInterrupt())
+
+            @kb.add("c-d")
+            def _cd(event) -> None:
+                if not buf.text:
+                    event.app.exit(exception=EOFError())
+                else:
+                    buf.reset()
+
+            layout = _Lay(
+                _HS([
+                    _W(_FTC(_top), height=1, dont_extend_height=True),
+                    _W(_FTC(_info), height=1, dont_extend_height=True),
+                    _W(_FTC(_mid), height=1, dont_extend_height=True),
+                    _W(
+                        _BC(
+                            buffer=buf,
+                            input_processors=[_BI([("class:prompt", "│  kratos ❯ ")])],
+                        ),
+                        height=1,
+                        dont_extend_height=True,
+                    ),
+                    _W(_FTC(_bot), height=1, dont_extend_height=True),
+                ]),
+                focused_element=buf,
+            )
+
+            style = _Sty.from_dict({
+                "bdr":                                      "#2d6070",
+                "prompt":                                   "ansicyan bold",
+                "auto-suggestion":                          "#445566",
+                "completion-menu.completion":               "bg:#1e2a35 #aaaaaa",
+                "completion-menu.completion.current":       "bg:#0078d4 #ffffff bold",
+                "completion-menu.meta.completion":          "bg:#1e2a35 #666666",
+                "completion-menu.meta.completion.current":  "bg:#005fa3 #cccccc",
+            })
+
+            app = _App(
+                layout=layout,
+                key_bindings=_mkb([_lkb(), kb]),
+                style=style,
+                erase_when_done=True,
+                full_screen=False,
+                mouse_support=False,
+            )
+            result = app.run()
+            return (result or "").strip()
+
+else:
+    class _BottomPanel:  # type: ignore[no-redef]
+        def __init__(self, get_info, history_path=None, completer=None):
+            self._get_info = get_info
+
+        def prompt(self) -> str:
+            return input("kratos ❯ ").strip()
 
 
 def _ctx_display(config: KratosConfig) -> dict[str, int]:
@@ -564,15 +672,7 @@ def main() -> None:
 
     _session_start = time.time()
 
-    session = None
-    if _HAS_PT:
-        GLOBAL_DIR.mkdir(parents=True, exist_ok=True)
-        session = PromptSession(
-            history=FileHistory(str(_HISTORY_FILE)),
-            auto_suggest=AutoSuggestFromHistory(),
-            completer=_COMPLETER,
-            complete_while_typing=True,
-        )
+    GLOBAL_DIR.mkdir(parents=True, exist_ok=True)
 
     # Live ctx tracking: updated by _stream_agent as model calls report token counts.
     _ctx_live: dict[str, tuple[int, int]] = {
@@ -582,7 +682,7 @@ def main() -> None:
     }
     _last_task_s: float | None = None
 
-    # ── bottom toolbar (always visible while user types) ──────────────────────
+    # ── live info content for the panel frame ─────────────────────────────────
     def _make_toolbar() -> list[tuple[str, str]]:
         """Builds prompt_toolkit bottom-toolbar: ⏱ lifetime · ∑ tokens · %→compose · project · perm."""
         import time as _t
@@ -636,11 +736,16 @@ def main() -> None:
         out.append(("", "  "))
         return out
 
+    panel = _BottomPanel(
+        get_info=_make_toolbar,
+        history_path=_HISTORY_FILE,
+        completer=_COMPLETER,
+    )
+
     while True:
         try:
-            line = _input(session, bottom_toolbar=_make_toolbar).strip()
+            line = panel.prompt()
         except KeyboardInterrupt:
-            console.print()
             print_info("Use [cyan]/exit[/cyan] to quit.")
             continue
         except EOFError:
