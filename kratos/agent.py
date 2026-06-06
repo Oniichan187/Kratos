@@ -1,4 +1,4 @@
-"""Kratos agent — dual-model pipeline with dynamic reasoning and auto-compression.
+"""Kratos agent â€” dual-model pipeline with dynamic reasoning and auto-compression.
 
 Token-stream convention:
   All generators yield (source: str, content: str, kind: str) where source is:
@@ -18,22 +18,22 @@ Token-stream convention:
     "end"      section end                      kind="end"
 
 Pipeline:
-  Input → Analyze → Classify → Route → Build Context
-    → [Relay if huge] → Planner → Coder → Verifier
-    → if NEEDS_REVISION: re-plan → re-code → re-verify  (up to max_verify_iterations)
-    → VERIFIED | UNSOLVABLE
+  Input â†’ Analyze â†’ Classify â†’ Route â†’ Build Context
+    â†’ [Relay if huge] â†’ Planner â†’ Coder â†’ Verifier
+    â†’ if NEEDS_REVISION: re-plan â†’ re-code â†’ re-verify  (up to max_verify_iterations)
+    â†’ VERIFIED | UNSOLVABLE
 
 Auto-compression: before each model call, if estimated prompt tokens >
-compress_threshold × num_ctx → compress_history() via the compressor model.
+compress_threshold Ã— num_ctx â†’ compress_history() via the compressor model.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Generator
 
@@ -50,7 +50,7 @@ from .tokens import (
     fit_to_budget, relay_needed, model_max_ctx,
 )
 
-# Prompts are fully externalized to JSON — all AI-facing strings, patterns, and pipeline config
+# Prompts are fully externalized to JSON â€” all AI-facing strings, patterns, and pipeline config
 # live in prompts_default.json (user-editable). Python code contains only flow logic.
 from .prompts import (
     load_prompts,
@@ -61,6 +61,38 @@ from .prompts import (
     get_toolchain,
     get_plan_config,
     reload_prompts,
+)
+from .builders import (
+    _scope_for,
+    _coder_scope_for,
+    _needs_thinking,
+    _coder_context_block,
+    _planner_msg,
+    _coder_msg,
+    _planner_retry_msg,
+    _coder_retry_msg,
+    _verify_msg,
+    _clarification_msg,
+    _direct_file_search,
+    _direct_code_search,
+)
+from .verification import (
+    VerificationCommand,
+    ProvenWork,
+    CommandRegistry,
+    _clean_command_line,
+    _is_safe_verification_command,
+    _is_test_verification_command,
+    _command_toolchain,
+    _dedupe_verification_commands,
+    _extract_readme_verification_commands,
+    _infer_project_verification_commands,
+    _proven_work_satisfied,
+    _format_proven_work_feedback,
+    _extract_plan_steps,
+    _extract_step_file_refs,
+    _parse_step_tests,
+    _patch_dotnet_test_runner,
 )
 
 # ── token predict limits (now sourced from prompts at runtime for full configurability) ──
@@ -81,10 +113,12 @@ def _get_file_change_re():
     fm = re.escape(pm.get_marker("file") or "### FILE:")
     return re.compile(rf'{fm}\s*(.+?)\s*\n```(?:\w+)?\n(.*?)```', re.S)
 
+
 def _get_file_delete_re():
     pm = load_prompts()
     dm = re.escape(pm.get_marker("delete") or "### DELETE:")
     return re.compile(rf'{dm}\s*(.+?)\s*$', re.M)
+
 
 # Fallback module-level compiled (using defaults at import time)
 _FILE_CHANGE_RE = re.compile(
@@ -102,758 +136,6 @@ def _parse_file_deletions(text: str) -> list[str]:
     return [m.group(1).strip() for m in _get_file_delete_re().finditer(text)]
 
 
-@dataclass(frozen=True)
-class VerificationCommand:
-    cmd: str
-    purpose: str
-    source: str
-    is_test: bool
-
-
-@dataclass
-class ProvenWork:
-    iteration: int
-    files_changed: list[str] = field(default_factory=list)
-    file_checks: list[dict] = field(default_factory=list)
-    commands: list[dict] = field(default_factory=list)
-    commands_planned: list[dict] = field(default_factory=list)
-
-    def to_dict(self) -> dict:
-        return {
-            "iteration": self.iteration,
-            "files_changed": self.files_changed,
-            "file_checks": self.file_checks,
-            "commands_planned": self.commands_planned,
-            "commands": self.commands,
-        }
-
-
-# Fallback constants — the JSON toolchain section is the authoritative source.
-# _is_safe_verification_command() always reads from JSON (cached), these are emergency fallbacks.
-_VERIFY_META_CHARS_FALLBACK: tuple[str, ...] = ("&&", "||", ";", "|", ">", "<", "`")
-_SAFE_VERIFY_PREFIXES_FALLBACK: tuple[str, ...] = (
-    "python -m pytest", "py -m pytest", "pytest",
-    "python -m unittest", "py -m unittest",
-    "python tests/", "python test",
-    "dotnet build", "dotnet test", "dotnet run --project",
-    "npm test", "npm run test", "npm run build",
-    "pnpm test", "pnpm run test", "pnpm run build",
-    "yarn test", "yarn build",
-    "cargo test", "cargo build",
-    "go test", "go build",
-    "mvn test", "gradle test", "./gradlew test",
-    "npx tsc", "tsc --noEmit",
-)
-
-
-def _compile_check_cmds(toolchains: set[str], root: "Path") -> "list[VerificationCommand]":
-    """Quick compile-only commands to run BEFORE the full test suite.
-
-    Commands sourced from prompts JSON toolchain.compile_commands so they can be
-    customized without touching Python code.
-    """
-    compile_cfgs: dict = get_toolchain("compile_commands") or {
-        "dotnet": "dotnet build --nologo -q",
-        "node_tsconfig": "npx tsc --noEmit --pretty false",
-    }
-    cmds: list[VerificationCommand] = []
-    if "dotnet" in toolchains:
-        cmd = compile_cfgs.get("dotnet", "dotnet build --nologo -q")
-        cmds.append(VerificationCommand(cmd=cmd, purpose="compile check", source="auto-compile", is_test=False))
-    if "node" in toolchains and (root / "tsconfig.json").exists():
-        cmd = compile_cfgs.get("node_tsconfig", "npx tsc --noEmit --pretty false")
-        cmds.append(VerificationCommand(cmd=cmd, purpose="TypeScript compile check", source="auto-compile", is_test=False))
-    return cmds
-
-
-def _clean_command_line(line: str) -> str:
-    s = line.strip()
-    s = re.sub(r"^(?:PS>|\$|>|#)\s*", "", s)
-    s = s.split(" #", 1)[0].strip()
-    return s
-
-
-def _is_safe_verification_command(cmd: str) -> bool:
-    # Read from JSON on each call (load_prompts() is cached — O(1) after first load).
-    meta_chars = tuple(get_toolchain("blocked_verify_chars") or _VERIFY_META_CHARS_FALLBACK)
-    safe_prefixes = tuple(get_toolchain("safe_verify_prefixes") or _SAFE_VERIFY_PREFIXES_FALLBACK)
-    normalized = " ".join(cmd.strip().split()).lower()
-    if not normalized or any(meta in normalized for meta in meta_chars):
-        return False
-    if normalized.startswith("dotnet run --project"):
-        return _is_test_verification_command(normalized)
-    return normalized.startswith(safe_prefixes)
-
-
-def _is_test_verification_command(cmd: str) -> bool:
-    normalized = " ".join(cmd.strip().split()).lower().replace("\\", "/")
-    if normalized.startswith(("dotnet build", "npm run build", "pnpm run build", "yarn build")):
-        return False
-    if normalized.startswith(("python -m pytest", "py -m pytest", "pytest")):
-        return True
-    if normalized.startswith(("python -m unittest", "py -m unittest")):
-        return True
-    if normalized.startswith("python ") and "/test" in normalized:
-        return True
-    if normalized.startswith("dotnet test"):
-        return True
-    if normalized.startswith("dotnet run --project") and "test" in normalized:
-        return True
-    if normalized.startswith(("npm test", "npm run test", "pnpm test", "pnpm run test", "yarn test")):
-        return True
-    return normalized.startswith(("cargo test", "go test", "mvn test", "gradle test", "./gradlew test"))
-
-
-def _purpose_for_command(cmd: str, source: str) -> str:
-    return f"{source} {'test' if _is_test_verification_command(cmd) else 'build'} verification"
-
-
-def _quote_rel(path: Path, root: Path) -> str:
-    rel = path.relative_to(root).as_posix()
-    return f'"{rel}"' if " " in rel else rel
-
-
-def _is_noise_path(path: Path) -> bool:
-    parts = {p.lower() for p in path.parts}
-    return bool(parts & {".git", ".svn", ".hg", "node_modules", ".venv", "venv", "bin", "obj", "dist", "build", "target"})
-
-
-def _detect_project_toolchains(root: Path) -> set[str]:
-    """Return the build/test toolchains actually present in the project root."""
-    toolchains: set[str] = set()
-    # Python
-    if any((root / n).exists() for n in ("pyproject.toml", "setup.py", "setup.cfg", "pytest.ini")):
-        toolchains.add("python")
-    elif (root / "tests").is_dir() or any(root.glob("test_*.py")):
-        toolchains.add("python")
-    # .NET
-    if any(root.glob("*.sln")) or any(root.rglob("*.csproj")):
-        toolchains.add("dotnet")
-    # Node
-    if (root / "package.json").exists():
-        toolchains.add("node")
-    # Rust
-    if (root / "Cargo.toml").exists():
-        toolchains.add("cargo")
-    # Go
-    if (root / "go.mod").exists():
-        toolchains.add("go")
-    # Maven / Gradle
-    if (root / "pom.xml").exists():
-        toolchains.add("maven")
-    if (root / "build.gradle").exists() or (root / "build.gradle.kts").exists():
-        toolchains.add("gradle")
-    return toolchains
-
-
-def _command_toolchain(cmd: str) -> str | None:
-    """Return the toolchain name a verify command belongs to, or None."""
-    n = " ".join(cmd.strip().split()).lower()
-    if n.startswith(("pytest", "python -m pytest", "py -m pytest",
-                     "python -m unittest", "py -m unittest")):
-        return "python"
-    if n.startswith("python ") and "test" in n:
-        return "python"
-    if n.startswith("dotnet"):
-        return "dotnet"
-    if n.startswith(("npm ", "pnpm ", "yarn ")):
-        return "node"
-    if n.startswith("cargo "):
-        return "cargo"
-    if n.startswith("go "):
-        return "go"
-    if n.startswith("mvn "):
-        return "maven"
-    if n.startswith(("gradle ", "./gradlew ")):
-        return "gradle"
-    return None
-
-
-def _dedupe_verification_commands(commands: list[VerificationCommand]) -> list[VerificationCommand]:
-    seen: set[str] = set()
-    unique: list[VerificationCommand] = []
-    for item in commands:
-        key = " ".join(item.cmd.split()).lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(item)
-    return unique
-
-
-def _extract_readme_verification_commands(root: Path) -> list[VerificationCommand]:
-    commands: list[VerificationCommand] = []
-    for readme in sorted(root.glob("README*")):
-        if not readme.is_file():
-            continue
-        try:
-            text = readme.read_text("utf-8", errors="replace")
-        except OSError:
-            continue
-        in_fence = False
-        for raw in text.splitlines():
-            stripped = raw.strip()
-            if stripped.startswith(("```", "~~~")):
-                in_fence = not in_fence
-                continue
-            cmd = _clean_command_line(stripped)
-            if not in_fence and not _is_safe_verification_command(cmd):
-                continue
-            if _is_safe_verification_command(cmd):
-                commands.append(VerificationCommand(
-                    cmd=cmd,
-                    purpose=_purpose_for_command(cmd, readme.name),
-                    source=readme.name,
-                    is_test=_is_test_verification_command(cmd),
-                ))
-    # Bare "dotnet build" / "dotnet test" without a project path only work when a
-    # .sln or .csproj lives in the root.  Drop them when they don't — the inferred
-    # commands (_infer_project_verification_commands) will provide explicit-path
-    # equivalents that actually work.
-    has_root_project = any(root.glob("*.sln")) or any(root.glob("*.csproj"))
-    if not has_root_project:
-        import re as _re
-        commands = [
-            c for c in commands
-            if not _re.match(r"^dotnet\s+(build|test)\s*$", c.cmd.strip(), _re.I)
-        ]
-
-    return _dedupe_verification_commands(commands)
-
-
-def _infer_project_verification_commands(root: Path) -> list[VerificationCommand]:
-    commands: list[VerificationCommand] = []
-
-    if (root / "package.json").exists():
-        try:
-            package = json.loads((root / "package.json").read_text("utf-8"))
-            scripts = package.get("scripts", {}) if isinstance(package, dict) else {}
-        except (json.JSONDecodeError, OSError):
-            scripts = {}
-        if "build" in scripts:
-            commands.append(VerificationCommand("npm run build", "package.json build verification", "package.json", False))
-        if "test" in scripts:
-            commands.append(VerificationCommand("npm test", "package.json test verification", "package.json", True))
-
-    has_python_project = any((root / name).exists() for name in ("pyproject.toml", "setup.py", "setup.cfg", "pytest.ini"))
-    has_python_tests = (root / "tests").exists() or any(root.glob("test_*.py"))
-    if has_python_project and has_python_tests:
-        commands.append(VerificationCommand("python -m pytest tests", "python pytest verification", "python", True))
-
-    if (root / "Cargo.toml").exists():
-        commands.append(VerificationCommand("cargo test", "cargo test verification", "cargo", True))
-
-    if (root / "go.mod").exists():
-        commands.append(VerificationCommand("go test ./...", "go test verification", "go", True))
-
-    sln_files = [p for p in root.glob("*.sln") if not _is_noise_path(p)]
-    if sln_files:
-        rel = _quote_rel(sln_files[0], root)
-        commands.append(VerificationCommand(f"dotnet build {rel}", "dotnet solution build verification", "dotnet", False))
-        commands.append(VerificationCommand(f"dotnet test {rel} --no-build", "dotnet solution test verification", "dotnet", True))
-        return _dedupe_verification_commands(commands)
-
-    csprojs = [p for p in root.rglob("*.csproj") if not _is_noise_path(p)]
-    test_projects: list[Path] = []
-    source_projects: list[Path] = []
-    for csproj in csprojs:
-        try:
-            text = csproj.read_text("utf-8", errors="replace").lower()
-        except OSError:
-            text = ""
-        rel_lower = csproj.relative_to(root).as_posix().lower()
-        if "test" in rel_lower or "microsoft.net.test.sdk" in text or "xunit" in text or "nunit" in text:
-            test_projects.append(csproj)
-        else:
-            source_projects.append(csproj)
-
-    for csproj in test_projects:
-        rel = _quote_rel(csproj, root)
-        commands.append(VerificationCommand(f"dotnet build {rel}", "dotnet test project build verification", "dotnet", False))
-        try:
-            text = csproj.read_text("utf-8", errors="replace").lower()
-        except OSError:
-            text = ""
-        if "microsoft.net.test.sdk" in text or "xunit" in text or "nunit" in text:
-            commands.append(VerificationCommand(f"dotnet test {rel} --no-build", "dotnet test project verification", "dotnet", True))
-        else:
-            commands.append(VerificationCommand(f"dotnet run --project {rel}", "dotnet executable test project verification", "dotnet", True))
-
-    if not test_projects and source_projects:
-        rel = _quote_rel(source_projects[0], root)
-        commands.append(VerificationCommand(f"dotnet build {rel}", "dotnet project build verification", "dotnet", False))
-
-    return _dedupe_verification_commands(commands)
-
-
-def _proven_work_satisfied(proof: ProvenWork, require_test: bool = True) -> bool:
-    if not proof.commands:
-        return False
-    # Per-step intermediate failures are allowed (other stubs may not be done yet).
-    # What matters is the FINAL state: the last test command that ran must have passed.
-    if require_test:
-        test_cmds = [c for c in proof.commands if c.get("is_test")]
-        if not test_cmds:
-            return False
-        return bool(test_cmds[-1].get("exit_code") == 0)
-    # Build-only case: all commands must pass.
-    return all(item.get("exit_code") == 0 for item in proof.commands)
-
-
-def _format_proven_work_feedback(proof: ProvenWork, require_test: bool = True) -> str:
-    if not proof.commands_planned:
-        return "PROVEN_WORK missing: no safe build/test command was configured, found in README, or inferred from project files."
-    if not proof.commands:
-        return "PROVEN_WORK missing: verification commands were planned but not executed."
-    failed = [item for item in proof.commands if item.get("exit_code") != 0]
-    if failed:
-        item = failed[-1]  # last failure is most recent and most relevant
-        return (
-            f"PROVEN_WORK failed: command `{item.get('cmd')}` exited with {item.get('exit_code')}.\n"
-            f"{str(item.get('output', ''))[-3000:]}"
-        )
-    if require_test and not any(item.get("is_test") for item in proof.commands):
-        return "PROVEN_WORK incomplete: build commands passed, but no test command actually ran."
-    return "PROVEN_WORK incomplete: verification evidence did not satisfy the proof gate."
-
-
-def _extract_plan_steps(plan: str) -> list[str]:
-    """Extract NUMBERED actionable steps from planner output.
-
-    Patterns sourced from JSON plan.step_regex and plan.step_skip_prefixes.
-    Only digit-prefixed lines count as steps — bullets explicitly excluded to
-    prevent the 15-item explosion where file lists / risk bullets become steps.
-    Falls back to double-newline paragraph splitting if no numbered items found.
-    """
-    if not plan or not plan.strip():
-        return []
-    # Read config from JSON (cached)
-    step_regex = get_plan_config("step_regex") or r'^(?:\d+[\.\)\-:]\s*|Step\s+\d+[:\.\)]?\s*)(.+)$'
-    raw_skip = get_plan_config("step_skip_prefixes") or ["what ", "which ", "potential", "verification", "final ", "note:"]
-    min_len = int(get_plan_config("min_step_length") or 8)
-    _skip_prefixes = tuple(raw_skip)
-    steps: list[str] = []
-    for raw in plan.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        m = re.match(step_regex, line, re.I)
-        if m:
-            txt = m.group(1).strip()
-            if len(txt) > min_len and not txt.lower().startswith(_skip_prefixes):
-                steps.append(txt)
-    if steps:
-        return steps
-    # Fallback: double-newline paragraphs containing action verbs
-    parts = [p.strip() for p in re.split(r'\n\s*\n', plan) if p.strip()]
-    filtered = [p for p in parts if any(k in p.lower() for k in (
-        "edit", "change", "implement", "add ", "fix ", "update ", "create ", "remove "
-    ))]
-    return filtered[:12] or [plan.strip()[:400]]
-
-
-def _extract_step_file_refs(step_text: str) -> list[str]:
-    """Extract source file paths referenced in a single step description.
-
-    Used to pre-read the CURRENT disk state of those files and inject it
-    into the coder's context so it can see what's there before overwriting.
-    Caps at 6 to avoid flooding the prompt.
-    """
-    patterns = [
-        r'(?:File:|file:)\s*([^\s,\n`"\']+)',           # File: src/Foo.cs
-        r'`([^`]+\.[a-zA-Z]{1,8})`',                    # `src/Foo.cs`
-        r'"([^"]+\.[a-zA-Z]{1,8})"',                    # "src/Foo.cs"
-    ]
-    found: list[str] = []
-    seen: set[str] = set()
-    for pat in patterns:
-        for m in re.finditer(pat, step_text):
-            p = m.group(1).strip().strip('`"\'').replace("\\", "/")
-            if "." in p and ("/" in p or "\\" in p) and p not in seen:
-                seen.add(p)
-                found.append(p)
-    return found[:6]
-
-
-# ── STEP_TEST: temp test parsing + .NET runner patching ──────────────────────
-
-def _parse_step_tests(text: str) -> list[tuple[str, str]]:
-    """Parse ### STEP_TEST: path blocks from coder output.
-
-    Same format as ### FILE: blocks. Returns (rel_path, content) pairs.
-    Marker sourced from JSON markers.step_test.
-    """
-    marker = get_marker("step_test") or "### STEP_TEST:"
-    escaped = re.escape(marker)
-    pattern = re.compile(rf'{escaped}\s*(.+?)\s*\n```(?:\w+)?\n(.*?)```', re.S)
-    return [(m.group(1).strip(), m.group(2)) for m in pattern.finditer(text)]
-
-
-def _patch_dotnet_test_runner(test_dir: Path, class_name: str) -> tuple[Path | None, str | None]:
-    """Temporarily add class_name.RunAll() to the test runner's Program.cs.
-
-    Handles two common .NET test runner formats:
-
-    Format A — top-level call style (most common):
-        TaskParserTests.RunAll();
-        TaskFormatterTests.RunAll();
-      → inserts ClassName.RunAll(); after the last existing call.
-
-    Format B — tuple/array style (e.g. probe runner):
-        var tests = new (string Name, Action Run)[]
-        {
-            ("TaskParserTests",  TaskParserTests.RunAll),
-            ("TaskFormatterTests", TaskFormatterTests.RunAll)   ← no comma on last
-        };
-      → adds a new entry after the last tuple, fixing up trailing commas.
-
-    Returns (prog_path, original_content) so callers can restore after the test run.
-    Returns (None, None) if Program.cs not found or cannot be patched.
-    """
-    prog = test_dir / "Program.cs"
-    if not prog.exists():
-        return None, None
-    original = prog.read_text("utf-8")
-    lines = original.rstrip().split("\n")
-
-    # ── Format A: lines containing RunAll() (with parentheses = direct call) ──
-    last_call_idx = -1
-    for i, line in enumerate(lines):
-        s = line.strip()
-        if "RunAll()" in s and not s.startswith("//"):
-            last_call_idx = i
-    if last_call_idx >= 0:
-        lines.insert(last_call_idx + 1, f"{class_name}.RunAll();")
-        prog.write_text("\n".join(lines) + "\n", "utf-8")
-        return prog, original
-
-    # ── Format B: tuple/array style — lines ending with .RunAll) or .RunAll), ─
-    last_tuple_idx = -1
-    indent = "    "
-    for i, line in enumerate(lines):
-        s = line.strip()
-        if (".RunAll)" in s or ".RunAll)," in s) and not s.startswith("//"):
-            last_tuple_idx = i
-            indent = line[: len(line) - len(line.lstrip())]
-    if last_tuple_idx >= 0:
-        # Ensure the previous last entry has a trailing comma
-        prev = lines[last_tuple_idx].rstrip()
-        if not prev.endswith(","):
-            lines[last_tuple_idx] = prev + ","
-        lines.insert(last_tuple_idx + 1, f'{indent}("{class_name}", {class_name}.RunAll)')
-        prog.write_text("\n".join(lines) + "\n", "utf-8")
-        return prog, original
-
-    # ── Fallback: just append (may not compile, but best-effort) ──────────────
-    lines.append(f"{class_name}.RunAll();")
-    prog.write_text("\n".join(lines) + "\n", "utf-8")
-    return prog, original
-
-
-# ── command registry ──────────────────────────────────────────────────────────
-
-class CommandRegistry:
-    """Centralized manager for all project build/test commands.
-
-    Discovers commands once per run from README, project structure, and config.
-    Provides structured access for the coder prompt and the verify pipeline.
-    """
-
-    def __init__(self, config: "KratosConfig", root: Path) -> None:
-        self._config = config
-        self._root = root
-        self.toolchains: set[str] = set()
-        self.commands: list[VerificationCommand] = []
-        self.compile_commands: list[VerificationCommand] = []
-
-    def discover(self) -> "CommandRegistry":
-        self.toolchains = _detect_project_toolchains(self._root)
-        raw: list[VerificationCommand] = []
-        # Configured commands first (highest priority)
-        if self._config.build_cmd:
-            raw.append(VerificationCommand(self._config.build_cmd, "configured build", "/build", False))
-        if self._config.test_cmd:
-            raw.append(VerificationCommand(self._config.test_cmd, "configured test", "/test", True))
-        # Auto-discovered
-        raw += _extract_readme_verification_commands(self._root)
-        raw += _infer_project_verification_commands(self._root)
-        self.commands = _dedupe_verification_commands([
-            c for c in raw if _is_safe_verification_command(c.cmd)
-        ])
-        self.compile_commands = _compile_check_cmds(self.toolchains, self._root)
-        return self
-
-    def verify_hint(self) -> str:
-        """One-block description for injection into planner/coder prompts."""
-        tc_str = ", ".join(sorted(self.toolchains)) if self.toolchains else "unknown"
-        if self.commands:
-            lines = [
-                f"PROJECT TOOLCHAIN: {tc_str}",
-                "STEP_VERIFY MUST use only the commands below — do NOT invent a runner "
-                "(e.g. never use pytest for a dotnet project, never use dotnet for Python):",
-            ]
-            lines += [f"  `{c.cmd}`" for c in self.commands[:4]]
-            return "\n".join(lines)
-        elif self.toolchains:
-            return (
-                f"PROJECT TOOLCHAIN: {tc_str}. "
-                "Use only the correct runner for this toolchain in every STEP_VERIFY."
-            )
-        return ""
-
-    def format_for_prompt(self) -> str:
-        """Compact command registry block for coder context injection."""
-        tc_str = ", ".join(sorted(self.toolchains)) if self.toolchains else "unknown"
-        lines = [f"COMMAND REGISTRY  (toolchain: {tc_str})"]
-        if self.compile_commands:
-            for c in self.compile_commands:
-                lines.append(f"  [COMPILE]  `{c.cmd}` — {c.purpose}")
-        for c in self.commands[:5]:
-            kind = "[TEST]  " if c.is_test else "[BUILD] "
-            lines.append(f"  {kind} `{c.cmd}` — {c.purpose}")
-        if not self.compile_commands and not self.commands:
-            lines.append("  (no commands detected — ensure README or project files describe how to build/test)")
-        return "\n".join(lines)
-
-    def test_commands(self) -> list[VerificationCommand]:
-        return [c for c in self.commands if c.is_test]
-
-    def is_toolchain_mismatch(self, cmd: str) -> bool:
-        if not self.toolchains:
-            return False
-        tc = _command_toolchain(cmd)
-        return bool(tc and tc not in self.toolchains)
-
-
-# ── scope / num_ctx selection ─────────────────────────────────────────────────
-
-def _scope_for(route: Route, intent: Intent) -> ScopeType:
-    if route == Route.DIRECT_ANSWER:
-        return "none"
-    if route == Route.PLANNER_ONLY:
-        if intent in (Intent.QUESTION, Intent.EXPLAIN):
-            return "minimal"
-        return "architecture"
-    if route == Route.CODER_ONLY:
-        if intent == Intent.FOLLOWUP:
-            return "patch_context"
-        if intent == Intent.SHELL_GIT:
-            return "none"
-        return "targeted"
-    if route == Route.DIAGNOSTIC_LOOP:
-        return "diagnostic"
-    if route == Route.PLANNER_THEN_CODER:
-        return "architecture"
-    return "minimal"
-
-
-def _coder_scope_for(intent: Intent) -> ScopeType:
-    if intent == Intent.FOLLOWUP:
-        return "patch_context"
-    return "expanded"
-
-
-# ── dynamic reasoning ─────────────────────────────────────────────────────────
-
-def _needs_thinking(
-    task: str, scope: ScopeType, route: Route, is_retry: bool, n_files: int
-) -> bool:
-    """CoT is disabled — the 8b model takes 20+ minutes with think=True on a 6 GB laptop
-    and causes Ollama server timeouts.  Context-rich prompts + PROVEN_WORK feedback give
-    the planner all the signal it needs without chain-of-thought."""
-    return False
-
-
-# ── message builders ──────────────────────────────────────────────────────────
-
-def _coder_context_block(ctx: ContextPackage, pm, step_mode: bool = False) -> str:
-    """Build the file-context section used in coder prompts.
-
-    Returns a string with test-file headers, stub-file headers, and done-source
-    excerpts — or an empty string if ctx has no files.
-
-    step_mode=True additionally classifies C# // TODO stubs as stubs (not "done").
-    """
-    if not ctx.files:
-        return ""
-    noise = ("README", "ARCH", "REQUIRE", "docs/", "CHANGELOG", "LICENSE")
-    test_files = [f for f in ctx.files
-                  if any(x in f.rel_path for x in ("test_", "_test.", ".spec.", ".test.",
-                                                     "Tests.", "Tests/", "tests/"))]
-    src_files  = [f for f in ctx.files
-                  if f not in test_files and not any(x in f.rel_path for x in noise)]
-
-    def _is_stub(f) -> bool:
-        c = f.content or ""
-        if "NotImplementedError" in c:
-            return True
-        # C# stubs: always detect TODO regardless of step_mode.
-        # Without this, the non-stepwise coder path classifies C# stubs as
-        # "done" files (do-not-rewrite), hiding them from the implementation prompt.
-        if "// TODO" in c or "/* TODO" in c:
-            return True
-        return False
-
-    stub_files = [f for f in src_files if _is_stub(f)]
-    done_files = [f for f in src_files if f not in stub_files]
-
-    parts: list[str] = []
-    if test_files:
-        parts.append(pm.get_snippet("test_files_header") or
-                     "TEST FILES — these define the exact API. Match every signature exactly:")
-        for f in test_files:
-            # Test files define the exact contract — give them full content (they're small).
-            parts.append(f"--- {f.rel_path} ---\n{f.excerpt(4000)}")
-    if stub_files:
-        names = ", ".join(f.rel_path for f in stub_files)
-        parts.append((pm.get_snippet("stub_files_header") or "STUB FILES — IMPLEMENT ALL: ") + names)
-        for f in stub_files:
-            parts.append(f"--- {f.rel_path} ---\n{f.excerpt(2500)}")
-    if done_files:
-        parts.append(pm.get_snippet("done_files_header") or
-                     "Already-implemented (reference only — do NOT rewrite unless plan says to):")
-        for f in done_files:
-            parts.append(f"--- {f.rel_path} ---\n{f.excerpt(1000)}")
-    return "\n\n".join(p for p in parts if p)
-
-
-def _planner_msg(task: str, ctx: ContextPackage, all_files: list | None = None, verify_hint: str = "") -> str:
-    pm = load_prompts()
-    parts: list[str] = []
-    if ctx.project_description:
-        parts.append(ctx.project_description)
-    if all_files and not ctx.project_description:
-        listing = "\n".join(f"  {e.rel_path}" for e in all_files[:100])
-        parts.append((pm.get_snippet("all_project_files_header") or "All project files:\n") + listing)
-    if ctx.memory_summary:
-        parts.append(ctx.memory_summary)
-    if ctx.files:
-        parts.append(pm.get_snippet("file_contents_header") or "File contents (most relevant):")
-        for f in ctx.files:
-            parts.append(f"--- {f.rel_path} ---\n{f.excerpt(1500)}")
-    if ctx.error_lines:
-        parts.append((pm.get_snippet("errors_header") or "Errors/logs:\n") + "\n".join(ctx.error_lines[:15]))
-    if verify_hint:
-        parts.append(verify_hint)
-    parts.append(f"{pm.get_snippet('task_label') or 'Task: '}{task}")
-    return "\n\n".join(p for p in parts if p)
-
-
-def _coder_msg(task: str, ctx: ContextPackage, plan: str) -> str:
-    pm = load_prompts()
-    parts: list[str] = []
-    if plan:
-        parts.append(f"{pm.get_snippet('plan_label') or 'Plan:\\n'}{plan}")
-    ctx_block = _coder_context_block(ctx, pm, step_mode=False)
-    if ctx_block:
-        parts.append(ctx_block)
-    if ctx.error_lines:
-        parts.append((pm.get_snippet("errors_short_header") or "Errors:\n") + "\n".join(ctx.error_lines[:10]))
-    parts.append(f"{pm.get_snippet('task_label') or 'Task: '}{task}")
-    return "\n\n".join(p for p in parts if p)
-
-
-def _planner_retry_msg(
-    task: str, prev_plan: str, verify_feedback: str, ctx: ContextPackage | None = None
-) -> str:
-    pm = load_prompts()
-    parts = [f"{pm.get_snippet('task_label') or 'Task: '}{task}"]
-    if ctx and ctx.files:
-        parts.append(pm.get_snippet("current_file_state_header") or "Current file state (updated since last iteration):")
-        for f in ctx.files:
-            parts.append(f"--- {f.rel_path} ---\n{f.excerpt(800)}")
-    parts.append(f"{pm.get_snippet('previous_plan_label') or 'Previous plan:\\n'}{prev_plan[:600]}")
-    fb_intro = pm.get_snippet("verify_feedback_intro") or "Verifier / test feedback — what still needs to be fixed:\n"
-    fb_action = pm.get_snippet("verify_feedback_action") or (
-        "Produce a precise plan for what the coder must implement to fix all issues. "
-        "List each file and function. For circular imports name the exact import line to remove."
-    )
-    parts.append(f"{fb_intro}{verify_feedback[:2000]}\n\n{fb_action}")
-    return "\n\n".join(parts)
-
-
-def _coder_retry_msg(
-    task: str, ctx: ContextPackage, plan: str, verify_feedback: str
-) -> str:
-    pm = load_prompts()
-    parts: list[str] = []
-    if ctx.files:
-        noise = ("README", "ARCH", "REQUIRE", "docs/", "CHANGELOG", "LICENSE")
-        test_files = [f for f in ctx.files
-                      if any(x in f.rel_path for x in ("test_", "_test.", ".spec.", ".test."))]
-        src_files  = [f for f in ctx.files
-                      if f not in test_files and not any(x in f.rel_path for x in noise)]
-        if test_files:
-            parts.append(pm.get_snippet("test_files_header_short") or "TEST FILES — exact API you must satisfy:")
-            for f in test_files:
-                parts.append(f"--- {f.rel_path} ---\n{f.excerpt(1000)}")
-        parts.append("Current source files:")
-        for f in src_files:
-            parts.append(f"--- {f.rel_path} ---\n{f.excerpt(1000)}")
-    parts.append(f"{pm.get_snippet('revised_plan_label') or 'Revised plan:\\n'}{plan}")
-    rf_intro = pm.get_snippet("required_fixes_intro") or "Required fixes:\n"
-    rf_action = pm.get_snippet("required_fixes_action") or "Fix ALL issues. Every NotImplementedError must be replaced."
-    parts.append(f"{rf_intro}{verify_feedback[:2000]}\n\n{rf_action}")
-    parts.append(f"{pm.get_snippet('task_label') or 'Task: '}{task}")
-    return "\n\n".join(p for p in parts if p)
-
-
-def _verify_msg(task: str, plan: str, coder_output: str, proof: ProvenWork | None = None) -> str:
-    pm = load_prompts()
-    proof_text = json.dumps(proof.to_dict(), ensure_ascii=False, indent=2) if proof else "{}"
-    tl = pm.get_snippet("task_label") or "Task: "
-    pl = pm.get_snippet("plan_label") or "Plan given to coder:\n"
-    cl = pm.get_snippet("proven_work_label") or "PROVEN_WORK evidence from Kratos runtime:\n"
-    return (
-        f"{tl}{task}\n\n"
-        f"{pl}{plan[:600]}\n\n"
-        f"Coder output:\n{coder_output[:2000]}\n\n"
-        f"{cl}{proof_text[:4000]}"
-    )
-
-
-def _clarification_msg(analysis, intent: Intent) -> str:
-    pm = load_prompts()
-    kw_str = ", ".join(analysis.keywords[:6]) if analysis.keywords else "none"
-    tmpl = pm.get_snippet("clarification_template") or (
-        "Your request is unclear. Detected keywords: [{kw}]. "
-        "Please specify: what should change, which file(s), and what the expected result is."
-    )
-    return tmpl.format(kw=kw_str)
-
-
-# ── direct search (no LLM) ────────────────────────────────────────────────────
-
-def _direct_file_search(indexer: ProjectIndexer, keywords: list[str], file_paths: list[str]) -> str:
-    results: list[str] = []
-    index = indexer.index
-    if not index:
-        return "No project files indexed."
-    for fp in file_paths:
-        fp_l = fp.lower().replace("\\", "/")
-        for e in index:
-            if fp_l in e.rel_path.lower():
-                results.append(f"  {e.rel_path}  [pri={e.priority}]")
-    for kw in keywords[:5]:
-        for e in index:
-            line = f"  {e.rel_path}  [pri={e.priority}]"
-            if kw.lower() in e.rel_path.lower() and line not in results:
-                results.append(line)
-    if not results:
-        top = [f"  {e.rel_path}" for e in index[:20]]
-        return "No direct matches. Top project files:\n" + "\n".join(top)
-    return "Matching files:\n" + "\n".join(results[:20])
-
-
-def _direct_code_search(indexer: ProjectIndexer, keywords: list[str]) -> str:
-    lines: list[str] = []
-    for kw in keywords[:3]:
-        hits = indexer.search_content(kw, max_results=8)
-        if hits:
-            lines.append(f"\nResults for '{kw}':")
-            for entry, lineno, text in hits:
-                lines.append(f"  {entry.rel_path}:{lineno}  {text}")
-    return "\n".join(lines) if lines else "No matches found in project files."
 
 
 # ── main agent ────────────────────────────────────────────────────────────────
@@ -882,7 +164,7 @@ class KratosAgent:
             "prompt_tokens": 0, "completion_tokens": 0
         }
 
-        # File operations extracted from last coder run — applied by caller
+        # File operations extracted from last coder run â€” applied by caller
         self.pending_file_changes:   list[tuple[str, str]] = []
         self.pending_file_deletions: list[str] = []
 
@@ -922,7 +204,7 @@ class KratosAgent:
         # ── context build ─────────────────────────────────────────────────────
         scope = _scope_for(route, intent)
         n_indexed = len(self._indexer.index)
-        yield ("tool", f"index_project({self._indexer.root.name!r}) → {n_indexed} files", "tool")
+        yield ("tool", f"index_project({self._indexer.root.name!r}) â†’ {n_indexed} files", "tool")
 
         ctx = self._ctx_builder.build(
             analysis, intent=intent.value, route=route.value,
@@ -937,7 +219,7 @@ class KratosAgent:
         )
         for f in ctx.files:
             sz = f"{f.size / 1024:.1f} KB" if f.size > 0 else "n/a"
-            yield ("tool", f"read_file({f.rel_path!r}) → {sz}", "tool")
+            yield ("tool", f"read_file({f.rel_path!r}) â†’ {sz}", "tool")
 
         # ── log context ───────────────────────────────────────────────────────
         yield ("log", json.dumps({
@@ -981,7 +263,7 @@ class KratosAgent:
             return
 
         if route == Route.CODER_ONLY:
-            # Git / shell / followup continuation — do not force the heavy "### FILE" format.
+            # Git / shell / followup continuation â€” do not force the heavy "### FILE" format.
             # Still goes through coder (so it benefits from max ctx + history), but prompt is light.
             yield ("header", "coder", "header")
             pm = load_prompts()
@@ -999,7 +281,7 @@ class KratosAgent:
             if chg:
                 self.pending_file_changes = chg
                 self.pending_file_deletions = _parse_file_deletions(cfull)
-                # (apply happens in caller via _show_file_ops + the agent already wrote? no — for this path we apply here for consistency)
+                # (apply happens in caller via _show_file_ops + the agent already wrote? no â€” for this path we apply here for consistency)
                 root = self._indexer.root
                 for rp, ct in chg:
                     try:
@@ -1010,7 +292,7 @@ class KratosAgent:
                         pass
             return
 
-        # ── plan → code → verify loop ─────────────────────────────────────────
+        # ── plan â†’ code â†’ verify loop ─────────────────────────────────────────
         max_iter   = self.config.max_verify_iterations
         plan_text  = ""
         verify_feedback = ""
@@ -1025,7 +307,7 @@ class KratosAgent:
             iter_label = f"iteration {attempt + 1}/{max_iter}"
 
             if is_retry:
-                yield ("info", f"Revising — {iter_label}", "info")
+                yield ("info", f"Revising â€” {iter_label}", "info")
                 self._indexer.build_index()
                 ctx = self._ctx_builder.build(
                     analysis, intent=intent.value, route=route.value,
@@ -1046,7 +328,7 @@ class KratosAgent:
             )
             raw_tokens = estimate(planner_input_raw)
             if relay_needed(raw_tokens, self.config.planner_num_ctx, self.config.relay_threshold):
-                yield ("info", f"Large input ({raw_tokens} est. tokens) → relay pre-process", "info")
+                yield ("info", f"Large input ({raw_tokens} est. tokens) â†’ relay pre-process", "info")
                 yield ("header", "relay", "header")
                 relayed = self._compressor.relay_large_input(task, planner_input_raw)
                 planner_input = relayed
@@ -1064,7 +346,7 @@ class KratosAgent:
                 yield ("end", "planner", "end")
                 plan_text = plan_full
 
-            # ── 3. Coder — STEPWISE per plan item (with inline test verify) ───
+            # ── 3. Coder â€” STEPWISE per plan item (with inline test verify) ───
             # This is the core "coder must think every step from plan, show command,
             # implement, verify with test, then continue every step".
             # Verifier later sees the full per-step PROVEN_WORK evidence.
@@ -1122,7 +404,7 @@ class KratosAgent:
                     disk_section = ""
                     if _disk_reads:
                         _ds_parts = [
-                            "CURRENT FILE STATE ON DISK (actual content right now — "
+                            "CURRENT FILE STATE ON DISK (actual content right now â€” "
                             "fix any errors you see, use these types/signatures exactly):"
                         ]
                         for _ref, _excerpt in _disk_reads:
@@ -1144,7 +426,7 @@ class KratosAgent:
                         f"{pm.get_snippet('step_input_full_task_label') or 'Full task: '}{task}\n\n"
                         f"{pm.get_snippet('step_input_overall_plan_label') or 'OVERALL PLAN (for reference):\\n'}{plan_text[:1500]}\n\n"
                         + (f"{_cmd_block}\n\n" if _cmd_block else "")
-                        + (f"PROJECT FILES (types, test contracts — match signatures exactly):\n{ctx_block}\n\n" if ctx_block else "")
+                        + (f"PROJECT FILES (types, test contracts â€” match signatures exactly):\n{ctx_block}\n\n" if ctx_block else "")
                         + disk_section
                         + _step_file_constraint
                         + f"{cur_label}{step}\n\n"
@@ -1173,7 +455,7 @@ class KratosAgent:
                     self._memory.track_files([p for p, _ in step_changes])
 
                     # Apply writes for this step immediately (so next step + tests see it).
-                    # No SHA256 read-back — write success is proven by compile+test, not byte comparison.
+                    # No SHA256 read-back â€” write success is proven by compile+test, not byte comparison.
                     for rel_path, content in step_changes:
                         target = (project_root / rel_path).resolve()
                         try:
@@ -1306,9 +588,9 @@ class KratosAgent:
                         except OSError:
                             pass
 
-                    # Step failed — continue so all stubs get implemented before outer retry
+                    # Step failed â€” continue so all stubs get implemented before outer retry
                     if _step_failed:
-                        yield ("warn", f"Step {step_num} failed — continuing with remaining steps", "warn")
+                        yield ("warn", f"Step {step_num} failed â€” continuing with remaining steps", "warn")
                         continue
 
             else:
@@ -1460,7 +742,7 @@ class KratosAgent:
 
             if "UNSOLVABLE" in vf_upper:
                 reason = verify_full.replace("UNSOLVABLE:", "").replace("UNSOLVABLE", "").strip()
-                yield ("warn", f"Task cannot be solved — {reason[:300]}", "warn")
+                yield ("warn", f"Task cannot be solved â€” {reason[:300]}", "warn")
                 yield ("log", json.dumps({"type": "verify_decision", "decision": "UNSOLVABLE",
                                           "feedback": verify_full, "iteration": attempt + 1}), "log")
                 # Rollback files written during this run
@@ -1474,11 +756,11 @@ class KratosAgent:
                                           "feedback": "", "iteration": attempt + 1}), "log")
                 self._record_solution([p for p, _ in self.pending_file_changes],
                                       attempt + 1, task, plan_text, coder_full_for_verify or plan_text, proof)
-                yield ("info", "PROVEN_WORK accepted — verification commands ran and passed.", "info")
+                yield ("info", "PROVEN_WORK accepted â€” verification commands ran and passed.", "info")
                 if attempt > 0:
                     yield ("info", f"Verified after {attempt + 1} iteration(s).", "info")
 
-                # Final extra verification pass — verifier "really does the tests"
+                # Final extra verification pass â€” verifier "really does the tests"
                 final_cmds = self._verification_commands(route)
                 if final_cmds:
                     yield ("info", "Final full verification sweep...", "info")
@@ -1494,7 +776,7 @@ class KratosAgent:
                             break
                     if not all_ok:
                         # demote to revision even if LLM said verified (strict)
-                        verify_feedback = "Final verification sweep failed — one or more tests did not pass after VERIFIED."
+                        verify_feedback = "Final verification sweep failed â€” one or more tests did not pass after VERIFIED."
                         yield ("warn", verify_feedback, "warn")
                         if attempt < max_iter - 1:
                             continue
@@ -1505,9 +787,9 @@ class KratosAgent:
             yield ("log", json.dumps({"type": "verify_decision", "decision": "NEEDS_REVISION",
                                       "feedback": verify_full, "iteration": attempt + 1}), "log")
             if attempt < max_iter - 1:
-                yield ("warn", f"Needs revision ({attempt + 1}/{max_iter}) — {verify_feedback[:200]}", "warn")
+                yield ("warn", f"Needs revision ({attempt + 1}/{max_iter}) â€” {verify_feedback[:200]}", "warn")
             else:
-                yield ("warn", f"Safety cap ({max_iter} iterations) reached — review manually.", "warn")
+                yield ("warn", f"Safety cap ({max_iter} iterations) reached â€” review manually.", "warn")
 
     # ── model runners ─────────────────────────────────────────────────────────
 
@@ -1518,7 +800,7 @@ class KratosAgent:
         """Compress history in-place if it's approaching the context limit.
 
         If _pending_events is provided, appends a (source, content, kind) tuple
-        so the caller can yield it — making compression visible in the UI.
+        so the caller can yield it â€” making compression visible in the UI.
         """
         if not self.config.auto_compress:
             return False
@@ -1530,7 +812,7 @@ class KratosAgent:
                 short_model = model.split("/")[-1].split(":")[0]
                 _pending_events.append(
                     ("compress",
-                     f"Auto-compressed {short_model} history  {tok:,} tokens → keep 4 pairs",
+                     f"Auto-compressed {short_model} history  {tok:,} tokens â†’ keep 4 pairs",
                      "info")
                 )
             return compressed
@@ -1611,7 +893,7 @@ class KratosAgent:
         # Guard: if CoT exhausted the token budget before producing any output,
         # re-run immediately with think=False using the same prompt.
         if not full.strip() and needs_thinking:
-            yield ("warn", "CoT used all token budget — retrying without chain-of-thought", "warn")
+            yield ("warn", "CoT used all token budget â€” retrying without chain-of-thought", "warn")
             try:
                 for token, kind in self.bridge.chat(
                     model=self.config.planner_model,
@@ -1743,7 +1025,7 @@ class KratosAgent:
             yield ("warn", "Verifier interrupted.", "warn")
         except Exception as exc:
             yield ("error", f"Verifier failed: {exc}", "error")
-            full = "NEEDS_REVISION: verifier error — treat as unverified"
+            full = "NEEDS_REVISION: verifier error â€” treat as unverified"
 
         yield ("log", json.dumps({"type": "model_output", "role": "verifier",
                                    "chars": len(full)}), "log")
