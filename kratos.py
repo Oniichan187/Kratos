@@ -160,7 +160,13 @@ if _HAS_PT:
 
         def prompt(self) -> str:
             """Block until Enter; return stripped text. Raises KeyboardInterrupt / EOFError."""
+            import sys as _sys
             import shutil
+            # Push cursor toward terminal bottom so the frame always anchors there,
+            # regardless of how many lines the previous agent output printed.
+            _rows = shutil.get_terminal_size((80, 24)).lines
+            _sys.stdout.write("\n" * max(0, _rows - 7))
+            _sys.stdout.flush()
             from prompt_toolkit.application import Application as _App
             from prompt_toolkit.layout import Layout as _Lay
             from prompt_toolkit.layout.containers import HSplit as _HS, Window as _W
@@ -589,13 +595,6 @@ def main() -> None:
     _session_start = time.time()
 
     GLOBAL_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Push cursor to bottom of terminal so the frame appears anchored there
-    # on startup (subsequent prompts are already at the bottom after output).
-    import shutil as _sh
-    _rows = _sh.get_terminal_size((80, 24)).lines
-    sys.stdout.write("\n" * max(0, _rows - 8))
-    sys.stdout.flush()
 
     # Live ctx tracking: updated by _stream_agent as model calls report token counts.
     _ctx_live: dict[str, tuple[int, int]] = {
