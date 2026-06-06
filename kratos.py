@@ -43,11 +43,6 @@ try:
 except ImportError:
     _HAS_PT = False
 
-try:
-    from rich.live import Live
-    from rich.layout import Layout
-except ImportError:
-    pass
 
 from kratos.config import KratosConfig, GLOBAL_DIR
 from kratos.bridge import OllamaBridge
@@ -58,10 +53,8 @@ from kratos.prompts import load_prompts, reload_prompts
 from kratos.ui import (
     console,
     print_banner, print_error, print_info, print_warn, print_success,
-    print_user_msg, print_section_time,
-    print_usage, print_ctx_bar, print_compress_event,
-    route_info, tool_call,
-    LiveBuffer, status_bar, user_message_panel, task_summary_panel,
+    print_usage,
+    user_message_panel, task_summary_panel,
     section_banner, elapsed_str,
 )
 
@@ -315,18 +308,13 @@ def _show_file_ops(agent: KratosAgent, logger: "SessionLogger | None" = None) ->
 # ── coder output filter ───────────────────────────────────────────────────────
 
 class _CoderFilter:
-    """Line-buffer that shows only file-operation markers and the SUMMARY section.
+    """Suppress code bodies; print only file-op markers and the SUMMARY section."""
 
-    The raw code bodies are suppressed — the agent wrote them to disk.
-    Output goes to a LiveBuffer instead of directly to console.
-    """
-
-    def __init__(self, buffer: "LiveBuffer") -> None:
+    def __init__(self) -> None:
         self._buf: str = ""
         self._in_summary = False
         self._in_code = False
         self._seen: set[str] = set()
-        self._buffer = buffer
 
     def feed(self, token: str) -> None:
         self._buf += token
@@ -353,23 +341,24 @@ class _CoderFilter:
             path = s[len(fm):].strip()
             if path and path not in self._seen:
                 self._seen.add(path)
-                self._buffer.add(f"  ↳ write_file({path!r})", "dim blue")
+                console.print(f"  [dim blue]↳[/dim blue] write_file([dim]{path!r}[/dim])")
             self._in_summary = False
             self._in_code = False
         elif s.startswith(dm):
             path = s[len(dm):].strip()
             if path:
-                self._buffer.add(f"  ↳ delete_file({path!r})", "dim blue")
+                console.print(f"  [dim blue]↳[/dim blue] delete_file([dim]{path!r}[/dim])")
             self._in_summary = False
             self._in_code = False
         elif s.startswith(sm):
             self._in_summary = True
             self._in_code = False
-            self._buffer.add("  ── Summary ──", "dim")
+            console.print()
+            console.print("  [dim]── Summary ──[/dim]")
         elif s.startswith("```"):
             self._in_code = not self._in_code
         elif self._in_summary and not self._in_code and s:
-            self._buffer.add(f"  {s}", "dim")
+            console.print(f"  [dim]{s}[/dim]")
 
 
 # ── agent streaming ───────────────────────────────────────────────────────────
@@ -378,15 +367,11 @@ def _stream_agent(
     agent: KratosAgent, task: str, logger: "SessionLogger",
     _ctx_state: "dict | None" = None,
 ) -> float:
-    """Run the pipeline with rich.live.Live for a persistent bottom status bar.
+    """Run the agent pipeline; stream output inline via console.print.
 
-    Streaming output goes to an alternate screen via ``Live(screen=True)``.
-    After the task completes, the full output + summary are printed to the
-    main screen so prompt_toolkit can continue below them.
-
-    Returns the total elapsed seconds.
+    No alternate screen / Live — output prints directly so the chat
+    history accumulates above the prompt frame.  Returns elapsed seconds.
     """
-    # Shared state
     ctx_live: dict[str, tuple[int, int]] = {
         "planner": (0, agent.config.planner_num_ctx),
         "coder":   (0, agent.config.coder_num_ctx),
@@ -397,189 +382,132 @@ def _stream_agent(
     task_start = time.monotonic()
     planner_buf = ""
     coder_buf = ""
+    coder_filter = _CoderFilter()
 
-    # Render output through LiveBuffer → Live display
-    body = LiveBuffer(max_lines=400)
-    coder_filter = _CoderFilter(body)
-
-    # ── build user label for footer (merged with status bar) ──────────────
-    from rich.markup import escape as _escape
-    _user_label = _escape(task)
-    if len(_user_label) > 60:
-        _user_label = _user_label[:57] + "…"
-
-    # ── build 2-row layout: body | footer ─────────────────────────────────
-    layout = Layout()
-    layout.split_column(
-        Layout(name="body", ratio=1, minimum_size=1),
-        Layout(name="footer", size=4),
-    )
-
-    def _make_footer(elapsed: float, section: str) -> "Panel":
-        return status_bar(
-            agent.config.scope or "project",
-            agent.config.permission,
-            ctx_live,
-            elapsed,
-            Path.cwd().name,
-            current_section=section,
-            session_tokens=(
-                agent.session_usage.get("prompt_tokens", 0),
-                agent.session_usage.get("completion_tokens", 0),
-            ),
-            goal=agent.config.goal,
-            user_label=_user_label,
-            hint="^C stop",
-        )
-
-    def _section_model(role: str) -> str:
-        if role == "planner":
-            return agent.config.planner_model
-        if role == "coder":
-            return agent.config.coder_model
-        if role == "verify":
-            return agent.config.verifier_model
+    def _smodel(role: str) -> str:
+        if role == "planner": return agent.config.planner_model
+        if role == "coder":   return agent.config.coder_model
+        if role == "verify":  return agent.config.verifier_model
         return ""
 
-    def _log_tool(content: str) -> None:
-        if "(" in content:
-            name = content[:content.index("(")]
-            args_str = content[content.index("(") + 1:content.rindex(")")]
-            result = ""
-            if "→" in content:
-                result = content.split("→")[-1].strip()
-            elif "->" in content:
-                result = content.split("->")[-1].strip()
-            logger.log_tool(name=name, args={"raw": args_str}, result=result)
+    def _log_tool(c: str) -> None:
+        if "(" in c:
+            name = c[:c.index("(")]
+            args = c[c.index("(") + 1:c.rindex(")")]
+            res = c.split("→")[-1].strip() if "→" in c else (c.split("->")[-1].strip() if "->" in c else "")
+            logger.log_tool(name=name, args={"raw": args}, result=res)
         else:
-            logger.log_tool(name=content, args={})
-
-    layout["body"].update(body.render())
-    layout["footer"].update(_make_footer(0, ""))
+            logger.log_tool(name=c, args={})
 
     try:
-        with Live(layout, screen=True, refresh_per_second=10,
-                  transient=True) as live:
+        for source, content, kind in agent.process(task):
 
-            for source, content, kind in agent.process(task):
-                elapsed = time.monotonic() - task_start
-
-                # ── log events (never shown in UI) ─────────────────────────
-                if source == "log":
-                    if logger.enabled:
-                        try:
-                            import json as _json
-                            data = _json.loads(content)
-                            event_type = data.pop("type", "unknown")
-                            logger._write(event_type, **data)
-                        except Exception:
-                            pass
-
-                elif source == "router":
-                    body.add(f"  ⟶  {content}", "dim cyan")
-                    parts = dict(p.split("=", 1) for p in content.split("  ") if "=" in p)
-                    logger.log_route(intent=parts.get("intent", ""), route=parts.get("route", ""))
-
-                elif source == "tool":
-                    body.add(f"  ↳ {content}", "dim blue")
-                    _log_tool(content)
-
-                elif source == "header":
-                    current_section = content
-                    section_start = time.monotonic()
-                    body.add("", "")
-                    body.add(section_banner(content, _section_model(content)).plain, _role_style_for(content))
-
-                elif source == "planner":
-                    if kind == "think":
-                        body.add(content, "dim italic")
-                    else:
-                        planner_buf += content
-                        body.add(content, "")
-
-                elif source == "verify":
-                    if kind == "think":
-                        body.add(content, "dim italic")
-                    else:
-                        body.add(content, "")
-
-                elif source == "coder":
-                    if kind == "think":
-                        body.add(content, "dim italic")
-                    else:
-                        coder_buf += content
-                        coder_filter.feed(content)
-
-                elif source == "relay":
-                    pass
-
-                elif source == "direct":
-                    body.add("", "")
-                    body.add(section_banner("direct", "").plain, _role_style_for("direct"))
-                    body.add(content, "")
-
-                elif source == "usage":
+            if source == "log":
+                if logger.enabled:
                     try:
-                        import json as _json
-                        d = _json.loads(content)
-                        logger._write("token_usage", **d)
+                        import json as _j
+                        d = _j.loads(content); et = d.pop("type", "unknown")
+                        logger._write(et, **d)
                     except Exception:
                         pass
 
-                elif source == "end":
-                    sec_elapsed = time.monotonic() - section_start
-                    body.add(f"  ⏱ {elapsed_str(sec_elapsed)}", "dim")
-                    body.add("", "")
-                    if current_section == "planner" and planner_buf:
-                        logger.log_model_output("planner", agent.config.planner_model, planner_buf)
-                        planner_buf = ""
-                    elif current_section == "coder":
-                        coder_filter.flush()
-                        if coder_buf:
-                            logger.log_model_output("coder", agent.config.coder_model, coder_buf)
-                        coder_buf = ""
-                    current_section = ""
+            elif source == "router":
+                console.print(f"  [dim cyan]⟶[/dim cyan]  [dim]{content}[/dim]")
+                kv = dict(p.split("=", 1) for p in content.split("  ") if "=" in p)
+                logger.log_route(intent=kv.get("intent", ""), route=kv.get("route", ""))
 
-                elif source == "info":
-                    body.add(f"  ℹ  {content}", "blue")
-                    logger.log_info(content)
+            elif source == "tool":
+                console.print(f"  [dim blue]↳[/dim blue]  [dim]{content}[/dim]")
+                _log_tool(content)
 
-                elif source == "warn":
-                    body.add(f"  ⚠  {content}", "yellow")
+            elif source == "header":
+                current_section = content
+                section_start = time.monotonic()
+                console.print()
+                console.print(section_banner(content, _smodel(content)))
 
-                elif source == "error":
-                    body.add(f"  ✗  {content}", "bold red")
-                    logger.log_error(content)
+            elif source == "planner":
+                if kind == "think":
+                    console.print(content, end="", style="dim italic", highlight=False)
+                else:
+                    console.print(content, end="", highlight=False)
+                    planner_buf += content
 
-                elif source == "ctx_info":
-                    parts = content.split("|")
-                    if len(parts) == 3:
-                        try:
-                            role_name, used_s, total_s = parts[0], int(parts[1]), int(parts[2])
-                            ctx_live[role_name] = (used_s, total_s)
-                            if _ctx_state is not None:
-                                _ctx_state[role_name] = (used_s, total_s)
-                        except ValueError:
-                            pass
+            elif source == "verify":
+                if kind == "think":
+                    console.print(content, end="", style="dim italic", highlight=False)
+                else:
+                    console.print(content, end="", highlight=False)
 
-                elif source == "compress":
-                    body.add(f"  ⇒ compress  {content}", "magenta")
-                    logger.log_info(f"[compress] {content}")
+            elif source == "coder":
+                if kind == "think":
+                    console.print(content, end="", style="dim italic", highlight=False)
+                else:
+                    coder_buf += content
+                    coder_filter.feed(content)
 
-                elif source == "question":
-                    body.add("", "")
-                    body.add(f"  Kratos: {content}", "cyan")
+            elif source == "direct":
+                console.print()
+                console.print(section_banner("direct", ""))
+                console.print(content, highlight=False)
 
-                # Update the Live display
-                layout["body"].update(body.render())
-                layout["footer"].update(_make_footer(elapsed, current_section))
+            elif source == "usage":
+                try:
+                    import json as _j
+                    d = _j.loads(content); logger._write("token_usage", **d)
+                except Exception:
+                    pass
+
+            elif source == "end":
+                sec_elapsed = time.monotonic() - section_start
+                console.print()
+                console.print(f"  [dim]⏱ {elapsed_str(sec_elapsed)}[/dim]")
+                console.print()
+                if current_section == "planner" and planner_buf:
+                    logger.log_model_output("planner", agent.config.planner_model, planner_buf)
+                    planner_buf = ""
+                elif current_section == "coder":
+                    coder_filter.flush()
+                    if coder_buf:
+                        logger.log_model_output("coder", agent.config.coder_model, coder_buf)
+                    coder_buf = ""
+                current_section = ""
+                if _ctx_state is not None:
+                    _ctx_state.update(ctx_live)
+
+            elif source == "info":
+                console.print(f"  [blue]ℹ[/blue]  [dim]{content}[/dim]")
+                logger.log_info(content)
+
+            elif source == "warn":
+                console.print(f"  [yellow]⚠[/yellow]  {content}")
+
+            elif source == "error":
+                console.print(f"  [bold red]✗[/bold red]  {content}")
+                logger.log_error(content)
+
+            elif source == "ctx_info":
+                pc = content.split("|")
+                if len(pc) == 3:
+                    try:
+                        rn, us, ts = pc[0], int(pc[1]), int(pc[2])
+                        ctx_live[rn] = (us, ts)
+                        if _ctx_state is not None:
+                            _ctx_state[rn] = (us, ts)
+                    except ValueError:
+                        pass
+
+            elif source == "compress":
+                console.print(f"  [magenta]⇒ compress[/magenta]  [dim]{content}[/dim]")
+                logger.log_info(f"[compress] {content}")
+
+            elif source == "question":
+                console.print()
+                console.print(f"  [cyan]Kratos:[/cyan] {content}")
 
     except KeyboardInterrupt:
-        # Live context already exited; fall through to summary
-        pass
-
-    # ── post-stream: print output + summary to main screen ────────────────
-    console.print(body.render())
+        console.print()
+        console.print("[yellow]⚠[/yellow]  Interrupted.")
 
     _show_file_ops(agent, logger)
     console.print()
@@ -589,21 +517,9 @@ def _stream_agent(
     usage = agent.session_usage
     tok = (usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
     console.print(task_summary_panel(total_elapsed, files, tok))
+    console.print()
 
     return total_elapsed
-
-
-def _role_style_for(role: str) -> str:
-    return {
-        "planner": "bold cyan", "coder": "bold green", "verify": "bold yellow",
-        "relay": "bold magenta", "direct": "bold blue",
-    }.get(role, "bold")
-
-
-# (The previous custom prompt_toolkit full-screen "chat" execution view with its
-# own bottom input window has been removed. See comment in the main REPL loop
-# for why we now use the stable rich Live path for everything after you submit
-# a real prompt.)
 
 
 # ── startup checks ────────────────────────────────────────────────────────────
@@ -673,6 +589,13 @@ def main() -> None:
     _session_start = time.time()
 
     GLOBAL_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Push cursor to bottom of terminal so the frame appears anchored there
+    # on startup (subsequent prompts are already at the bottom after output).
+    import shutil as _sh
+    _rows = _sh.get_terminal_size((80, 24)).lines
+    sys.stdout.write("\n" * max(0, _rows - 8))
+    sys.stdout.flush()
 
     # Live ctx tracking: updated by _stream_agent as model calls report token counts.
     _ctx_live: dict[str, tuple[int, int]] = {
