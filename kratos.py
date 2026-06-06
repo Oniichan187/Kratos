@@ -162,8 +162,12 @@ if _HAS_PT:
             """Block until Enter; return stripped text. Raises KeyboardInterrupt / EOFError."""
             import sys as _sys
             import shutil
-            # Push cursor toward terminal bottom so the frame always anchors there,
-            # regardless of how many lines the previous agent output printed.
+            # Save cursor position here (right after last output line).
+            # After app.run() we restore to this point and clear to end of screen,
+            # which removes both the blank-line push and the frame without touching
+            # any content above — even if erase_when_done left residue.
+            _sys.stdout.write("\033[s")
+            # Push cursor toward terminal bottom so the frame always anchors there.
             _rows = shutil.get_terminal_size((80, 24)).lines
             _sys.stdout.write("\n" * max(0, _rows - 7))
             _sys.stdout.flush()
@@ -256,6 +260,12 @@ if _HAS_PT:
                 mouse_support=False,
             )
             result = app.run()
+            # Restore cursor to the saved position (before blank-line push),
+            # then clear everything from there to end of screen.
+            # This guarantees the frame and padding are fully gone regardless of
+            # whether erase_when_done worked correctly on this terminal.
+            _sys.stdout.write("\033[u\033[0J")
+            _sys.stdout.flush()
             return (result or "").strip()
 
 else:
