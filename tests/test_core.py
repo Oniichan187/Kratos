@@ -4,8 +4,10 @@ Run:  python -m pytest tests/ -v
 or:   python tests/test_core.py
 """
 
+import os
 import sys
 import json
+import tempfile
 import threading
 import types
 import unittest
@@ -39,7 +41,8 @@ from kratos.verification import (
     CommandRegistry,
 )
 from kratos.execution.parsing import _parse_file_changes, _parse_file_deletions
-from kratos.roles import _coder_context_block
+from kratos.execution.tools import parse_actions, do_read, do_write, do_delete, do_command
+from kratos.roles import _coder_context_block, run_coder_loop
 from kratos.config import KratosConfig
 from kratos.llm.bridge import OllamaBridge
 from kratos.classifier import IntentClassifier, Intent
@@ -52,6 +55,15 @@ from kratos.prompts import (
     load_prompts, get_system, get_snippet, get_predict, get_marker,
     reload_prompts,
 )
+
+
+def drain_generator(gen):
+    events = []
+    while True:
+        try:
+            events.append(next(gen))
+        except StopIteration as exc:
+            return events, exc.value
 
 
 # ── Token estimates ───────────────────────────────────────────────────────────
@@ -288,6 +300,300 @@ public sealed class TaskParser {}
 """
         changes = _parse_file_changes(text)
         self.assertEqual(changes, [("src/TaskParser.cs", "public sealed class TaskParser {}\n")])
+
+
+class TestCoderActionTools(unittest.TestCase):
+    def test_parse_actions_accepts_tolerant_markers(self):
+        pm = load_prompts()
+        text = """### read src/app.py
+
+### file src/app.py
+```python
+VALUE = 1
+```
+
+### RUN python -m pytest tests
+### verify: npm run build
+### done:
+### delete old.py
+"""
+        actions = parse_actions(text, pm)
+        self.assertEqual(actions["reads"], ["src/app.py"])
+        self.assertEqual(actions["files"], [("src/app.py", "VALUE = 1\n")])
+        self.assertEqual(actions["deletes"], ["old.py"])
+        self.assertEqual(actions["commands"], ["python -m pytest tests", "npm run build"])
+        self.assertTrue(actions["done"])
+
+    def test_read_write_delete_handlers_update_disk_and_proof(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proof = ProvenWork(iteration=1)
+            snapshots = {}
+
+            _, write_obs = drain_generator(do_write(root, "src/app.py", "VALUE = 1\n", proof, 0, snapshots))
+            self.assertTrue(write_obs["ok"])
+            self.assertEqual((root / "src" / "app.py").read_text(encoding="utf-8"), "VALUE = 1\n")
+            self.assertIn("src/app.py", proof.files_changed)
+            self.assertTrue(proof.file_checks[-1]["ok"])
+
+            _, read_obs = drain_generator(do_read(root, "src/app.py"))
+            self.assertTrue(read_obs["ok"])
+            self.assertIn("VALUE = 1", read_obs["content"])
+
+            _, delete_obs = drain_generator(do_delete(root, "src/app.py", proof, 0, snapshots))
+            self.assertTrue(delete_obs["ok"])
+            self.assertFalse((root / "src" / "app.py").exists())
+
+    def test_handlers_refuse_path_escape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proof = ProvenWork(iteration=1)
+            _, write_obs = drain_generator(do_write(root, "../escape.py", "x", proof, 0, {}))
+            _, read_obs = drain_generator(do_read(root, "../escape.py"))
+            self.assertFalse(write_obs["ok"])
+            self.assertFalse(read_obs["ok"])
+            self.assertFalse((root.parent / "escape.py").exists())
+
+    def test_command_handler_skips_unsafe_mismatch_and_missing_paths(self):
+        class FakeAgent:
+            def __init__(self):
+                self.calls = 0
+
+            def _run_verification_command(self, command):
+                self.calls += 1
+                return {
+                    "cmd": command.cmd,
+                    "purpose": command.purpose,
+                    "source": command.source,
+                    "is_test": command.is_test,
+                    "exit_code": 0,
+                    "duration_seconds": 0.01,
+                    "output": "ok",
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            proof = ProvenWork(iteration=1)
+            agent = FakeAgent()
+
+            python_reg = CommandRegistry(KratosConfig(always_max_ctx=False), root).discover()
+            _, unsafe = drain_generator(do_command(agent, root, python_reg, "echo hello", proof))
+            self.assertTrue(unsafe["skipped"])
+
+            _, missing = drain_generator(do_command(agent, root, python_reg, "python -m pytest tests/test_missing.py", proof))
+            self.assertTrue(missing["skipped"])
+
+            dotnet_root = root / "dotnet_only"
+            dotnet_root.mkdir()
+            (dotnet_root / "App.sln").write_text("", encoding="utf-8")
+            dotnet_reg = CommandRegistry(KratosConfig(always_max_ctx=False), dotnet_root).discover()
+            _, mismatch = drain_generator(do_command(agent, dotnet_root, dotnet_reg, "python -m pytest tests", proof))
+            self.assertTrue(mismatch["skipped"])
+            self.assertEqual(agent.calls, 0)
+
+    def test_command_handler_executes_safe_command_through_agent(self):
+        class FakeAgent:
+            def __init__(self):
+                self.calls = []
+
+            def _run_verification_command(self, command):
+                self.calls.append(command)
+                return {
+                    "cmd": command.cmd,
+                    "purpose": command.purpose,
+                    "source": command.source,
+                    "is_test": command.is_test,
+                    "exit_code": 0,
+                    "duration_seconds": 0.01,
+                    "output": "passed",
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            reg = CommandRegistry(KratosConfig(always_max_ctx=False), root).discover()
+            proof = ProvenWork(iteration=1)
+            agent = FakeAgent()
+            _, obs = drain_generator(do_command(agent, root, reg, "python -m pytest tests", proof))
+            self.assertFalse(obs["skipped"])
+            self.assertTrue(obs["ok"])
+            self.assertEqual(len(agent.calls), 1)
+            self.assertEqual(proof.commands[-1]["exit_code"], 0)
+
+
+class TestCoderReActLoop(unittest.TestCase):
+    class FakeAgent:
+        def __init__(self, root: Path, outputs: list[str], command_results: list[dict], **cfg):
+            self.config = KratosConfig(always_max_ctx=False, **cfg)
+            self.pending_file_changes = []
+            self.pending_file_deletions = []
+            self._memory = MagicMock()
+            self._knowledge = None
+            self._outputs = list(outputs)
+            self.command_results = list(command_results)
+            self.prompts = []
+            self._indexer = types.SimpleNamespace(root=root)
+
+        def _is_cancelled(self):
+            return False
+
+        def _run_coder(self, msg):
+            self.prompts.append(msg)
+            out = self._outputs.pop(0)
+            yield ("coder", out, "text")
+            return out
+
+        def _run_verification_command(self, command):
+            result = dict(self.command_results.pop(0))
+            result.update({
+                "cmd": command.cmd,
+                "purpose": command.purpose,
+                "source": command.source,
+                "is_test": command.is_test,
+            })
+            return result
+
+    def _ctx(self):
+        from kratos.context import ContextPackage
+        return ContextPackage(user_input="test", intent="coding", route="planner_then_coder")
+
+    def test_loop_converges_after_write_fail_read_fix_pass_done(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            reg = CommandRegistry(KratosConfig(always_max_ctx=False), root).discover()
+            outputs = [
+                """### FILE: src/calc.py
+```python
+def add(a, b):
+    return a - b
+```
+### VERIFY: python -m pytest tests
+""",
+                "### READ: src/calc.py",
+                """### FILE: src/calc.py
+```python
+def add(a, b):
+    return a + b
+```
+### VERIFY: python -m pytest tests
+""",
+                "### DONE",
+            ]
+            results = [
+                {"exit_code": 1, "duration_seconds": 0.01, "output": "AssertionError: expected 3"},
+                {"exit_code": 0, "duration_seconds": 0.01, "output": "1 passed"},
+            ]
+            agent = self.FakeAgent(root, outputs, results, permission="mid", max_coder_iterations=6)
+            proof = ProvenWork(iteration=1)
+
+            events, result = drain_generator(run_coder_loop(
+                agent, "fix add", "plan", None, Intent.CODING, Route.PLANNER_THEN_CODER,
+                self._ctx(), reg, proof, 0, "", root, {},
+            ))
+            transcript, changes, deletions = result
+
+            self.assertEqual(changes["src/calc.py"], "def add(a, b):\n    return a + b\n")
+            self.assertEqual(deletions, set())
+            self.assertEqual((root / "src" / "calc.py").read_text(encoding="utf-8"), changes["src/calc.py"])
+            self.assertEqual([c["exit_code"] for c in proof.commands], [1, 0])
+            self.assertTrue(_proven_work_satisfied(proof, require_test=True))
+            self.assertEqual(len(agent.prompts), 4)
+            self.assertIn("AssertionError", agent.prompts[1])
+            self.assertIn("return a - b", agent.prompts[2])
+            self.assertIn("CODER LOOP ITERATION 3", transcript)
+            self.assertTrue(any("converged" in ev[1] for ev in events if ev[0] == "info"))
+
+    def test_loop_honors_max_iterations_without_done(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            reg = CommandRegistry(KratosConfig(always_max_ctx=False), root).discover()
+            outputs = [
+                "### VERIFY: python -m pytest tests",
+                "### VERIFY: python -m pytest tests",
+            ]
+            results = [
+                {"exit_code": 0, "duration_seconds": 0.01, "output": "1 passed"},
+                {"exit_code": 0, "duration_seconds": 0.01, "output": "1 passed"},
+            ]
+            agent = self.FakeAgent(root, outputs, results, max_coder_iterations=2)
+            proof = ProvenWork(iteration=1)
+
+            events, _ = drain_generator(run_coder_loop(
+                agent, "fix", "plan", None, Intent.CODING, Route.PLANNER_THEN_CODER,
+                self._ctx(), reg, proof, 0, "", root, {},
+            ))
+            self.assertEqual(len(agent.prompts), 2)
+            self.assertTrue(any("max_coder_iterations=2" in ev[1] for ev in events if ev[0] == "warn"))
+
+    def test_loop_permission_gate_skips_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            reg = CommandRegistry(KratosConfig(always_max_ctx=False), root).discover()
+            outputs = ["""### FILE: blocked.py
+```python
+VALUE = 1
+```"""]
+            agent = self.FakeAgent(root, outputs, [], permission="low", max_coder_iterations=1)
+            proof = ProvenWork(iteration=1)
+
+            events, result = drain_generator(run_coder_loop(
+                agent, "write", "plan", None, Intent.CODING, Route.PLANNER_THEN_CODER,
+                self._ctx(), reg, proof, 0, "", root, {},
+            ))
+            _, changes, _ = result
+            self.assertEqual(changes, {})
+            self.assertFalse((root / "blocked.py").exists())
+            self.assertTrue(any("write permission disabled" in ev[1] for ev in events if ev[0] == "warn"))
+
+    def test_coder_loop_false_uses_legacy_one_shot_process_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_cwd = os.getcwd()
+            os.chdir(root)
+            try:
+                (root / "pyproject.toml").write_text("[tool.pytest.ini_options]\n", encoding="utf-8")
+                (root / "tests").mkdir()
+                (root / "tests" / "test_dummy.py").write_text("def test_dummy():\n    assert True\n", encoding="utf-8")
+
+                responses = iter([
+                    "1. Write legacy file. STEP_VERIFY: `python -m pytest tests`",
+                    """### FILE: src/legacy.py
+```python
+VALUE = 1
+```""",
+                    "VERIFIED\n(implementation is complete, correct, and final tests passed)",
+                ])
+                calls = []
+
+                def fake_chat(**kwargs):
+                    calls.append(kwargs)
+                    return iter([(next(responses), "text")])
+
+                bridge = MagicMock()
+                bridge.chat = fake_chat
+                agent = KratosAgent(
+                    KratosConfig(
+                        coder_loop=False,
+                        auto_compress=False,
+                        always_max_ctx=False,
+                        max_verify_iterations=1,
+                        verification_timeout_seconds=30,
+                    ),
+                    bridge,
+                )
+                agent._knowledge = None
+                agent._compressor.generate_memory = lambda *args, **kwargs: []
+
+                events = list(agent.process("implement missing functionality"))
+                self.assertTrue((root / "src" / "legacy.py").exists())
+                self.assertIn("FULL-PASS MODE", calls[1]["messages"][-1]["content"])
+                self.assertNotIn("OBSERVE -> ACT loop", calls[1]["messages"][-1]["content"])
+                self.assertTrue(any(ev[0] == "header" and ev[1] == "coder" for ev in events))
+            finally:
+                os.chdir(old_cwd)
 
 
 class TestProvenWork(unittest.TestCase):

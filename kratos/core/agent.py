@@ -71,6 +71,7 @@ from ..roles import (
     _coder_context_block,
     _planner_msg,
     _coder_msg,
+    run_coder_loop,
     _planner_retry_msg,
     _coder_retry_msg,
     _verify_msg,
@@ -388,22 +389,47 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
                     yield ("warn", "Run cancelled.", "warn")
                     return
 
-            # ── 3. Coder — STEPWISE per plan item (with inline test verify) ───
-            # This is the core "coder must think every step from plan, show command,
-            # implement, verify with test, then continue every step".
-            # Verifier later sees the full per-step PROVEN_WORK evidence.
+            # ── 3. Coder — adaptive loop (or legacy one-shot fallback) ───
+            # The coder now uses an adaptive OBSERVE -> ACT loop by default:
+            # write/read/delete/run guarded commands, ingest observations, then
+            # hand the same PROVEN_WORK evidence to the existing verifier gate.
             project_root = self._indexer.root
             proof = ProvenWork(iteration=attempt + 1)
 
-            steps = _extract_plan_steps(plan_text) if (plan_text and needs_plan) else []
-            use_stepwise = (
-                len(steps) >= 1
+            use_coder_loop = (
+                bool(getattr(self.config, "coder_loop", True))
                 and route in (Route.PLANNER_THEN_CODER, Route.DIAGNOSTIC_LOOP)
             )
+            steps: list[str] = []
+            use_stepwise = False
 
             coder_full_for_verify = ""   # collect last coder output for the LLM verifier msg
 
-            if use_stepwise:
+            if use_coder_loop:
+                (
+                    coder_full_for_verify,
+                    _accumulated_changes,
+                    _accumulated_deletions,
+                ) = yield from run_coder_loop(
+                    self,
+                    task,
+                    plan_text,
+                    analysis,
+                    intent,
+                    route,
+                    coder_ctx,
+                    _cmd_registry,
+                    proof,
+                    attempt,
+                    verify_feedback,
+                    project_root,
+                    _original_snapshots,
+                )
+                if self._is_cancelled():
+                    yield ("warn", "Run cancelled before final verification.", "warn")
+                    return
+
+            elif use_stepwise:
                 note = pm.get_snippet("stepwise_execution_note").format(n=len(steps))
                 yield ("info", note, "info")
                 for sidx, step in enumerate(steps):

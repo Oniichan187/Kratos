@@ -10,6 +10,14 @@ from .parsing import (
     _parse_file_deletions,
 )
 from .repair import try_repair_known_probe
+from .tools import (
+    parse_actions,
+    format_observation,
+    do_read,
+    do_write,
+    do_delete,
+    do_command,
+)
 
 __all__ = [
     "try_repair_known_probe",
@@ -19,4 +27,10 @@ __all__ = [
     "_get_file_delete_re",
     "_FILE_CHANGE_RE",
     "_FILE_DELETE_RE",
+    "parse_actions",
+    "format_observation",
+    "do_read",
+    "do_write",
+    "do_delete",
+    "do_command",
 ]

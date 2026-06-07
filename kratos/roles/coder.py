@@ -6,7 +6,19 @@ verbatim from builders.py). Phase 2 adds the adaptive ReAct action-loop here.
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Generator
+
 from ..context import ContextPackage
+from ..execution.tools import (
+    do_command,
+    do_delete,
+    do_read,
+    do_write,
+    format_observation,
+    parse_actions,
+)
+from ..verification import CommandRegistry, ProvenWork
 from .prompts import _coder_context_block
 
 
@@ -66,3 +78,224 @@ def _coder_retry_msg(
         )
     parts.append(f"{pm.get_snippet('task_label') or 'Task: '}{task}")
     return "\n\n".join(p for p in parts if p)
+
+
+def _fresh_knowledge_block(agent, query: str, iteration: int) -> Generator[tuple, None, str]:
+    if getattr(agent, "_knowledge", None) is None or not query.strip():
+        return ""
+    try:
+        yield ("info", f"retrieving (coder loop {iteration}) from project vector KB...", "info")
+        chunks = agent._knowledge.retrieve(
+            query[:2500],
+            top_k=getattr(agent.config, "retrieval_top_k", 12),
+        )
+        yield ("tool", f"knowledge_get(coder loop {iteration}) -> {len(chunks)} chunks", "tool")
+    except Exception as exc:
+        yield ("warn", f"coder-loop retrieval failed: {exc}", "warn")
+        return ""
+    if not chunks:
+        return ""
+    blocks = ["FRESH RELEVANT CODE (retrieved after the latest observation):"]
+    for ch in chunks[:8]:
+        try:
+            blocks.append(ch.to_prompt_block(900))
+        except Exception:
+            blocks.append(f"### {getattr(ch, 'rel_path', '?')}\n{getattr(ch, 'text', '')[:800]}")
+    return "\n\n".join(blocks)
+
+
+def _observation_query(task: str, plan_text: str, observations: list[dict]) -> str:
+    failed = [
+        obs for obs in observations
+        if obs.get("kind") == "command" and not obs.get("skipped") and not obs.get("ok")
+    ]
+    if failed:
+        obs = failed[-1]
+        return "\n".join([
+            task,
+            f"Failed command: {obs.get('cmd')}",
+            str(obs.get("output", "")),
+        ])
+
+    skipped = [obs for obs in observations if obs.get("kind") == "command" and obs.get("skipped")]
+    if skipped:
+        obs = skipped[-1]
+        return "\n".join([task, f"Skipped command: {obs.get('cmd')}", str(obs.get("detail", ""))])
+
+    reads = [obs for obs in observations if obs.get("kind") == "read" and obs.get("ok")]
+    if reads:
+        obs = reads[-1]
+        return "\n".join([task, f"Read file: {obs.get('path')}", str(obs.get("content", ""))[:1200]])
+
+    changed = [
+        str(obs.get("path")) for obs in observations
+        if obs.get("kind") in {"file", "delete"} and obs.get("ok")
+    ]
+    if changed:
+        return "\n".join([task, "Changed files: " + ", ".join(changed), plan_text[:1200]])
+
+    return "\n".join([task, plan_text[:1200]])
+
+
+def _last_test_passed(proof: ProvenWork) -> bool:
+    test_cmds = [c for c in proof.commands if c.get("is_test")]
+    return bool(test_cmds and test_cmds[-1].get("exit_code") == 0)
+
+
+def _sync_pending(agent, changes: dict[str, str], deletions: set[str]) -> None:
+    agent.pending_file_changes = list(changes.items())
+    agent.pending_file_deletions = list(deletions)
+
+
+def run_coder_loop(
+    agent,
+    task: str,
+    plan_text: str,
+    analysis,
+    intent,
+    route,
+    ctx: ContextPackage,
+    cmd_registry: CommandRegistry,
+    proof: ProvenWork,
+    attempt: int,
+    verify_feedback: str,
+    project_root: Path,
+    original_snapshots: dict | None = None,
+) -> Generator[tuple, None, tuple[str, dict[str, str], set[str]]]:
+    """Adaptive OBSERVE -> ACT coder loop.
+
+    The loop writes/reads/deletes/runs only through the existing guarded runtime
+    helpers and returns accumulated file state for the unchanged outer
+    PROVEN_WORK/verifier/retry block.
+    """
+    from ..prompts import load_prompts
+
+    del analysis, intent, route  # kept in the public call shape for future prompt refinements
+
+    pm = load_prompts()
+    original_snapshots = original_snapshots if original_snapshots is not None else {}
+    accumulated_changes: dict[str, str] = dict(agent.pending_file_changes)
+    accumulated_deletions: set[str] = set(agent.pending_file_deletions)
+    coder_transcript: list[str] = []
+
+    ctx_block = _coder_context_block(ctx, pm, step_mode=False)
+    cmd_block = cmd_registry.format_for_prompt()
+    forced = pm.get_snippet("coder_loop_forced_prefix") or ""
+    protocol = pm.get_snippet("coder_action_protocol") or ""
+
+    parts = [
+        forced + protocol,
+        f"{pm.get_snippet('task_label') or 'Task: '}{task}",
+    ]
+    if plan_text:
+        parts.append(
+            "PLAN GUIDANCE (use as context, not as a rigid per-step driver):\n"
+            f"{plan_text}"
+        )
+    if verify_feedback:
+        parts.append(
+            f"{pm.get_snippet('verify_feedback_intro') or 'Verifier / test feedback:'}"
+            f"{verify_feedback[:2000]}"
+        )
+    if cmd_block:
+        parts.append(cmd_block)
+    if ctx_block:
+        parts.append("PROJECT FILES / CURRENT CONTEXT:\n" + ctx_block)
+    if getattr(ctx, "error_lines", None):
+        parts.append((pm.get_snippet("errors_short_header") or "Errors:\n") + "\n".join(ctx.error_lines[:10]))
+
+    turn = "\n\n".join(p for p in parts if p)
+    max_iterations = max(1, int(getattr(agent.config, "max_coder_iterations", 6) or 6))
+
+    for loop_idx in range(max_iterations):
+        loop_num = loop_idx + 1
+        if agent._is_cancelled():
+            yield ("warn", "Run cancelled before coder loop iteration.", "warn")
+            break
+
+        yield ("header", "coder", "header")
+        coder_out = yield from agent._run_coder(turn)
+        yield ("end", "coder", "end")
+        coder_transcript.append(f"CODER LOOP ITERATION {loop_num}\n{coder_out}")
+
+        if agent._is_cancelled():
+            yield ("warn", "Run cancelled before applying coder output.", "warn")
+            break
+
+        actions = parse_actions(coder_out, pm)
+        observations: list[dict] = []
+        touched_files: list[str] = []
+
+        for rel_path in actions["reads"]:
+            observations.append((yield from do_read(project_root, rel_path)))
+
+        for rel_path, content in actions["files"]:
+            if not agent.config.can_write():
+                yield ("warn", f"write_file({rel_path!r}) -> skipped (write permission disabled)", "warn")
+                observations.append({
+                    "kind": "file", "path": rel_path, "ok": False,
+                    "detail": "write permission disabled",
+                })
+                continue
+            obs = yield from do_write(project_root, rel_path, content, proof, attempt, original_snapshots)
+            observations.append(obs)
+            if obs.get("ok"):
+                accumulated_changes[rel_path] = content
+                accumulated_deletions.discard(rel_path)
+                touched_files.append(rel_path)
+
+        for rel_path in actions["deletes"]:
+            if not agent.config.can_delete():
+                yield ("warn", f"delete_file({rel_path!r}) -> skipped (delete permission disabled)", "warn")
+                observations.append({
+                    "kind": "delete", "path": rel_path, "ok": False,
+                    "detail": "delete permission disabled",
+                })
+                continue
+            obs = yield from do_delete(project_root, rel_path, proof, attempt, original_snapshots)
+            observations.append(obs)
+            if obs.get("ok"):
+                accumulated_changes.pop(rel_path, None)
+                accumulated_deletions.add(rel_path)
+                touched_files.append(rel_path)
+
+        _sync_pending(agent, accumulated_changes, accumulated_deletions)
+        if touched_files:
+            agent._memory.track_files(touched_files)
+
+        for cmd in actions["commands"]:
+            observations.append((yield from do_command(agent, project_root, cmd_registry, cmd, proof)))
+
+        if actions["done"]:
+            if _last_test_passed(proof):
+                yield ("info", f"Coder loop converged after {loop_num} iteration(s).", "info")
+                break
+            observations.append({"kind": "done", "ok": False})
+
+        if not any((actions["reads"], actions["files"], actions["deletes"], actions["commands"], actions["done"])):
+            observations.append({
+                "kind": "note",
+                "detail": (
+                    "No valid action markers were found. Use ### READ, ### FILE, "
+                    "### DELETE, ### VERIFY/### RUN, or ### DONE."
+                ),
+            })
+
+        observation_text = format_observation(observations, pm)
+        knowledge_query = _observation_query(task, plan_text, observations)
+        knowledge_block = yield from _fresh_knowledge_block(agent, knowledge_query, loop_num)
+        if knowledge_block:
+            observation_text += "\n\n" + knowledge_block
+        if not _last_test_passed(proof):
+            observation_text += "\n\n" + (
+                pm.get_snippet("observation_continue") or
+                "Continue the loop: react to the observation above, fix failures, then re-verify."
+            )
+
+        coder_transcript.append(observation_text)
+        turn = observation_text
+    else:
+        yield ("warn", f"Coder loop reached max_coder_iterations={max_iterations}; continuing to final verifier.", "warn")
+
+    _sync_pending(agent, accumulated_changes, accumulated_deletions)
+    return ("\n\n".join(coder_transcript), accumulated_changes, accumulated_deletions)

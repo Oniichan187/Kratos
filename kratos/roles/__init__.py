@@ -1,7 +1,7 @@
 """Model-role runners and their prompt builders (planner, coder, verifier)."""
 from __future__ import annotations
 
-from .coder import _coder_msg, _coder_retry_msg
+from .coder import _coder_msg, _coder_retry_msg, run_coder_loop
 from .planner import _planner_msg, _planner_retry_msg
 from .prompts import (
     _clarification_msg,
@@ -23,6 +23,7 @@ __all__ = [
     "_planner_retry_msg",
     "_coder_msg",
     "_coder_retry_msg",
+    "run_coder_loop",
     "_verify_msg",
     "_clarification_msg",
     "_direct_file_search",

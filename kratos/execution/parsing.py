@@ -14,27 +14,35 @@ from ..prompts import load_prompts
 
 # ── output parsers (markers sourced from prompts at runtime for perfect sync with JSON) ──
 
+def _marker_pattern(marker: str) -> str:
+    marker = (marker or "").strip()
+    if marker.endswith(":"):
+        marker = marker[:-1].rstrip()
+    escaped = re.escape(marker).replace(r"\ ", r"\s+")
+    return rf"{escaped}\s*:?"
+
+
 def _get_file_change_re():
     pm = load_prompts()
-    fm = re.escape(pm.get_marker("file") or "### FILE:")
+    fm = _marker_pattern(pm.get_marker("file") or "### FILE:")
     return re.compile(
         rf'^\s*{fm}\s*([^\r\n]+?)\s*\r?\n```(?:\w+)?[^\S\r\n]*\r?\n(.*?)^```\s*$',
-        re.S | re.M,
+        re.S | re.M | re.I,
     )
 
 
 def _get_file_delete_re():
     pm = load_prompts()
-    dm = re.escape(pm.get_marker("delete") or "### DELETE:")
-    return re.compile(rf'{dm}\s*(.+?)\s*$', re.M)
+    dm = _marker_pattern(pm.get_marker("delete") or "### DELETE:")
+    return re.compile(rf'^\s*{dm}\s*(.+?)\s*$', re.M | re.I)
 
 
 # Fallback module-level compiled (using defaults at import time)
 _FILE_CHANGE_RE = re.compile(
-    r'^\s*###\s+FILE:\s*([^\r\n]+?)\s*\r?\n```(?:\w+)?[^\S\r\n]*\r?\n(.*?)^```\s*$',
-    re.S | re.M,
+    r'^\s*###\s+FILE\s*:?\s*([^\r\n]+?)\s*\r?\n```(?:\w+)?[^\S\r\n]*\r?\n(.*?)^```\s*$',
+    re.S | re.M | re.I,
 )
-_FILE_DELETE_RE = re.compile(r'###\s+DELETE:\s*(.+?)\s*$', re.M)
+_FILE_DELETE_RE = re.compile(r'^\s*###\s+DELETE\s*:?\s*(.+?)\s*$', re.M | re.I)
 
 
 def _parse_file_changes(text: str) -> list[tuple[str, str]]:

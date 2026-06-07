@@ -132,6 +132,15 @@ class KratosConfig:
     require_test_for_verified:  bool = True
     verification_timeout_seconds: int = 120
 
+    # ── Adaptive ReAct coder action-loop ─────────────────────────────────────
+    # coder_loop: when True (default), the coder runs as an observe->act loop
+    # (writes/reads/runs commands, ingests real results, iterates until a test
+    # passes and it signals ### DONE) instead of the rigid per-step driver.
+    # max_coder_iterations bounds that loop so a non-converging model still
+    # falls through to the existing verifier + outer retry.
+    coder_loop:            bool = True
+    max_coder_iterations:  int = 6
+
     # ── Persistence ───────────────────────────────────────────────────────────
     # Prompts are loaded independently via kratos/prompts.py (same GLOBAL_DIR / _project_dir pattern).
     # See .kratos/prompts.json or ~/.kratos/prompts.json for system prompts + snippets (edit + /prompts reload).
