@@ -128,16 +128,68 @@ def _missing_command_paths(cmd: str, root: Path) -> list[str]:
     return missing
 
 
-def _is_safe_verification_command(cmd: str) -> bool:
+def _is_safe_verification_command(cmd: str, root: Path | None = None) -> bool:
     # Read from JSON on each call (load_prompts() is cached — O(1) after first load).
     meta_chars = tuple(get_toolchain("blocked_verify_chars") or _VERIFY_META_CHARS_FALLBACK)
     safe_prefixes = tuple(get_toolchain("safe_verify_prefixes") or _SAFE_VERIFY_PREFIXES_FALLBACK)
     normalized = " ".join(cmd.strip().split()).lower()
     if not normalized or any(meta in normalized for meta in meta_chars):
         return False
+    if root is not None:
+        parts = normalized.split()
+        if len(parts) == 2 and parts[0] in {"python", "py"}:
+            script = parts[1].replace("\\", "/")
+            if script.endswith(".py") and (root / script).exists():
+                return True
     if normalized.startswith("dotnet run --project"):
         return True
     return normalized.startswith(safe_prefixes)
+
+
+_INSPECT_BLOCKED_RE = re.compile(
+    r"(?i)(?:\b("
+    r"set-content|add-content|out-file|remove-item|move-item|copy-item|new-item|"
+    r"set-item|clear-content|rename-item|new-itemproperty|remove-itemproperty|"
+    r"invoke-expression|iex|start-process|start-job|invoke-webrequest|"
+    r"invoke-restmethod|irm|iwr|curl|wget|invoke-command"
+    r")\b|>>|<|`|&)"
+)
+
+_INSPECT_ALLOWED_RE = re.compile(
+    r"(?i)(?:^|[;|]\s*)(?:"
+    r"(?:\$\w+(?:\.\w+)?\s*=\s*[^;|]+;\s*)*"
+    r"(?:"
+    r"rg\b|"
+    r"Get-Content\b|gc\b|"
+    r"Get-ChildItem\b|gci\b|"
+    r"Get-Item\b|gi\b|"
+    r"Resolve-Path\b|"
+    r"Test-Path\b|"
+    r"git\s+(?:diff|status|show|log)\b|"
+    r"type\b|cat\b|ls\b|dir\b|findstr\b|"
+    r"Select-Object\b|Select-String\b|"
+    r"ForEach-Object\b|Where-Object\b|Sort-Object\b|Measure-Object\b|"
+    r"Format-Table\b|Format-List\b"
+    r")"
+    r")"
+)
+
+
+def _is_safe_inspect_command(cmd: str, root: Path | None = None) -> bool:
+    """Return True for read-only shell inspection commands."""
+    normalized = " ".join(cmd.strip().split())
+    if not normalized:
+        return False
+    if _INSPECT_BLOCKED_RE.search(normalized):
+        return False
+    pathish_cmds = (
+        "get-content", "gc", "get-childitem", "gci", "get-item", "gi",
+        "resolve-path", "test-path", "rg", "findstr", "type", "cat", "ls", "dir",
+    )
+    if any(token in normalized.lower() for token in pathish_cmds):
+        if re.search(r"(?<!\.)\.\.[\\/]", normalized) or re.search(r"\b[A-Za-z]:[\\/]", normalized) or "\\\\" in normalized:
+            return False
+    return bool(_INSPECT_ALLOWED_RE.search(normalized))
 
 
 def _is_test_verification_command(cmd: str) -> bool:

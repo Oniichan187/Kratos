@@ -13,10 +13,19 @@ from ..context import ContextPackage
 from ..execution.tools import (
     do_command,
     do_delete,
+    do_inspect,
     do_read,
     do_write,
     format_observation,
     parse_actions,
+)
+from ..planning import (
+    ExecutionPlan,
+    parse_execution_plan,
+    plan_all_done,
+    refresh_plan_status,
+    render_checklist,
+    render_plan_status,
 )
 from ..verification import CommandRegistry, ProvenWork
 from .prompts import _coder_context_block
@@ -117,10 +126,27 @@ def _observation_query(task: str, plan_text: str, observations: list[dict]) -> s
             str(obs.get("output", "")),
         ])
 
+    failed_inspect = [
+        obs for obs in observations
+        if obs.get("kind") == "inspect" and not obs.get("skipped") and not obs.get("ok")
+    ]
+    if failed_inspect:
+        obs = failed_inspect[-1]
+        return "\n".join([
+            task,
+            f"Failed inspect: {obs.get('cmd')}",
+            str(obs.get("output", "")),
+        ])
+
     skipped = [obs for obs in observations if obs.get("kind") == "command" and obs.get("skipped")]
     if skipped:
         obs = skipped[-1]
         return "\n".join([task, f"Skipped command: {obs.get('cmd')}", str(obs.get("detail", ""))])
+
+    skipped_inspect = [obs for obs in observations if obs.get("kind") == "inspect" and obs.get("skipped")]
+    if skipped_inspect:
+        obs = skipped_inspect[-1]
+        return "\n".join([task, f"Skipped inspect: {obs.get('cmd')}", str(obs.get("detail", ""))])
 
     reads = [obs for obs in observations if obs.get("kind") == "read" and obs.get("ok")]
     if reads:
@@ -150,7 +176,7 @@ def _sync_pending(agent, changes: dict[str, str], deletions: set[str]) -> None:
 def run_coder_loop(
     agent,
     task: str,
-    plan_text: str,
+    plan,
     analysis,
     intent,
     route,
@@ -178,6 +204,9 @@ def run_coder_loop(
     accumulated_deletions: set[str] = set(agent.pending_file_deletions)
     coder_transcript: list[str] = []
 
+    plan_state = plan if isinstance(plan, ExecutionPlan) else parse_execution_plan(str(plan or ""))
+    plan_text = plan_state.markdown
+
     ctx_block = _coder_context_block(ctx, pm, step_mode=False)
     cmd_block = cmd_registry.format_for_prompt()
     forced = pm.get_snippet("coder_loop_forced_prefix") or ""
@@ -192,6 +221,11 @@ def run_coder_loop(
             "PLAN GUIDANCE (use as context, not as a rigid per-step driver):\n"
             f"{plan_text}"
         )
+    if plan_state.items:
+        parts.append(
+            "PLAN CHECKLIST (the loop must keep going until all items are done):\n"
+            f"{render_checklist(plan_state.items, compact=False)}"
+        )
     if verify_feedback:
         parts.append(
             f"{pm.get_snippet('verify_feedback_intro') or 'Verifier / test feedback:'}"
@@ -199,6 +233,9 @@ def run_coder_loop(
         )
     if cmd_block:
         parts.append(cmd_block)
+    inspect_hint = pm.get_snippet("inspect_hint")
+    if inspect_hint:
+        parts.append(inspect_hint)
     if ctx_block:
         parts.append("PROJECT FILES / CURRENT CONTEXT:\n" + ctx_block)
     if getattr(ctx, "error_lines", None):
@@ -228,6 +265,9 @@ def run_coder_loop(
 
         for rel_path in actions["reads"]:
             observations.append((yield from do_read(project_root, rel_path)))
+
+        for cmd in actions["inspects"]:
+            observations.append((yield from do_inspect(agent, project_root, cmd)))
 
         for rel_path, content in actions["files"]:
             if not agent.config.can_write():
@@ -266,27 +306,35 @@ def run_coder_loop(
         for cmd in actions["commands"]:
             observations.append((yield from do_command(agent, project_root, cmd_registry, cmd, proof)))
 
+        refresh_plan_status(plan_state, proof, touched_files)
+        plan_block = render_plan_status(plan_state.items)
+
         if actions["done"]:
-            if _last_test_passed(proof):
+            if _last_test_passed(proof) and plan_all_done(plan_state):
                 yield ("info", f"Coder loop converged after {loop_num} iteration(s).", "info")
                 break
-            observations.append({"kind": "done", "ok": False})
-
-        if not any((actions["reads"], actions["files"], actions["deletes"], actions["commands"], actions["done"])):
             observations.append({
-                "kind": "note",
-                "detail": (
-                    "No valid action markers were found. Use ### READ, ### FILE, "
-                    "### DELETE, ### VERIFY/### RUN, or ### DONE."
-                ),
+                "kind": "done",
+                "ok": False,
+                "detail": "plan items remain unfinished" if not plan_all_done(plan_state) else "no passing test command yet",
             })
 
+        if not any((actions["reads"], actions["files"], actions["deletes"], actions["commands"], actions["done"])):
+                observations.append({
+                    "kind": "note",
+                    "detail": (
+                        "No valid action markers were found. Use ### READ, ### INSPECT, ### FILE, "
+                        "### DELETE, ### VERIFY/### RUN, or ### DONE."
+                    ),
+                })
+
         observation_text = format_observation(observations, pm)
+        observation_text += "\n\n" + plan_block
         knowledge_query = _observation_query(task, plan_text, observations)
         knowledge_block = yield from _fresh_knowledge_block(agent, knowledge_query, loop_num)
         if knowledge_block:
             observation_text += "\n\n" + knowledge_block
-        if not _last_test_passed(proof):
+        if not (_last_test_passed(proof) and plan_all_done(plan_state)):
             observation_text += "\n\n" + (
                 pm.get_snippet("observation_continue") or
                 "Continue the loop: react to the observation above, fix failures, then re-verify."

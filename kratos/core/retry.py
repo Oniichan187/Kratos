@@ -9,11 +9,14 @@ on the same ``self`` (config, project_dir helpers, compressor, memory).
 from __future__ import annotations
 
 import json
+import re
+from datetime import datetime
 from pathlib import Path
 
 from ..config import _project_dir
 from ..memory import MemoryEntry
 from ..verification import ProvenWork
+from ..planning import ExecutionPlan
 
 
 class _RetryMixin:
@@ -63,6 +66,45 @@ class _RetryMixin:
             )
         except OSError:
             pass
+
+    def _record_planner_artifact(
+        self,
+        task: str,
+        route: str,
+        iteration: int,
+        plan_markdown: str,
+        plan_state: ExecutionPlan | None = None,
+    ) -> Path | None:
+        """Persist the exact planner Markdown and a short project-memory summary."""
+        plan_markdown = (plan_markdown or "").rstrip()
+        if not plan_markdown:
+            return None
+
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+        safe_route = re.sub(r"[^A-Za-z0-9._-]+", "_", route or "plan").strip("_") or "plan"
+        plans_dir = _project_dir() / "plans"
+        plans_dir.mkdir(parents=True, exist_ok=True)
+        plan_path = plans_dir / f"{stamp}_{safe_route}_iter{iteration:02d}.md"
+        plan_path.write_text(plan_markdown + "\n", encoding="utf-8")
+
+        checklist = ""
+        if plan_state and getattr(plan_state, "items", None):
+            titles = [item.title.strip() for item in plan_state.items[:3] if item.title.strip()]
+            checklist = "; ".join(titles)
+
+        summary_bits = [f"Planner saved Markdown plan for task: {task[:120].strip()}"]
+        if checklist:
+            summary_bits.append(f"Checklist: {checklist[:160]}")
+        summary_bits.append(f"Artifact: {plan_path.name}")
+        self._memory.add(
+            MemoryEntry(
+                category="decision",
+                content=" | ".join(summary_bits)[:220],
+                tags=["planner", "markdown", "plan"],
+            ),
+            "project",
+        )
+        return plan_path
 
     def _record_solution(
         self,

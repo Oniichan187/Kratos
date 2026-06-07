@@ -104,6 +104,7 @@ from ..execution.parsing import (
     _parse_file_changes,
     _parse_file_deletions,
 )
+from ..planning import parse_execution_plan
 from ..execution.repair import try_repair_known_probe
 
 # ── token predict limits (now sourced from prompts at runtime for full configurability) ──
@@ -290,6 +291,8 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
             if self._is_cancelled():
                 yield ("warn", "Run cancelled.", "warn")
                 return
+            plan_state = parse_execution_plan(plan_full)
+            self._record_planner_artifact(task, route.value, 1, plan_state.markdown or plan_full, plan_state)
             # Async memory extraction
             mem_entries_new = self._compressor.generate_memory(task, plan_full, "", [])
             self._memory.add_from_compress(mem_entries_new)
@@ -331,6 +334,7 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
         # ── plan → code → verify loop ─────────────────────────────────────────
         max_iter   = self.config.max_verify_iterations
         plan_text  = ""
+        plan_state = parse_execution_plan("")
         verify_feedback = ""
         needs_plan = route in (Route.PLANNER_THEN_CODER, Route.DIAGNOSTIC_LOOP)
         _accumulated_changes: dict[str, str] = {}
@@ -384,7 +388,9 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
                     scope=scope, task=task, is_retry=is_retry,
                 )
                 yield ("end", "planner", "end")
-                plan_text = plan_full
+                plan_state = parse_execution_plan(plan_full)
+                plan_text = plan_state.markdown or plan_full
+                self._record_planner_artifact(task, route.value, attempt + 1, plan_text, plan_state)
                 if self._is_cancelled():
                     yield ("warn", "Run cancelled.", "warn")
                     return
@@ -413,7 +419,7 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
                 ) = yield from run_coder_loop(
                     self,
                     task,
-                    plan_text,
+                    plan_state,
                     analysis,
                     intent,
                     route,
@@ -904,7 +910,7 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
             # ── 4b. LLM verifier, gated by PROVEN_WORK (now sees per-step evidence) ─
             yield ("header", "verify", "header")
             verify_full = yield from self._run_verifier(
-                _verify_msg(task, plan_text, coder_full_for_verify or plan_text, proof)
+                _verify_msg(task, plan_text, coder_full_for_verify or plan_text, proof, plan_state.items)
             )
             if self._is_cancelled():
                 yield ("warn", "Run cancelled.", "warn")

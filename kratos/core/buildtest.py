@@ -10,6 +10,7 @@ these methods operate on the same ``self`` (config, indexer).
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import time
 
@@ -26,7 +27,7 @@ from ..verification import (
 
 class _VerificationRunnerMixin:
     """Provides ``_verification_commands``, ``_run_verification_command``,
-    and ``_run_build_test``."""
+    ``_run_readonly_command``, and ``_run_build_test``."""
 
     # ── build/test runner ─────────────────────────────────────────────────────
 
@@ -85,6 +86,36 @@ class _VerificationRunnerMixin:
             "purpose": command.purpose,
             "source": command.source,
             "is_test": command.is_test,
+            "exit_code": exit_code,
+            "duration_seconds": round(time.monotonic() - started, 3),
+            "output": output,
+        }
+
+    def _run_readonly_command(self, cmd: str, root=None) -> dict:
+        started = time.monotonic()
+        shell = shutil.which("pwsh") or shutil.which("powershell") or "powershell"
+        try:
+            result = subprocess.run(
+                [shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", cmd],
+                shell=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=self.config.verification_timeout_seconds,
+                cwd=str(root or self._indexer.root),
+            )
+            output = (result.stdout or "") + (result.stderr or "")
+            exit_code = int(result.returncode)
+        except Exception as exc:
+            output = str(exc)
+            exit_code = 1
+
+        return {
+            "cmd": cmd,
+            "purpose": "readonly inspection",
+            "source": "coder-inspect",
+            "is_test": False,
             "exit_code": exit_code,
             "duration_seconds": round(time.monotonic() - started, 3),
             "output": output,

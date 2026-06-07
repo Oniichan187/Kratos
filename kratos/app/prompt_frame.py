@@ -2,9 +2,9 @@
 
 ``_BottomPanel`` is the framed, non-fullscreen prompt_toolkit ``Application``
 that draws the bordered input box + live info bar (falls back to plain
-``input()`` when prompt_toolkit isn't installed). ``_CoderFilter``,
-``_LineFilter`` and ``_LiveBar`` buffer/format the agent's streamed output
-for ``console.print`` + ``rich.Live`` in ``app/cli.py``.
+``input()`` when prompt_toolkit isn't installed). ``_PlannerFilter``,
+``_CoderFilter``, ``_LineFilter`` and ``_LiveBar`` buffer/format the agent's
+streamed output for ``console.print`` + ``rich.Live`` in ``app/cli.py``.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 from typing import Callable
 
+from kratos.planning import parse_execution_plan, render_checklist
 from kratos.ui import console
 
 try:
@@ -30,7 +31,7 @@ if _HAS_PT:
 
         Terminal layout while waiting for input (input expands up to 5 lines):
           ╭────────────────────────────────────────────────────────╮
-          │  ⏱ 3m  ∑ 8k  ░░░░░░░░ 0%→compose  project  mid       │
+          │  ⏱ 3m  P 2k/40k  │  C 11k/64k  │  V 3k/40k  project  mid │
           ├────────────────────────────────────────────────────────┤
           │  kratos ❯ line 1                                       │
           │           line 2  (Alt+Enter to insert newline)        │
@@ -291,6 +292,38 @@ else:
 
 
 # ── coder output filter ───────────────────────────────────────────────────────
+
+class _PlannerFilter:
+    """Buffer planner output and render only the short checklist on flush."""
+
+    def __init__(self, emit: Callable[[str, str], None] | None = None) -> None:
+        self._buf: str = ""
+        self._emit = emit or (lambda text, style="": console.print(text, style=style, highlight=False))
+
+    def feed(self, token: str, style: str = "") -> None:
+        del style
+        self._buf += token
+
+    def flush(self) -> None:
+        text = self._buf.strip()
+        self._buf = ""
+        if not text:
+            return
+        plan = parse_execution_plan(text)
+        checklist = render_checklist(plan.items, compact=True)
+        if checklist.strip():
+            heading = "PLAN CHECKLIST"
+            try:
+                from kratos.prompts import get_snippet
+                heading = get_snippet("planner_checklist_heading") or heading
+            except Exception:
+                pass
+            self._emit(heading, "bold")
+            for line in checklist.splitlines():
+                self._emit(f"  {line}", "")
+        else:
+            self._emit("PLAN CHECKLIST: (no checklist parsed)", "dim")
+
 
 class _CoderFilter:
     """Suppress code bodies; print only file-op markers and the SUMMARY section."""

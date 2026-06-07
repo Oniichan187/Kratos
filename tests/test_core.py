@@ -27,6 +27,7 @@ from kratos.verification import (
     ProvenWork,
     _extract_readme_verification_commands,
     _infer_project_verification_commands,
+    _is_safe_inspect_command,
     _is_safe_verification_command,
     _is_test_verification_command,
     _missing_command_paths,
@@ -41,20 +42,26 @@ from kratos.verification import (
     CommandRegistry,
 )
 from kratos.execution.parsing import _parse_file_changes, _parse_file_deletions
-from kratos.execution.tools import parse_actions, do_read, do_write, do_delete, do_command
+from kratos.execution.tools import parse_actions, do_read, do_write, do_delete, do_command, do_inspect
 from kratos.roles import _coder_context_block, run_coder_loop
 from kratos.config import KratosConfig
+from kratos.planning import PlanItem, ExecutionPlan, parse_execution_plan, render_checklist, render_plan_status, refresh_plan_status, plan_all_done
 from kratos.llm.bridge import OllamaBridge
 from kratos.classifier import IntentClassifier, Intent
 from kratos.analyzer import InputAnalyzer
 from kratos.router import Router, Route
 from kratos.compress import Compressor, _algo_compress, _algo_relay, _algo_memory
+from kratos.knowledge import ProjectKnowledge
 from kratos.memory import MemoryManager, MemoryEntry
 from kratos.prompts import (
     PromptManager, DEFAULT_PROMPTS,
     load_prompts, get_system, get_snippet, get_predict, get_marker,
     reload_prompts,
 )
+from kratos.app.prompt_frame import _PlannerFilter
+from kratos.app.tui import KratosApp
+from kratos.roles.verifier import _verify_msg
+from kratos.ui.status import status_bar
 
 
 def drain_generator(gen):
@@ -302,10 +309,262 @@ public sealed class TaskParser {}
         self.assertEqual(changes, [("src/TaskParser.cs", "public sealed class TaskParser {}\n")])
 
 
+class TestExecutionPlanHelpers(unittest.TestCase):
+    def test_parse_execution_plan_explicit_checklist(self):
+        markdown = (
+            "## Detailed Plan\n"
+            "Work out the fix in depth.\n\n"
+            "## CHECKLIST\n"
+            "- Coder-Loop and Action-Dispatch fertig implementieren\n"
+            "  File: kratos/roles/coder.py\n"
+            "  VERIFY: python -m pytest tests/test_core.py\n"
+            "- Agent-Wiring auf coder_loop umstellen und Legacy-Fallback erhalten\n"
+            "  File: kratos/core/agent.py\n"
+            "  VERIFY: python -m pytest tests/test_core.py\n"
+        )
+        plan = parse_execution_plan(markdown)
+        self.assertIsInstance(plan, ExecutionPlan)
+        self.assertEqual(len(plan.items), 2)
+        self.assertEqual(plan.items[0].title, "Coder-Loop and Action-Dispatch fertig implementieren")
+        self.assertIn("kratos/roles/coder.py", plan.items[0].file_refs)
+        self.assertEqual(plan.items[0].verify_cmd, "python -m pytest tests/test_core.py")
+
+    def test_render_checklist_and_status(self):
+        plan = ExecutionPlan(
+            markdown="## CHECKLIST\n- First\n- Second",
+            items=[
+                PlanItem(index=1, title="First", status="done"),
+                PlanItem(index=2, title="Second", status="pending"),
+            ],
+        )
+        compact = render_checklist(plan.items, compact=True)
+        verbose = render_checklist(plan.items, compact=False)
+        self.assertIn("☑ First", compact)
+        self.assertIn("□ Second", compact)
+        self.assertIn("1. First", verbose)
+        self.assertIn("2. Second", verbose)
+        self.assertIn("PLAN STATUS:", render_plan_status(plan.items))
+
+    def test_refresh_plan_status_marks_done(self):
+        plan = ExecutionPlan(
+            markdown="## CHECKLIST\n- First",
+            items=[
+                PlanItem(index=1, title="First", file_refs=["src/app.py"], verify_cmd="python -m pytest tests/test_core.py"),
+            ],
+        )
+        proof = ProvenWork(iteration=1)
+        proof.files_changed.append("src/app.py")
+        proof.commands.append({"cmd": "python -m pytest tests/test_core.py", "exit_code": 0, "is_test": True})
+        refreshed = refresh_plan_status(plan, proof, ["src/app.py"])
+        self.assertTrue(plan_all_done(refreshed))
+        self.assertEqual(refreshed.items[0].status, "done")
+
+    def test_planner_filter_emits_only_checklist(self):
+        captured = []
+        filt = _PlannerFilter(lambda text, style="": captured.append((text, style)))
+        filt.feed(
+            "## Detailed Plan\n"
+            "Explain everything.\n\n"
+            "## CHECKLIST\n"
+            "- One\n"
+            "  File: a.py\n"
+            "  VERIFY: python -m pytest tests/test_core.py\n"
+        )
+        filt.flush()
+        joined = "\n".join(text for text, _style in captured)
+        self.assertIn("PLAN CHECKLIST", joined)
+        self.assertIn("□ One", joined)
+        self.assertNotIn("Explain everything.", joined)
+
+    def test_status_bar_does_not_render_session_total_or_compose_meter(self):
+        from io import StringIO
+        from rich.console import Console
+
+        panel = status_bar(
+            scope="project",
+            permission="mid",
+            ctx_state={
+                "planner": (2048, 40960),
+                "coder": (11264, 65536),
+                "verifier": (3072, 40960),
+            },
+            elapsed_s=12.3,
+            project_name="demo",
+            current_section="coder",
+            goal="",
+            hint="",
+        )
+        buf = StringIO()
+        cap = Console(file=buf, force_terminal=True, color_system="standard", width=120)
+        cap.print(panel)
+        rendered = buf.getvalue()
+        self.assertNotIn("∑", rendered)
+        self.assertNotIn("compose", rendered.lower())
+        self.assertIn("C", rendered)
+        self.assertIn("11k/64k", rendered)
+        self.assertNotIn("P 2k/40k", rendered)
+        self.assertNotIn("V 3k/40k", rendered)
+
+    def test_tui_footer_shows_only_active_role_when_busy(self):
+        app = object.__new__(KratosApp)
+        app._busy = True
+        app._task_start = 0.0
+        app._last_task_s = None
+        app.session_start = 0.0
+        app._ctx_live = {
+            "planner": (2048, 40960),
+            "coder": (11264, 65536),
+            "verifier": (3072, 40960),
+        }
+        app._current_section = "coder"
+        app.kratos_config = KratosConfig(
+            always_max_ctx=False,
+            permission="mid",
+            coder_num_ctx=262144,
+            vram_ctx_ceiling=65536,
+        )
+        app.project_root = Path("demo")
+
+        footer = KratosApp._footer_text(app)
+        rendered = footer.plain
+        self.assertIn("C ", rendered)
+        self.assertNotIn("P ", rendered)
+        self.assertNotIn("V ", rendered)
+
+
+class TestPlannerArtifacts(unittest.TestCase):
+    def test_planner_only_writes_markdown_artifact_and_memory_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_cwd = os.getcwd()
+            os.chdir(root)
+            try:
+                plan_markdown = (
+                    "## Detailed Plan\n"
+                    "Work out the fix.\n\n"
+                    "## CHECKLIST\n"
+                    "- First item\n"
+                    "  File: src/app.py\n"
+                    "  VERIFY: python -m pytest tests/test_core.py\n"
+                )
+
+                def fake_run_planner(self, *args, **kwargs):
+                    yield ("planner", plan_markdown, "text")
+                    return plan_markdown
+
+                agent = KratosAgent(KratosConfig(always_max_ctx=False), MagicMock())
+                agent._knowledge = None
+                agent._run_planner = types.MethodType(fake_run_planner, agent)
+                agent._compressor.generate_memory = lambda *args, **kwargs: []
+
+                events = list(agent.process("what is dependency injection?"))
+                self.assertTrue(any(ev[0] == "header" and ev[1] == "planner" for ev in events))
+
+                plans_dir = root / ".kratos" / "plans"
+                md_files = list(plans_dir.glob("*.md"))
+                self.assertEqual(len(md_files), 1)
+                content = md_files[0].read_text(encoding="utf-8")
+                self.assertIn("## Detailed Plan", content)
+                self.assertIn("## CHECKLIST", content)
+                self.assertFalse(content.lstrip().startswith("{"))
+
+                project_entries = agent.memory.list_all()["project"]
+                self.assertTrue(project_entries)
+                self.assertTrue(any("Planner saved Markdown plan" in e.content for e in project_entries))
+            finally:
+                os.chdir(old_cwd)
+
+
+class TestAutoCompressionArtifacts(unittest.TestCase):
+    def test_auto_compress_writes_markdown_and_ingests_knowledge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_cwd = os.getcwd()
+            os.chdir(root)
+            try:
+                class FakeKnowledge:
+                    def __init__(self):
+                        self.calls = []
+
+                    def ingest_markdown_artifact(self, path, metadata=None):
+                        self.calls.append((path, metadata))
+                        return 1
+
+                cfg = KratosConfig(auto_compress=True, always_max_ctx=False)
+                agent = KratosAgent(cfg, MagicMock())
+                agent._knowledge = FakeKnowledge()
+
+                def fake_compress(history, keep_pairs=4):
+                    history[:]= [{"role": "user", "content": "[Compressed prior context]\n\n## Compressed Summary\nkept"}]
+                    return True
+
+                agent._compressor.compress_history = fake_compress
+                history = [
+                    {"role": "user", "content": "old user " * 200},
+                    {"role": "assistant", "content": "old assistant " * 200},
+                    {"role": "user", "content": "new user " * 200},
+                ]
+                events = []
+                ok = agent._auto_compress_if_needed(
+                    history,
+                    agent.config.coder_model,
+                    1000,
+                    prompt_tokens=900,
+                    role="coder",
+                    _pending_events=events,
+                )
+
+                self.assertTrue(ok)
+                artifact_dir = root / ".kratos" / "knowledge" / "compressions"
+                files = list(artifact_dir.glob("*.md"))
+                self.assertEqual(len(files), 1)
+                content = files[0].read_text(encoding="utf-8")
+                self.assertIn("# Auto-Compression Artifact", content)
+                self.assertIn("## Compressed Summary", content)
+                self.assertIn("Role: coder", content)
+                self.assertEqual(len(agent._knowledge.calls), 1)
+                self.assertTrue(agent._knowledge.calls[0][0].name.endswith(".md"))
+                self.assertEqual(agent._knowledge.calls[0][1]["kind"], "compression_artifact")
+            finally:
+                os.chdir(old_cwd)
+
+    def test_knowledge_retrieves_compression_artifact_dynamically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_cwd = os.getcwd()
+            os.chdir(root)
+            try:
+                artifact_dir = root / ".kratos" / "knowledge" / "compressions"
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                artifact = artifact_dir / "2026-06-07_18-22-32_coder_demo.md"
+                artifact.write_text(
+                    "# Auto-Compression Artifact\n\n"
+                    "## Compressed Summary\n"
+                    "History was compressed because the coder context overflowed.\n\n"
+                    "## Removed Context Signals\n"
+                    "- `user`: the failing test output mentions AssertionError\n",
+                    encoding="utf-8",
+                )
+
+                with patch("kratos.knowledge.base._HAS_LANCEDB", False):
+                    kb = ProjectKnowledge(KratosConfig(always_max_ctx=False), MagicMock())
+                    kb._fallback_chunks = []
+                    kb._table = None
+                    n = kb.ingest_markdown_artifact(artifact, metadata={"kind": "compression_artifact"})
+                    self.assertGreater(n, 0)
+                    results = kb.retrieve("AssertionError from compressed coder context", top_k=5)
+                    self.assertTrue(any(ch.kind == "compression_artifact" for ch in results))
+                    self.assertTrue(any("AssertionError" in (ch.text + ch.summary) for ch in results))
+            finally:
+                os.chdir(old_cwd)
+
+
 class TestCoderActionTools(unittest.TestCase):
     def test_parse_actions_accepts_tolerant_markers(self):
         pm = load_prompts()
         text = """### read src/app.py
+
+### inspect: rg -n "TODO" src
 
 ### file src/app.py
 ```python
@@ -319,6 +578,7 @@ VALUE = 1
 """
         actions = parse_actions(text, pm)
         self.assertEqual(actions["reads"], ["src/app.py"])
+        self.assertEqual(actions["inspects"], ['rg -n "TODO" src'])
         self.assertEqual(actions["files"], [("src/app.py", "VALUE = 1\n")])
         self.assertEqual(actions["deletes"], ["old.py"])
         self.assertEqual(actions["commands"], ["python -m pytest tests", "npm run build"])
@@ -420,6 +680,47 @@ VALUE = 1
             self.assertTrue(obs["ok"])
             self.assertEqual(len(agent.calls), 1)
             self.assertEqual(proof.commands[-1]["exit_code"], 0)
+
+    def test_inspect_handler_executes_read_only_command_through_agent(self):
+        class FakeAgent:
+            def __init__(self):
+                self.calls = []
+
+            def _run_readonly_command(self, cmd, root):
+                self.calls.append((cmd, root))
+                return {
+                    "cmd": cmd,
+                    "purpose": "readonly inspection",
+                    "source": "coder-inspect",
+                    "is_test": False,
+                    "exit_code": 0,
+                    "duration_seconds": 0.01,
+                    "output": "line1\nline2\n",
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            agent = FakeAgent()
+            events, obs = drain_generator(do_inspect(agent, root, 'Get-Content src/app.py | Select-Object -First 1'))
+            self.assertFalse(obs["skipped"])
+            self.assertTrue(obs["ok"])
+            self.assertEqual(len(agent.calls), 1)
+            self.assertTrue(any(ev[0] == "tool" for ev in events))
+
+    def test_inspect_handler_skips_write_or_escape_commands(self):
+        class FakeAgent:
+            def _run_readonly_command(self, cmd, root):
+                raise AssertionError("should not run")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            agent = FakeAgent()
+            _, unsafe = drain_generator(do_inspect(agent, root, "Set-Content src/app.py x"))
+            _, escape = drain_generator(do_inspect(agent, root, "Get-Content ..\\secret.txt"))
+            self.assertTrue(unsafe["skipped"])
+            self.assertTrue(escape["skipped"])
 
 
 class TestCoderReActLoop(unittest.TestCase):
@@ -602,6 +903,49 @@ class TestProvenWork(unittest.TestCase):
         self.assertTrue(_is_safe_verification_command("dotnet run --project tests/TaskBoard.Tests"))
         self.assertFalse(_is_safe_verification_command("python -m pytest tests && del important.txt"))
         self.assertFalse(_is_safe_verification_command("echo hello"))
+
+    def test_safe_inspect_filter_allows_read_only_shell_diagnostics(self):
+        self.assertTrue(_is_safe_inspect_command('rg -n "TODO" src'))
+        self.assertTrue(_is_safe_inspect_command("Get-Content kratos/knowledge/base.py | Select-Object -First 3"))
+        self.assertTrue(_is_safe_inspect_command("git diff -- kratos/core/agent.py"))
+        self.assertFalse(_is_safe_inspect_command("Set-Content src/app.py x"))
+        self.assertFalse(_is_safe_inspect_command("Get-Content ..\\secret.txt"))
+
+    def test_local_python_smoke_run_is_safe_when_script_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "main.py").write_text("print('ok')\n", encoding="utf-8")
+            self.assertTrue(_is_safe_verification_command("python main.py", root))
+
+    def test_local_python_smoke_run_executes_through_command_handler(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "main.py").write_text("print('ok')\n", encoding="utf-8")
+            proof = ProvenWork(iteration=1)
+
+            class FakeAgent:
+                def __init__(self):
+                    self.calls = 0
+
+                def _run_verification_command(self, command):
+                    self.calls += 1
+                    return {
+                        "cmd": command.cmd,
+                        "purpose": command.purpose,
+                        "source": command.source,
+                        "is_test": command.is_test,
+                        "exit_code": 0,
+                        "duration_seconds": 0.01,
+                        "output": "ok",
+                    }
+
+            agent = FakeAgent()
+            registry = CommandRegistry(KratosConfig(always_max_ctx=False), root).discover()
+            events, obs = drain_generator(do_command(agent, root, registry, "python main.py", proof))
+            self.assertTrue(obs["ok"])
+            self.assertEqual(agent.calls, 1)
+            self.assertTrue(any(ev[0] == "tool" for ev in events))
+            self.assertEqual(proof.commands[-1]["cmd"], "python main.py")
 
     def test_missing_command_paths_flags_nonexistent_files_only(self):
         import tempfile
@@ -933,7 +1277,8 @@ class TestPromptManager(unittest.TestCase):
     def test_get_system_planner(self):
         s = self._pm.get_system("planner")
         self.assertIn("Kratos Planner", s)
-        self.assertIn("STEP_VERIFY", s)
+        self.assertIn("CHECKLIST", s)
+        self.assertIn("VERIFY", s)
 
     def test_get_system_coder(self):
         s = self._pm.get_system("coder")
@@ -948,6 +1293,22 @@ class TestPromptManager(unittest.TestCase):
         self.assertIn("VERIFIED", s)
         self.assertIn("NEEDS_REVISION", s)
         self.assertIn("UNSOLVABLE", s)
+
+    def test_verify_msg_includes_planner_checklist_audit(self):
+        proof = ProvenWork(iteration=1)
+        msg = _verify_msg(
+            "fix the bug",
+            "## CHECKLIST\n- One\n- Two",
+            "coder output",
+            proof,
+            [
+                PlanItem(index=1, title="One", status="pending"),
+                PlanItem(index=2, title="Two", status="done"),
+            ],
+        )
+        self.assertIn("Planner checklist audit", msg)
+        self.assertIn("One", msg)
+        self.assertIn("Two", msg)
 
     def test_get_system_compress(self):
         s = self._pm.get_system("compress")

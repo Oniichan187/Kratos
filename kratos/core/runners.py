@@ -10,6 +10,8 @@ stays focused on the pipeline shape; these methods are mixed back in via
 from __future__ import annotations
 
 import json
+from datetime import datetime
+from pathlib import Path
 from typing import Generator
 
 from ..llm.tokens import estimate, estimate_messages, fit_to_budget
@@ -72,6 +74,7 @@ class _RoleRunnerMixin:
         compressed = self._auto_compress_if_needed(
             history, model, num_ctx,
             prompt_tokens=prompt_tok,
+            role=role,
             _pending_events=events,
         )
         if compressed:
@@ -126,6 +129,7 @@ class _RoleRunnerMixin:
     def _auto_compress_if_needed(
         self, history: list[dict], model: str, num_ctx: int,
         prompt_tokens: int | None = None,
+        role: str = "",
         _pending_events: list | None = None,
     ) -> bool:
         """Compress history in-place if it's approaching the context limit.
@@ -139,6 +143,7 @@ class _RoleRunnerMixin:
         tok = prompt_tokens if prompt_tokens is not None else history_tok
         threshold = int(num_ctx * self.config.compress_threshold)
         if tok > threshold or history_tok > threshold or len(history) > self.config.max_history_pairs * 2:
+            before = [dict(item) for item in history]
             compressed = self._compressor.compress_history(history, keep_pairs=4)
             if compressed and _pending_events is not None:
                 short_model = model.split("/")[-1].split(":")[0]
@@ -147,8 +152,91 @@ class _RoleRunnerMixin:
                      f"Auto-compressed {short_model} history  {tok:,} tokens → keep 4 pairs",
                      "info")
                 )
+            if compressed:
+                self._persist_compression_artifact(
+                    role=role or "unknown",
+                    model=model,
+                    history_before=before,
+                    history_after=list(history),
+                    prompt_tokens=tok,
+                    num_ctx=num_ctx,
+                    threshold=threshold,
+                )
             return compressed
         return False
+
+    def _persist_compression_artifact(
+        self,
+        *,
+        role: str,
+        model: str,
+        history_before: list[dict],
+        history_after: list[dict],
+        prompt_tokens: int,
+        num_ctx: int,
+        threshold: int,
+    ) -> Path | None:
+        root = getattr(self._indexer, "root", None)
+        if root is None:
+            return None
+
+        artifact_dir = Path(root) / ".kratos" / "knowledge" / "compressions"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+        short_model = model.split("/")[-1].split(":")[0]
+        safe_role = "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in (role or "role"))
+        path = artifact_dir / f"{stamp}_{safe_role}_{short_model}.md"
+
+        removed = history_before[: max(0, len(history_before) - len(history_after))]
+        removed_notes: list[str] = []
+        for item in removed[-8:]:
+            role_name = str(item.get("role", "unknown"))
+            content = " ".join(str(item.get("content", "")).split())
+            if not content:
+                continue
+            removed_notes.append(f"- `{role_name}`: {content[:220]}")
+
+        compressed_note = ""
+        if history_after:
+            compressed_note = str(history_after[0].get("content", "")).strip()
+
+        artifact = [
+            "# Auto-Compression Artifact",
+            "",
+            f"- Time: {stamp}",
+            f"- Role: {role}",
+            f"- Model: {model}",
+            f"- Prompt tokens: {prompt_tokens}",
+            f"- Context window: {num_ctx}",
+            f"- Compression threshold: {threshold}",
+            f"- History messages before: {len(history_before)}",
+            f"- History messages after: {len(history_after)}",
+            "",
+            "## Compressed Summary",
+            compressed_note or "_No compressed summary available._",
+            "",
+            "## Removed Context Signals",
+        ]
+        artifact.extend(removed_notes or ["- _No removed context captured._"])
+        path.write_text("\n".join(artifact).rstrip() + "\n", encoding="utf-8")
+
+        knowledge = getattr(self, "_knowledge", None)
+        if knowledge is not None and hasattr(knowledge, "ingest_markdown_artifact"):
+            try:
+                knowledge.ingest_markdown_artifact(
+                    path,
+                    metadata={
+                        "kind": "compression_artifact",
+                        "role": role,
+                        "model": model,
+                        "prompt_tokens": prompt_tokens,
+                        "num_ctx": num_ctx,
+                        "threshold": threshold,
+                    },
+                )
+            except Exception:
+                pass
+        return path
 
     def _run_planner(
         self, msg: str, route: Route, keep_alive: str = "0",

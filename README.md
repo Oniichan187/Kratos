@@ -3,10 +3,10 @@
 **Kratos** — fully local, all models **abliterated** (no safety filters).
 
 4 roles that play perfectly together:
-- **Planner** — full max ctx (40k) every time
-- **Coder** — full 262k ctx, walks the plan **step by step**: think how to implement, show verify command, code it, runtime immediately tests that step, then next step
-- **Verifier** — full max ctx, **really executes every test** (per-step + final sweep) and only accepts VERIFIED on solid PROVEN_WORK
-- **Auto-Composer (Compressor)** — full ctx, **never destroys information**, feeds durable facts into `.kratos/memory.json` (project + global)
+- **Planner** — full max ctx (40k) every time, writes a detailed Markdown plan plus a short visible checklist
+- **Coder** — full 262k ctx, uses an adaptive OBSERVE -> ACT loop with `READ`, `INSPECT`, `FILE`, `DELETE`, `VERIFY`, `RUN`, `DONE`
+- **Verifier** — full max ctx, **really executes every test** and only accepts VERIFIED on solid PROVEN_WORK plus final goal fit
+- **Auto-Composer (Compressor)** — full ctx, **never destroys information**, feeds durable facts into `.kratos/memory.json` and Markdown compression artifacts under `.kratos/knowledge/compressions/`
 
 Works for tiny tasks **and** for huge monorepos that massively exceed any ctx window (Large-Input Relay via coder + lossless compress + memory).
 
@@ -41,21 +41,21 @@ Alle Modelle laufen **sequenziell** — nie gleichzeitig im VRAM. Optimiert für
 
 ---
 
-## Pipeline (max-ctx + stepwise + lossless)
+## Pipeline (max-ctx + adaptive loop + lossless)
 
 ```
 User Input
   → Analyzer + Classifier (regel-basiert) → Router
   → Context (mit Memory aus .kratos) + ggf. Large-Input Relay (Coder 262k vor Planner)
 
-  Planner (full 40k ctx) → detaillierter Plan mit NUMMERIERTEN Steps + Verify-Cmds
+  Planner (full 40k ctx) → detaillierter Markdown-Plan + sichtbare Checkliste
 
-  Coder (full 262k) — für JEDEN Step:
-      - denkt "wie genau umsetzen + Risiken + welcher Befehl zum Testen?"
-      - zeigt/implementiert den Code für genau diesen Step
-      - Kratos schreibt Datei(en)
-      - Kratos führt den Verify-Befehl (Test) für diesen Step aus
-      → erst dann nächster Step
+  Coder (full 262k) — adaptive OBSERVE -> ACT loop:
+      - denkt "wie genau umsetzen + Risiken + welcher Befehl zum Testen/Inspektieren?"
+      - kann READ / INSPECT / FILE / DELETE / VERIFY / RUN / DONE einsetzen
+      - Kratos schreibt Datei(en) oder führt read-only Inspektionen aus
+      - Kratos führt den Verify-Befehl (Test) aus
+      → Beobachtung zurück an den Coder, dann nächster Turn
 
   Nach allen Steps:
       - finale Test-Sweep
@@ -98,8 +98,10 @@ Für einfache Aufgaben: direkte Ausgabe, kein CoT → spart VRAM-Zeit.
 Immer mit **maximalem Kontextfenster**. Prompts erzwingen Vollständigkeit (exhaustive + wörtliche Zitate kritischer Fakten).
 
 - History-Kompression: alte Turns werden durch dichte, aber **informations-erhaltende** Records ersetzt.
+- Jede Auto-Compression schreibt zusätzlich ein Markdown-Artefakt nach `.kratos/knowledge/compressions/` und ingestiert es dynamisch in den Knowledge-Index.
 - Nach jedem Task: Memory-Extraktion (decisions, conventions, file_roles, error_cause, solution) → `.kratos/memory.json` (project) + global.
-- Wird in jeden relevanten Prompt eingespeist.
+- Der Planner schreibt seine Plan-Artefakte als Markdown nach `.kratos/plans/`.
+- Wird in jeden relevanten Prompt eingespeist, aber dynamisch statt blind.
 - Nie Infos vernichten — das ist eine Kernanforderung.
 
 `/memory list | clear ...` verwaltet es.
@@ -129,24 +131,25 @@ Das ermöglicht kleine schnelle Tasks **und** die Monster-Repos.
 
 ---
 
-## Stepwise Coder + Verify-Loop (der Kern)
+## Adaptive Coder Action Loop (der Kern)
 
-Coder führt den Plan **Schritt für Schritt** aus (genau wie vom User gewünscht):
+Coder arbeitet in einem echten OBSERVE -> ACT Loop:
 
-1. Planner liefert nummerierte Steps mit Verify-Befehlen.
-2. Für Step N:
-   - Coder denkt: "Wie setze ich das exakt um? Risiken? Welchen Befehl zeige/empfehle ich zum Test?"
-   - Coder gibt die Dateiänderung(en) für **nur diesen Step** aus.
-   - Kratos schreibt die Dateien + verifiziert Hash.
-   - Kratos führt den (vom Coder oder Projekt empfohlenen) Test/Befehl **sofort** aus.
-   - Nur wenn ok → Step N+1.
-3. Nach allen Steps: finale volle Test-Suite + Verifier-LLM.
-4. Verifier darf **nur** VERIFIED sagen, wenn für (idealerweise jeden) Step echte Tests mit exit=0 nach dem Write gelaufen sind + die finale Evidenz passt.
+1. Planner liefert einen ausführlichen Markdown-Plan plus die sichtbare Checkliste.
+2. Der Coder kann pro Turn mehrere Marker kombinieren:
+   - `### READ` für on-disk Inhalte
+   - `### INSPECT` für read-only Shell-Diagnose (`rg`, `Get-Content`, `git diff`, ...)
+   - `### FILE` / `### DELETE` für Änderungen
+   - `### VERIFY` / `### RUN` für sichere Build-/Test-Kommandos
+   - `### DONE` erst nach echtem Erfolg
+3. Kratos gibt nach jedem Turn eine Observation zurück und der Coder reagiert auf das reale Ergebnis.
+4. Der Loop läuft bis alle Checklist-Punkte erledigt sind oder das Iterationslimit erreicht ist.
+5. Verifier prüft danach nochmals die Checkliste, die Tests und die eigentliche Nutzerabsicht.
 
-PROVEN_WORK ist jetzt noch strenger:
-- Per-Step Commands werden aufgezeichnet (mit "step": N).
-- Finaler Sweep nach "VERIFIED" des LLMs wird zusätzlich ausgeführt.
-- Fehlt ein Test oder schlägt einer fehl → NEEDS_REVISION (auch wenn LLM schon Verfied sagte).
+PROVEN_WORK bleibt streng:
+- Dateiänderungen, Deletes, Reads, Inspects und Commands werden einzeln protokolliert.
+- Finaler Sweep nach dem Coder-Loop läuft zusätzlich.
+- Fehlt ein Test oder schlägt einer fehl → NEEDS_REVISION, auch wenn das Modell schon fertig klingt.
 
 UNSOLVABLE → kompletter Rollback der in dieser Runde geschriebenen Dateien.
 
@@ -246,6 +249,8 @@ Damit ist Kratos extrem anpassbar, während die starke programmierte Logik (jede
   "relay_num_ctx":     131072,
   "vram_ctx_ceiling":  65536,
   "always_max_ctx":    true,
+  "coder_loop":        true,
+  "max_coder_iterations": 6,
   "compress_threshold": 0.75,
   "relay_threshold":   0.80,
   "max_history_pairs": 8,
@@ -271,11 +276,11 @@ C:\Tools\Kratos\
 ├── setup_models.py        ← Modell-Setup-Wizard (idempotent)
 ├── setup_wsl.sh           ← WSL + CUDA Setup (einmalig)
 ├── tests/
-│   └── test_core.py       ← 44 Unit-Tests (kein Ollama nötig)
+│   └── test_core.py       ← comprehensive unit tests (kein Ollama nötig)
 └── kratos/
     ├── tokens.py          ← choose_num_ctx with force_max_context=True (default)
-    ├── compress.py        ← Auto-Composer: lossless history + .kratos memory (max ctx)
-    ├── agent.py           ← KratosAgent: Planner→Stepwise-Coder+per-step-tests→Verifier loop
+    ├── compress.py        ← Auto-Composer: lossless history + Markdown knowledge artifacts + .kratos memory (max ctx)
+    ├── agent.py           ← KratosAgent: Planner→Adaptive Coder Action Loop→Verifier loop
     ├── bridge.py          ← OllamaBridge (full num_ctx always passed)
     ├── config.py          ← always_max_ctx + bumped role num_ctx defaults + auto-upgrade on load
     ├── context.py         ← full file listing + token-aware excerpts (benefits from huge budgets)

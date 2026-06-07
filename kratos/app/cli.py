@@ -36,7 +36,7 @@ from kratos.ui import (
     status_bar,
 )
 
-from .prompt_frame import _BottomPanel, _CoderFilter, _LineFilter, _LiveBar
+from .prompt_frame import _BottomPanel, _CoderFilter, _LineFilter, _LiveBar, _PlannerFilter
 from .slash import make_completer
 
 _HISTORY_FILE = GLOBAL_DIR / "history.txt"
@@ -83,6 +83,7 @@ def _show_file_ops(agent: KratosAgent, logger: "SessionLogger | None" = None) ->
 def _stream_agent(
     agent: KratosAgent, task: str, logger: "SessionLogger",
     _ctx_state: "dict | None" = None,
+    _active_role: "dict | None" = None,
 ) -> float:
     """Run the agent pipeline; stream output inline via console.print,
     with a `rich.Live` status bar pinned to the bottom for the duration.
@@ -107,7 +108,7 @@ def _stream_agent(
     planner_buf = ""
     coder_buf = ""
     coder_filter = _CoderFilter()
-    planner_filter = _LineFilter()
+    planner_filter = _PlannerFilter()
     verify_filter = _LineFilter()
     coder_think_filter = _LineFilter(style="dim italic")
 
@@ -117,7 +118,6 @@ def _stream_agent(
     # ~4 chars/token is the standard rough estimate; good enough for a live
     # indicator that the real end-of-call numbers immediately correct.
     running_completion = 0
-    session_completion_base = 0
 
     def _est_tokens(s: str) -> int:
         return max(1, len(s) // 4)
@@ -130,15 +130,6 @@ def _stream_agent(
         if role and running_completion:
             used, total = state.get(role, (0, 0))
             state[role] = (used + running_completion, total)
-        usage = agent.session_usage
-        sess_tok = (
-            usage.get("prompt_tokens", 0),
-            usage.get("completion_tokens", 0) + session_completion_base + running_completion,
-        )
-        coder_used, coder_total = state.get("coder", (0, windows["coder"]))
-        threshold = float(getattr(agent.config, "compress_threshold", 0.75))
-        compose_at = max(1, threshold * coder_total)
-        compose_pct = min(100, int(coder_used * 100 / compose_at))
         return status_bar(
             scope=agent.config.scope or "project",
             permission=agent.config.permission,
@@ -146,10 +137,8 @@ def _stream_agent(
             elapsed_s=time.monotonic() - task_start,
             project_name=agent._indexer.root.name,
             current_section=role,
-            session_tokens=sess_tok,
             goal=agent.config.goal,
             hint="Ctrl+C to stop",
-            compose_pct=compose_pct,
         )
 
     def _smodel(role: str) -> str:
@@ -194,10 +183,11 @@ def _stream_agent(
                 _log_tool(content)
 
             elif source == "header":
-                session_completion_base += running_completion
                 running_completion = 0
                 current_section = content
                 section_start = time.monotonic()
+                if _active_role is not None:
+                    _active_role["role"] = content
                 # Dedup across stepwise re-entries too: print the role banner only when
                 # the role changes (e.g. coder -> verify -> coder), not on every step's
                 # repeated "coder" header — the "Step N/M" info line is the per-step marker.
@@ -208,9 +198,8 @@ def _stream_agent(
 
             elif source == "planner":
                 running_completion += _est_tokens(content)
-                style = "dim italic" if kind == "think" else ""
-                planner_filter.feed(content, style=style)
                 if kind != "think":
+                    planner_filter.feed(content)
                     planner_buf += content
 
             elif source == "verify":
@@ -257,9 +246,10 @@ def _stream_agent(
                     if coder_buf:
                         logger.log_model_output("coder", agent.config.coder_model, coder_buf)
                     coder_buf = ""
-                session_completion_base += running_completion
                 running_completion = 0
                 current_section = ""
+                if _active_role is not None:
+                    _active_role["role"] = ""
                 if _ctx_state is not None:
                     _ctx_state.update(ctx_live)
 
@@ -389,12 +379,13 @@ def main() -> None:
         "coder":   (0, _windows["coder"]),
         "verifier": (0, _windows["verifier"]),
     }
+    _active_role: dict[str, str] = {"role": ""}
     _last_task_s: float | None = None
 
     # ── live info content for the panel frame ─────────────────────────────────
     def _make_toolbar() -> list[tuple[str, str]]:
-        """Builds prompt_toolkit bottom-toolbar: ⏱ (grows left on m/h) + tokens + ctx + %→compose + project + perm.
-        Both % and the Uhr/time are always shown together with the other live stats.
+        """Builds prompt_toolkit bottom-toolbar: ⏱ (grows left on m/h) + ctx + project + perm.
+        The live context bars are the active signal; no session-total or compose meter.
         """
         SEP = "   │   "
         out: list[tuple[str, str]] = [("", "  ")]
@@ -405,28 +396,16 @@ def main() -> None:
         _t_str = elapsed_str(_time_val) if _time_val and _time_val > 0 else "0s"
         out += [("", "⏱ "), ("ansiyellow", _t_str), ("", SEP)]
 
-        # Cumulative token usage — prefer Ollama eval counts; fall back to ctx_info sizes
-        _tok = agent.session_usage
-        _total = _tok.get("prompt_tokens", 0) + _tok.get("completion_tokens", 0)
-        tok_str = "--" if _total == 0 else f"{_total:,}"
-        out += [("", "∑ "), ("ansicyan", tok_str), ("", SEP)]
-
         _windows_now = role_context_windows(config)
-        for _role, _abbr in (("planner", "P"), ("coder", "C"), ("verifier", "V")):
-            _used = _ctx_live.get(_role, (0, _windows_now[_role]))[0]
-            out += [("", f"{_abbr} {_used // 1024}k/{_windows_now[_role] // 1024}k"), ("", SEP)]
-
-        # % until auto-compose (always present together with the time)
-        _coder_total = _windows_now["coder"]
-        _threshold = float(getattr(config, "compress_threshold", 0.75))
-        _coder_used = _ctx_live.get("coder", (0, _coder_total))[0]
-        _compose_at = max(1, _threshold * _coder_total)
-        _pct = min(100, int(_coder_used * 100 / _compose_at))
-        _bw = 8
-        _filled = min(_bw, int(_bw * _pct / 100))
-        _bar = "▓" * _filled + "░" * (_bw - _filled)
-        _bc = "ansired" if _pct > 80 else "ansiyellow" if _pct > 50 else "ansibrightblack"
-        out += [(_bc, _bar), ("", f" {_pct}%→compose"), ("", SEP)]
+        _role = _active_role.get("role", "")
+        if _role in ("planner", "coder", "verifier"):
+            _abbr = {"planner": "P", "coder": "C", "verifier": "V"}[_role]
+            _used, _total = _ctx_live.get(_role, (0, _windows_now[_role]))
+            out += [("", f"{_abbr} {_used // 1024}k/{_total // 1024}k"), ("", SEP)]
+        else:
+            for _role, _abbr in (("planner", "P"), ("coder", "C"), ("verifier", "V")):
+                _used = _ctx_live.get(_role, (0, _windows_now[_role]))[0]
+                out += [("", f"{_abbr} {_used // 1024}k/{_windows_now[_role] // 1024}k"), ("", SEP)]
 
         # Project name + permission
         _perm = config.permission
@@ -478,7 +457,7 @@ def main() -> None:
         logger.log_input(line)
 
         try:
-            _last_task_s = _stream_agent(agent, line, logger, _ctx_state=_ctx_live)
+            _last_task_s = _stream_agent(agent, line, logger, _ctx_state=_ctx_live, _active_role=_active_role)
         except Exception as exc:
             print_error(f"Agent error: {escape(str(exc))}")
             logger.log_error(str(exc))

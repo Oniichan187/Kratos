@@ -14,6 +14,7 @@ as ``execution/parsing.py`` so user customization stays in sync):
   ``### FILE: <path>`` + fenced body   -> write file              (kind="file")
   ``### DELETE: <path>``               -> delete file             (kind="delete")
   ``### READ: <path>``                 -> return on-disk content  (kind="read")
+  ``### INSPECT: <cmd>``               -> run read-only shell diag (kind="inspect")
   ``### VERIFY: <cmd>`` / ``### RUN:`` -> run a guarded command   (kind="command")
   ``### DONE``                         -> signal loop completion  (parsed separately)
 
@@ -36,6 +37,7 @@ from ..verification import (
     CommandRegistry,
     ProvenWork,
     _clean_command_line,
+    _is_safe_inspect_command,
     _is_safe_verification_command,
     _is_test_verification_command,
     _missing_command_paths,
@@ -85,6 +87,17 @@ def _parse_command_markers(text: str, pm) -> list[str]:
     return list(dict.fromkeys(cmds))
 
 
+def _parse_inspect_markers(text: str, pm) -> list[str]:
+    cmds: list[str] = []
+    marker = _marker_pattern(pm.get_marker("inspect") or "### INSPECT:")
+    combined = re.compile(rf'^[ \t]*{marker}\s*(.*?)\s*$', re.M | re.I)
+    for m in combined.finditer(text):
+        c = _clean_command_line(m.group(1))
+        if c:
+            cmds.append(c)
+    return list(dict.fromkeys(cmds))
+
+
 def _has_done_marker(text: str, pm) -> bool:
     return _marker_re(pm, "done", "### DONE").search(text) is not None
 
@@ -92,7 +105,7 @@ def _has_done_marker(text: str, pm) -> bool:
 def parse_actions(text: str, pm) -> dict:
     """Parse every action marker from one coder turn.
 
-    Returns ``{"reads": [path...], "files": [(path, content)...],
+    Returns ``{"reads": [path...], "inspects": [cmd...], "files": [(path, content)...],
     "deletes": [path...], "commands": [cmd...], "done": bool}``.
 
     The loop applies categories in a fixed safe order — read, then write, then
@@ -102,6 +115,7 @@ def parse_actions(text: str, pm) -> dict:
     """
     return {
         "reads":    _parse_read_markers(text, pm),
+        "inspects": _parse_inspect_markers(text, pm),
         "files":    _parse_file_changes(text),
         "deletes":  _parse_file_deletions(text),
         "commands": _parse_command_markers(text, pm),
@@ -191,7 +205,7 @@ def do_command(
     if not cmd:
         return {"kind": "command", "cmd": raw_cmd, "ok": False, "skipped": True, "detail": "empty command"}
 
-    if not _is_safe_verification_command(cmd):
+    if not _is_safe_verification_command(cmd, project_root):
         yield ("warn", f"skipped `{cmd}` — not a recognized safe build/test command", "warn")
         return {"kind": "command", "cmd": cmd, "ok": False, "skipped": True,
                 "detail": "not a recognized safe build/test command"}
@@ -235,6 +249,51 @@ def do_command(
     }
 
 
+def do_inspect(
+    agent, project_root: Path, raw_cmd: str,
+) -> Generator[tuple, None, dict]:
+    """``### INSPECT: <cmd>`` — read-only shell diagnostics only.
+
+    This runs through the agent's dedicated read-only shell helper and rejects
+    anything that looks write-capable or shell-escape oriented.
+    """
+    cmd = _clean_command_line(raw_cmd)
+    if not cmd:
+        return {"kind": "inspect", "cmd": raw_cmd, "ok": False, "skipped": True, "detail": "empty command"}
+
+    if not _is_safe_inspect_command(cmd, project_root):
+        yield ("warn", f"skipped inspect `{cmd}` — not a recognized read-only diagnostic command", "warn")
+        return {
+            "kind": "inspect", "cmd": cmd, "ok": False, "skipped": True,
+            "detail": "not a recognized read-only diagnostic command",
+        }
+
+    if not hasattr(agent, "_run_readonly_command"):
+        yield ("error", "inspect helper missing on agent: _run_readonly_command", "error")
+        return {
+            "kind": "inspect", "cmd": cmd, "ok": False, "skipped": True,
+            "detail": "agent has no readonly command runner",
+        }
+
+    yield ("tool", f"inspect_command({cmd!r}) -> readonly shell", "tool")
+    res = agent._run_readonly_command(cmd, project_root)
+    status = "ok" if res["exit_code"] == 0 else "FAILED"
+    yield ("tool", f"inspect_result({cmd!r}) -> {status} exit={res['exit_code']}", "tool")
+    yield ("log", json.dumps({
+        "type": "inspect",
+        "cmd": cmd,
+        "exit_code": res["exit_code"],
+        "duration_seconds": res.get("duration_seconds"),
+        "output": res.get("output", "")[-3000:],
+    }), "log")
+    return {
+        "kind": "inspect", "cmd": cmd, "ok": res["exit_code"] == 0, "skipped": False,
+        "exit_code": res["exit_code"],
+        "duration_seconds": res.get("duration_seconds"),
+        "output": res.get("output", "")[-_OUTPUT_TAIL:],
+    }
+
+
 # ── observation rendering — folds results back into the next coder turn ─────
 
 def format_observation(observations: list[dict], pm) -> str:
@@ -270,6 +329,16 @@ def format_observation(observations: list[dict], pm) -> str:
                 lines.append(tmpl.format(
                     cmd=obs["cmd"], exit_code=obs.get("exit_code"),
                     test_tag=" [TEST]" if obs.get("is_test") else "",
+                    output=obs.get("output", ""),
+                ))
+        elif kind == "inspect":
+            if obs.get("skipped"):
+                tmpl = pm.get_snippet("observation_inspect_skipped") or "  skipped inspect `{cmd}` -> {reason}"
+                lines.append(tmpl.format(cmd=obs["cmd"], reason=obs.get("detail", "")))
+            else:
+                tmpl = pm.get_snippet("observation_inspect") or "  inspected `{cmd}` -> exit={exit_code}\n{output}"
+                lines.append(tmpl.format(
+                    cmd=obs["cmd"], exit_code=obs.get("exit_code"),
                     output=obs.get("output", ""),
                 ))
         elif kind == "done":

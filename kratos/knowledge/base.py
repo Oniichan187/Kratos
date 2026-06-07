@@ -251,6 +251,94 @@ class ProjectKnowledge:
 
     # ── chunking (best-possible, symbol-centric) ─────────────────────────────
 
+    def _chunk_markdown_artifact(
+        self,
+        rel_path: str,
+        text: str,
+        *,
+        mtime: float | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> list[_ChunkRecord]:
+        metadata = dict(metadata or {})
+        lines = text.splitlines(keepends=True)
+        if not lines:
+            return []
+
+        heading_re = re.compile(r"^\s*#{1,6}\s+(.+?)\s*$")
+        sections: list[tuple[str, int, int, str]] = []
+        current_title = "document"
+        current_start = 1
+        current_lines: list[str] = []
+
+        def flush(end_line: int) -> None:
+            nonlocal current_lines, current_title, current_start
+            body = "".join(current_lines).strip()
+            if body:
+                sections.append((current_title, current_start, end_line, body))
+            current_lines = []
+
+        for idx, line in enumerate(lines, 1):
+            match = heading_re.match(line)
+            if match:
+                if current_lines:
+                    flush(idx - 1)
+                current_title = match.group(1).strip() or "section"
+                current_start = idx
+                current_lines = [line]
+                continue
+            if not current_lines:
+                current_start = idx
+            current_lines.append(line)
+
+        if current_lines:
+            flush(len(lines))
+
+        if not sections:
+            sections.append(("document", 1, len(lines), text.strip()))
+
+        stamp = float(mtime or time.time())
+        records: list[_ChunkRecord] = []
+        for idx, (title, start, end, body) in enumerate(sections, 1):
+            cid = f"{rel_path}:artifact:{idx}:{hash((rel_path, title, start, body[:160])) & 0xffffffff:x}"
+            records.append(
+                _ChunkRecord(
+                    id=cid,
+                    rel_path=rel_path,
+                    symbol=title,
+                    kind="compression_artifact",
+                    start_line=start,
+                    end_line=end,
+                    text=body,
+                    summary="",
+                    mtime=stamp,
+                    metadata={**metadata, "artifact_kind": "compression", "section": title},
+                )
+            )
+        return records
+
+    def _ingest_chunk_records(self, chunks: list[_ChunkRecord], force: bool = False) -> int:
+        if not chunks:
+            return 0
+        if self._table is not None or _HAS_LANCEDB:
+            return self._index_into_lancedb(chunks, force=force)
+        self._fallback_chunks.extend(chunks)
+        self._save_fallback_index()
+        return len(chunks)
+
+    def ingest_markdown_artifact(self, path: Path, metadata: dict[str, Any] | None = None) -> int:
+        """Incrementally ingest a Markdown artifact without rebuilding the whole KB."""
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+            mtime = path.stat().st_mtime
+        except Exception:
+            return 0
+        try:
+            rel = str(path.resolve().relative_to(self._root)).replace("\\", "/")
+        except Exception:
+            rel = str(path.name)
+        chunks = self._chunk_markdown_artifact(rel, text, mtime=mtime, metadata=metadata)
+        return self._ingest_chunk_records(chunks, force=False)
+
     def _discover_and_chunk_project(self) -> list[_ChunkRecord]:
         """Walk the project and produce high-quality chunks.
 
@@ -356,6 +444,31 @@ class ProjectKnowledge:
                         )
                     )
 
+        records.extend(self._discover_compression_artifacts())
+        return records
+
+    def _discover_compression_artifacts(self) -> list[_ChunkRecord]:
+        """Load Markdown compression artifacts saved under .kratos/knowledge/compressions."""
+        artifacts_dir = (_project_dir() / "knowledge" / "compressions").resolve()
+        if not artifacts_dir.exists():
+            return []
+
+        records: list[_ChunkRecord] = []
+        for path in artifacts_dir.rglob("*.md"):
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+                mtime = path.stat().st_mtime
+                rel = str(path.relative_to(self._root)).replace("\\", "/")
+            except Exception:
+                continue
+            records.extend(
+                self._chunk_markdown_artifact(
+                    rel,
+                    text,
+                    mtime=mtime,
+                    metadata={"tier": "project", "artifact_kind": "compression"},
+                )
+            )
         return records
 
     def _extract_symbol_chunks(self, rel_path: str, text: str) -> list[dict]:

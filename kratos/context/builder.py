@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from ..llm.tokens import estimate, fit_excerpt
-from .indexer import FileEntry, ProjectIndexer
+from .indexer import FileEntry, ProjectIndexer, _MAX_FILE_BYTES
 
 ScopeType = Literal[
     "none", "minimal", "targeted", "expanded",

@@ -10,7 +10,7 @@ Layout:
      │    ├─ UserMessage(...)           # each user turn — max 7 rows, internal scroll
      │    └─ AssistantTurn(...)         # each agent run — full height, streamed into
      └─ Vertical(id="inputbar")         # docked bottom
-          ├─ StatusFooter               # ⏱ tokens compose% project perm
+          ├─ StatusFooter               # ⏱ P/C/V context project perm
           └─ Horizontal(id="input_row")
                ├─ Static("│  kratos ❯ ")
                └─ PromptInput(TextArea) # 1→5 lines, then internal scroll
@@ -36,6 +36,7 @@ from textual import events
 
 from ..llm.tokens import role_context_windows
 from kratos.ui import elapsed_str, _tok_short
+from .prompt_frame import _PlannerFilter
 from .slash import _SLASH_TREE, slash_completions
 
 
@@ -224,7 +225,7 @@ class PromptInput(TextArea):
 
 
 class StatusFooter(Static):
-    """One-line info bar: ⏱ lifetime · ∑ tokens · compose% · project · perm · last task."""
+    """One-line info bar: ⏱ lifetime · P/C/V context · project · perm · last task."""
 
     DEFAULT_CSS = """
     StatusFooter {
@@ -338,6 +339,7 @@ class KratosApp(App):
         self._last_banner_section: str = ""
         self._section_start: float = 0.0
         self._coder_filter: _TuiCoderFilter | None = None
+        self._planner_filter: _PlannerFilter | None = None
         self._planner_buf: str = ""
         self._coder_buf: str = ""
 
@@ -484,6 +486,7 @@ class KratosApp(App):
         self._planner_buf = ""
         self._coder_buf = ""
         self._last_banner_section = ""
+        self._planner_filter = None
 
         turn = AssistantTurn()
         self._current_turn = turn
@@ -602,20 +605,31 @@ class KratosApp(App):
             if self._current_turn is not None:
                 self._current_turn.mount(self._stream_static)
 
-            if content == "coder":
+            if content == "planner":
+                self._planner_filter = _PlannerFilter(self._planner_emit)
+            elif content == "coder":
                 self._coder_filter = _TuiCoderFilter(self._coder_emit)
 
-        elif src in ("planner", "verify"):
+        elif src == "planner":
+            if self._stream_static is None:
+                return
+            if kind == "think":
+                self._stream_text.append(content, style="dim italic")
+            else:
+                self._planner_buf += content
+                if self._planner_filter:
+                    self._planner_filter.feed(content)
+            self._scroll_log()
+
+        elif src == "verify":
             if self._stream_static is None:
                 return
             if kind == "think":
                 self._stream_text.append(content, style="dim italic")
             else:
                 self._stream_text.append(content)
-                if src == "planner":
-                    self._planner_buf += content
-            self._stream_static.update(self._stream_text)
-            self._scroll_log()
+                self._stream_static.update(self._stream_text)
+                self._scroll_log()
 
         elif src == "coder":
             if kind == "think":
@@ -641,6 +655,9 @@ class KratosApp(App):
                 self.kratos_logger.log_model_output(
                     "planner", self.kratos_config.planner_model, self._planner_buf)
                 self._planner_buf = ""
+                if self._planner_filter:
+                    self._planner_filter.flush()
+                    self._planner_filter = None
             elif self._current_section == "coder":
                 if self._coder_filter:
                     self._coder_filter.flush()
@@ -703,6 +720,7 @@ class KratosApp(App):
         self._stream_static   = None
         self._current_section = ""
         self._coder_filter    = None
+        self._planner_filter  = None
         self._busy            = False
 
         inp = self.query_one("#prompt_input", PromptInput)
@@ -719,6 +737,12 @@ class KratosApp(App):
             self._current_turn.mount(Static(rt))
         self._scroll_log()
 
+    def _planner_emit(self, text: str, style: str = "") -> None:
+        rt = RichText(text, style=style)
+        if self._current_turn is not None:
+            self._current_turn.mount(Static(rt))
+        self._scroll_log()
+
     # ── Status footer ─────────────────────────────────────────────────────────
 
     def _refresh_footer(self) -> None:
@@ -728,40 +752,34 @@ class KratosApp(App):
             pass
 
     def _footer_text(self) -> RichText:
-        """Builds the bottom status line for TUI. Always includes both ⏱ (Uhr) and %→compose
-        together with the other live stats. Uhr grows and shifts left as it goes s→m→h.
+        """Builds the bottom status line for TUI. Shows ⏱ plus live P/C/V context usage.
+        Uhr grows and shifts left as it goes s→m→h.
         """
         SEP = "  [dim]│[/dim]  "
         parts: list[str] = []
 
         # Time early so longer values (1h 05m etc) expand left and push rest right gracefully.
-        display_t = self._last_task_s
-        if display_t is None:
+        # While a task is running, show its live elapsed time (ticking since the prompt was
+        # sent) rather than the previous task's frozen duration.
+        if self._busy:
+            display_t = time.monotonic() - self._task_start
+        elif self._last_task_s is not None:
+            display_t = self._last_task_s
+        else:
             display_t = time.monotonic() - self.session_start
         t_str = elapsed_str(display_t) if display_t and display_t > 0 else "0s"
         parts.append(f"[dim]⏱[/dim] [cyan]{t_str}[/cyan]")
 
-        tok   = self.kratos_agent.session_usage
-        total = tok.get("prompt_tokens", 0) + tok.get("completion_tokens", 0)
-        parts.append(f"∑ [cyan]{total:,}[/cyan]")
-
         windows = role_context_windows(self.kratos_config)
-        for role, abbr in (("planner", "P"), ("coder", "C"), ("verifier", "V")):
+        active_role = self._current_section if self._busy and self._current_section in windows else ""
+        roles = [(active_role, {"planner": "P", "coder": "C", "verifier": "V"}[active_role])] if active_role else [
+            ("planner", "P"), ("coder", "C"), ("verifier", "V")
+        ]
+        for role, abbr in roles:
             used = self._ctx_live.get(role, (0, windows[role]))[0]
             window = windows[role]
             color = "red" if window and used / window > 0.8 else "yellow" if window and used / window > 0.6 else "green"
             parts.append(f"[{color}]{abbr} {_tok_short(used)}/{_tok_short(window)}[/]")
-
-        coder_total  = windows["coder"]
-        threshold    = float(getattr(self.kratos_config, "compress_threshold", 0.75))
-        coder_used   = self._ctx_live.get("coder", (0, coder_total))[0]
-        compose_at   = max(1, threshold * coder_total)
-        pct          = min(100, int(coder_used * 100 / compose_at))
-        bw           = 8
-        filled       = min(bw, int(bw * pct / 100))
-        bar          = "▓" * filled + "░" * (bw - filled)
-        bc           = "red" if pct > 80 else "yellow" if pct > 50 else "bright_black"
-        parts.append(f"[{bc}]{bar} {pct}%[/] [dim]→compose[/dim]")
 
         perm   = self.kratos_config.permission
         pc     = {"low": "yellow", "mid": "green", "high": "red"}.get(perm, "green")
