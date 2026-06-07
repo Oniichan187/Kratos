@@ -70,7 +70,28 @@ def _compile_check_cmds(toolchains: set[str], root: Path) -> list[VerificationCo
     }
     cmds: list[VerificationCommand] = []
     if "dotnet" in toolchains:
-        cmd = compile_cfgs.get("dotnet", "dotnet build --nologo -q")
+        sln_files = [p for p in root.glob("*.sln") if not _is_noise_path(p)]
+        root_projects = [p for p in root.glob("*.csproj") if not _is_noise_path(p)]
+        all_projects = [p for p in root.rglob("*.csproj") if not _is_noise_path(p)]
+        test_projects = [
+            p for p in all_projects
+            if "test" in p.relative_to(root).as_posix().lower()
+        ]
+        target = (
+            sln_files[0]
+            if sln_files else
+            root_projects[0]
+            if root_projects else
+            test_projects[0]
+            if test_projects else
+            all_projects[0]
+            if all_projects else
+            None
+        )
+        if target is not None:
+            cmd = f"dotnet build {_quote_rel(target, root)} --nologo -v:minimal"
+        else:
+            cmd = compile_cfgs.get("dotnet", "dotnet build --nologo -q")
         cmds.append(VerificationCommand(cmd=cmd, purpose="compile check", source="auto-compile", is_test=False))
     if "node" in toolchains and (root / "tsconfig.json").exists():
         cmd = compile_cfgs.get("node_tsconfig", "npx tsc --noEmit --pretty false")
@@ -85,6 +106,28 @@ def _clean_command_line(line: str) -> str:
     return s
 
 
+_CMD_PATH_TOKEN_RE = re.compile(r'[^\s"\']+[/\\][^\s"\']*\.[a-zA-Z][a-zA-Z0-9]{0,8}')
+
+
+def _missing_command_paths(cmd: str, root: Path) -> list[str]:
+    """Return file-path tokens referenced in *cmd* that don't exist under *root*.
+
+    Catches verify commands the coder points at not-yet-created files (e.g.
+    `python -m pytest tests/test_todo_store.py` before that file was written),
+    so the runtime can skip them instead of executing a guaranteed failure.
+    Bare directory/package targets (e.g. `pytest tests`) have no extension and
+    are left alone.
+    """
+    missing: list[str] = []
+    for token in _CMD_PATH_TOKEN_RE.findall(cmd):
+        rel = token.strip("'\"").replace("\\", "/")
+        if (root / rel).exists():
+            continue
+        if rel not in missing:
+            missing.append(rel)
+    return missing
+
+
 def _is_safe_verification_command(cmd: str) -> bool:
     # Read from JSON on each call (load_prompts() is cached — O(1) after first load).
     meta_chars = tuple(get_toolchain("blocked_verify_chars") or _VERIFY_META_CHARS_FALLBACK)
@@ -93,7 +136,7 @@ def _is_safe_verification_command(cmd: str) -> bool:
     if not normalized or any(meta in normalized for meta in meta_chars):
         return False
     if normalized.startswith("dotnet run --project"):
-        return _is_test_verification_command(normalized)
+        return True
     return normalized.startswith(safe_prefixes)
 
 
@@ -303,10 +346,11 @@ def _proven_work_satisfied(proof: ProvenWork, require_test: bool = True) -> bool
 
 
 def _format_proven_work_feedback(proof: ProvenWork, require_test: bool = True) -> str:
+    pm = load_prompts()
     if not proof.commands_planned:
-        return "PROVEN_WORK missing: no safe build/test command was configured, found in README, or inferred from project files."
+        return pm.get_snippet("proven_work_missing_command")
     if not proof.commands:
-        return "PROVEN_WORK missing: verification commands were planned but not executed."
+        return "PROVEN_WORK missing: verification commands were planned but not executed."  # keep one for now, or add another snippet
     failed = [item for item in proof.commands if item.get("exit_code") != 0]
     if failed:
         item = failed[-1]

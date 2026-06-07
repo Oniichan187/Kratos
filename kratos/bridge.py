@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Generator
@@ -72,6 +73,17 @@ def win_to_wsl(win_path: str | Path) -> str:
 class OllamaBridge:
     def __init__(self, host: str = "http://localhost:11434") -> None:
         self.host = host.rstrip("/")
+        self._active_response = None
+        self._active_lock = threading.Lock()
+
+    def cancel_active(self) -> None:
+        with self._active_lock:
+            response = self._active_response
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
@@ -258,6 +270,7 @@ class OllamaBridge:
         num_ctx: int | None = None,
         think: bool | None = None,
         keep_alive: str = "0",
+        cancel_event=None,
     ) -> Generator[tuple[str, str], None, None]:
         """Stream chat response.
 
@@ -280,40 +293,61 @@ class OllamaBridge:
         if think is not None:
             payload["think"] = think
 
-        r = requests.post(
-            f"{self.host}/api/chat",
-            json=payload,
-            stream=True,
-            timeout=None,
-        )
-
         prompt_tokens = 0
         completion_tokens = 0
 
-        for line in r.iter_lines():
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+        r = None
+        try:
+            if cancel_event is not None and cancel_event.is_set():
+                raise KeyboardInterrupt
+            r = requests.post(
+                f"{self.host}/api/chat",
+                json=payload,
+                stream=True,
+                timeout=None,
+            )
+            with self._active_lock:
+                self._active_response = r
 
-            if "error" in data:
-                raise RuntimeError(f"Ollama: {data['error']}")
+            for line in r.iter_lines():
+                if cancel_event is not None and cancel_event.is_set():
+                    raise KeyboardInterrupt
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
 
-            if data.get("done", False):
-                # Harvest real token counts from the done-message
-                prompt_tokens     = data.get("prompt_eval_count", 0)
-                completion_tokens = data.get("eval_count", 0)
-                break
+                if "error" in data:
+                    raise RuntimeError(f"Ollama: {data['error']}")
 
-            msg   = data.get("message", {})
-            think_tok = msg.get("thinking", "")
-            text_tok  = msg.get("content", "")
-            if think_tok:
-                yield (think_tok, "think")
-            if text_tok:
-                yield (text_tok, "text")
+                if data.get("done", False):
+                    # Harvest real token counts from the done-message
+                    prompt_tokens     = data.get("prompt_eval_count", 0)
+                    completion_tokens = data.get("eval_count", 0)
+                    break
+
+                msg   = data.get("message", {})
+                think_tok = msg.get("thinking", "")
+                text_tok  = msg.get("content", "")
+                if think_tok:
+                    yield (think_tok, "think")
+                if text_tok:
+                    yield (text_tok, "text")
+        except requests.RequestException:
+            if cancel_event is not None and cancel_event.is_set():
+                raise KeyboardInterrupt
+            raise
+        finally:
+            if r is not None:
+                with self._active_lock:
+                    if self._active_response is r:
+                        self._active_response = None
+                try:
+                    r.close()
+                except Exception:
+                    pass
 
         # Always emit a usage tuple so the agent can track consumption
         usage = json.dumps({
@@ -322,3 +356,46 @@ class OllamaBridge:
             "total_tokens":      prompt_tokens + completion_tokens,
         })
         yield (usage, "usage")
+
+    # ── embeddings (for knowledge base / vector retrieval) ────────────────────
+
+    def embed(
+        self,
+        texts: list[str] | str,
+        model: str | None = None,
+    ) -> list[list[float]]:
+        """Generate embeddings via Ollama (/api/embed).
+
+        Works against the same host (WSL Ollama in the user's setup).
+        Returns list of float vectors (one per input text).
+        Model should be a small embed model (e.g. nomic-embed-text).
+        """
+        if isinstance(texts, str):
+            texts = [texts]
+
+        if not texts:
+            return []
+
+        payload = {
+            "model": model or "nomic-embed-text",
+            "input": texts,
+        }
+
+        try:
+            r = requests.post(
+                f"{self.host}/api/embed",
+                json=payload,
+                timeout=180,
+            )
+            r.raise_for_status()
+            data = r.json()
+            embs = data.get("embeddings") or data.get("embedding")
+            if isinstance(embs, list) and embs:
+                if isinstance(embs[0], (int, float)):
+                    return [embs]  # single vector case
+                return embs
+            return []
+        except Exception:
+            # Graceful: return zero vectors so hybrid retrieval can still run
+            dim = 768
+            return [[0.0] * dim for _ in texts]

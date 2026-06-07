@@ -1,3 +1,9 @@
 rich>=13.7
 requests>=2.31
 prompt-toolkit>=3.0
+textual>=0.60
+
+# For best-possible vector knowledge base + continuous "gets" (optional but recommended)
+# LanceDB is lightweight, serverless, file-based — perfect for local laptop + WSL shared FS.
+lancedb>=0.12.0  # or `pip install lancedb` if you want the real vector DB experience
+# If you omit it, Kratos falls back to symbol + keyword + memory hybrid retrieval (still much better than pure keyword).

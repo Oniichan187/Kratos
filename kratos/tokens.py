@@ -138,6 +138,63 @@ def choose_num_ctx(
     return min(chosen, cap)
 
 
+def effective_num_ctx(
+    model: str,
+    configured_num_ctx: int,
+    vram_ctx_ceiling: int,
+    *,
+    prompt_tokens: int = 0,
+    max_new_tokens: int = 0,
+    force_max_context: bool = True,
+) -> int:
+    """Return the real context window that will be passed to a model call."""
+    return choose_num_ctx(
+        model=model,
+        prompt_tokens=prompt_tokens,
+        max_new_tokens=max_new_tokens,
+        vram_ceiling=min(configured_num_ctx, vram_ctx_ceiling),
+        force_max_context=force_max_context,
+    )
+
+
+def role_context_windows(config) -> dict[str, int]:
+    """Return effective display windows for Kratos roles."""
+    force_max = getattr(config, "always_max_ctx", True)
+    return {
+        "planner": effective_num_ctx(
+            getattr(config, "planner_model"),
+            int(getattr(config, "planner_num_ctx")),
+            int(getattr(config, "vram_ctx_ceiling")),
+            force_max_context=force_max,
+        ),
+        "coder": effective_num_ctx(
+            getattr(config, "coder_model"),
+            int(getattr(config, "coder_num_ctx")),
+            int(getattr(config, "vram_ctx_ceiling")),
+            force_max_context=force_max,
+        ),
+        "verifier": effective_num_ctx(
+            getattr(config, "verifier_model"),
+            int(getattr(config, "verifier_num_ctx")),
+            int(getattr(config, "vram_ctx_ceiling")),
+            force_max_context=force_max,
+        ),
+        "compressor": effective_num_ctx(
+            getattr(config, "compressor_model"),
+            int(getattr(config, "compressor_num_ctx")),
+            int(getattr(config, "compressor_num_ctx")),
+            force_max_context=force_max,
+        ),
+        "relay": effective_num_ctx(
+            getattr(config, "coder_model"),
+            int(getattr(config, "relay_num_ctx")),
+            int(getattr(config, "relay_num_ctx")),
+            force_max_context=force_max,
+        ),
+        "vram_cap": int(getattr(config, "vram_ctx_ceiling")),
+    }
+
+
 # ── relay decision ─────────────────────────────────────────────────────────────
 
 def relay_needed(

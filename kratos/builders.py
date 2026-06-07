@@ -6,6 +6,7 @@ import json
 
 from .classifier import Intent
 from .context import ContextPackage, ProjectIndexer, ScopeType
+from .knowledge import RetrievedChunk  # for type hints / rendering
 from .prompts import load_prompts
 from .router import Route
 from .verification import ProvenWork
@@ -49,11 +50,20 @@ def _needs_thinking(
 def _coder_context_block(ctx: ContextPackage, pm, step_mode: bool = False) -> str:
     """Build the file-context section used in coder prompts.
 
-    Returns a string with test-file headers, stub-file headers, and done-source
-    excerpts — or an empty string if ctx has no files.
-
-    step_mode=True additionally classifies C# // TODO stubs as stubs (not "done").
+    Prefers rich retrieved chunks from the vector knowledge base (the "continuous gets").
+    Falls back to the old whole-file excerpts only when no chunks are present.
     """
+    # NEW best-possible path: use the dynamically retrieved chunks
+    if getattr(ctx, "retrieved_chunks", None):
+        parts: list[str] = []
+        parts.append(pm.get_snippet("file_contents_header") or "Relevant code (dynamically retrieved for this step):")
+        for ch in ctx.retrieved_chunks[:8]:
+            if isinstance(ch, RetrievedChunk):
+                parts.append(ch.to_prompt_block(700))
+            else:
+                parts.append(str(ch)[:500])
+        return "\n\n".join(parts)
+
     if not ctx.files:
         return ""
     noise = ("README", "ARCH", "REQUIRE", "docs/", "CHANGELOG", "LICENSE")
@@ -67,7 +77,7 @@ def _coder_context_block(ctx: ContextPackage, pm, step_mode: bool = False) -> st
         c = f.content or ""
         if "NotImplementedError" in c:
             return True
-        if "// TODO" in c or "/* TODO" in c:
+        if step_mode and ("// TODO" in c or "/* TODO" in c):
             return True
         return False
 
@@ -79,17 +89,17 @@ def _coder_context_block(ctx: ContextPackage, pm, step_mode: bool = False) -> st
         parts.append(pm.get_snippet("test_files_header") or
                      "TEST FILES — these define the exact API. Match every signature exactly:")
         for f in test_files:
-            parts.append(f"--- {f.rel_path} ---\n{f.excerpt(4000)}")
+            parts.append(f"--- {f.rel_path} ---\n{f.excerpt(7000)}")
     if stub_files:
         names = ", ".join(f.rel_path for f in stub_files)
         parts.append((pm.get_snippet("stub_files_header") or "STUB FILES — IMPLEMENT ALL: ") + names)
         for f in stub_files:
-            parts.append(f"--- {f.rel_path} ---\n{f.excerpt(2500)}")
+            parts.append(f"--- {f.rel_path} ---\n{f.excerpt(5000)}")
     if done_files:
         parts.append(pm.get_snippet("done_files_header") or
                      "Already-implemented (reference only — do NOT rewrite unless plan says to):")
         for f in done_files:
-            parts.append(f"--- {f.rel_path} ---\n{f.excerpt(1000)}")
+            parts.append(f"--- {f.rel_path} ---\n{f.excerpt(3000)}")
     return "\n\n".join(p for p in parts if p)
 
 
@@ -103,10 +113,20 @@ def _planner_msg(task: str, ctx: ContextPackage, all_files: list | None = None, 
         parts.append((pm.get_snippet("all_project_files_header") or "All project files:\n") + listing)
     if ctx.memory_summary:
         parts.append(ctx.memory_summary)
-    if ctx.files:
+
+    # NEW: prefer rich retrieved chunks from the vector knowledge base (continuous "gets")
+    if getattr(ctx, "retrieved_chunks", None):
+        parts.append("## Relevant Code (dynamically retrieved via project vector knowledge base)")
+        for ch in ctx.retrieved_chunks[:10]:
+            if isinstance(ch, RetrievedChunk):
+                parts.append(ch.to_prompt_block(800))
+            else:
+                parts.append(str(ch)[:600])
+    elif ctx.files:
         parts.append(pm.get_snippet("file_contents_header") or "File contents (most relevant):")
         for f in ctx.files:
             parts.append(f"--- {f.rel_path} ---\n{f.excerpt(1500)}")
+
     if ctx.error_lines:
         parts.append((pm.get_snippet("errors_header") or "Errors/logs:\n") + "\n".join(ctx.error_lines[:15]))
     if verify_hint:
@@ -120,7 +140,7 @@ def _coder_msg(task: str, ctx: ContextPackage, plan: str) -> str:
     parts: list[str] = []
     if plan:
         parts.append(f"{pm.get_snippet('plan_label') or 'Plan:\\n'}{plan}")
-    ctx_block = _coder_context_block(ctx, pm, step_mode=False)
+    ctx_block = _coder_context_block(ctx, pm, step_mode=True)
     if ctx_block:
         parts.append(ctx_block)
     if ctx.error_lines:
@@ -156,20 +176,36 @@ def _coder_retry_msg(
     if ctx.files:
         noise = ("README", "ARCH", "REQUIRE", "docs/", "CHANGELOG", "LICENSE")
         test_files = [f for f in ctx.files
-                      if any(x in f.rel_path for x in ("test_", "_test.", ".spec.", ".test."))]
+                      if any(x in f.rel_path for x in (
+                          "test_", "_test.", ".spec.", ".test.",
+                          "Tests.", "Tests/", "tests/",
+                      ))]
         src_files  = [f for f in ctx.files
                       if f not in test_files and not any(x in f.rel_path for x in noise)]
         if test_files:
             parts.append(pm.get_snippet("test_files_header_short") or "TEST FILES — exact API you must satisfy:")
             for f in test_files:
-                parts.append(f"--- {f.rel_path} ---\n{f.excerpt(1000)}")
+                parts.append(f"--- {f.rel_path} ---\n{f.excerpt(3000)}")
         parts.append("Current source files:")
         for f in src_files:
-            parts.append(f"--- {f.rel_path} ---\n{f.excerpt(1000)}")
+            parts.append(f"--- {f.rel_path} ---\n{f.excerpt(5000)}")
     parts.append(f"{pm.get_snippet('revised_plan_label') or 'Revised plan:\\n'}{plan}")
     rf_intro = pm.get_snippet("required_fixes_intro") or "Required fixes:\n"
     rf_action = pm.get_snippet("required_fixes_action") or "Fix ALL issues. Every NotImplementedError must be replaced."
     parts.append(f"{rf_intro}{verify_feedback[:2000]}\n\n{rf_action}")
+    if any(f.rel_path.endswith(".cs") for f in ctx.files):
+        parts.append(
+            "C# compiler repair notes:\n"
+            "- Use explicit generic enum parsing, e.g. Enum.TryParse<TaskStatus>(value, ignoreCase: true, out var status).\n"
+            "- Enum.Parse<TEnum>(...) returns a value; it is not a TryParse method and has no out parameter.\n"
+            "- Hyphenated CLI/file values such as in-progress usually need explicit mapping to enum names like InProgress.\n"
+            "- Do not use StringSplitOptions.RemoveEmptyEntries when empty columns are invalid; split first, then validate count and trim.\n"
+            "- Convert invalid user/file values into the exception type required by tests; do not leak ArgumentException from Enum.Parse.\n"
+            "- Filter blank/comment input lines in repository/file loading before calling a parser that expects a task record.\n"
+            "- Compare enum values directly for business logic; do not compare TaskStatus.ToString() to lowercase CLI strings.\n"
+            "- Priority order High, Medium, Low means lower rank index sorts first.\n"
+            "- After any compiler or test failure, rewrite the complete affected file with the exact broken lines fixed."
+        )
     parts.append(f"{pm.get_snippet('task_label') or 'Task: '}{task}")
     return "\n\n".join(p for p in parts if p)
 

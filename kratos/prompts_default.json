@@ -24,7 +24,7 @@
     "step_verify_marker": "### STEP_VERIFY:",
 
     "coder_forced_prefix_legacy": "CRITICAL: Your response MUST begin with '### FILE:' on the very first line.\nOutput ONLY source files as specified in the system prompt.\n\n",
-    "coder_step_forced_prefix": "CRITICAL: Implement ONLY the SINGLE step below. Begin response with '### FILE:'.\nThink: how exactly, risks, exact verify command for THIS step.\n\n",
+    "coder_step_forced_prefix": "CRITICAL: Implement ONLY the SINGLE step below. Begin response with '### FILE:'.\nThink: how exactly, risks, exact verify command for THIS step.\n\nAFTER the file content and the ### SUMMARY, you MUST output exactly one line:\n### STEP_VERIFY: <the exact command the planner asked for this step (or a safe project test command)>\nDo not skip this line. The runtime will run it immediately after your change for this step.\n\n",
     "coder_only_light": "If this is a git/shell command or a small continuation, reply with the precise commands or the minimal code patch. Use normal text or ``` blocks. Only emit ### FILE: blocks if the task actually requires writing source files to disk.",
 
     "step_input_full_task_label": "Full task: ",
@@ -50,6 +50,8 @@
     "done_files_header": "Already-implemented (reference only — do NOT rewrite unless plan says to):",
 
     "file_contents_header": "File contents (most relevant):",
+    "retrieved_chunks_header": "Relevant code (dynamically retrieved via project vector knowledge base for this step):",
+    "retrieved_chunks_note": "The chunks below were selected by semantic + symbol search for the CURRENT step. Match signatures and tests exactly. Prioritize these over generic knowledge.",
     "all_project_files_header": "All project files:\n",
     "errors_header": "Errors/logs:\n",
     "errors_short_header": "Errors:\n",
@@ -61,7 +63,22 @@
     "stepwise_execution_note": "Stepwise execution: {n} plan steps (coder + test per step)",
     "step_progress": "Step {num}/{total}: {desc}",
     "step_verified": "Step {num}/{total} verified (tests passed).",
-    "step_no_verify_warn": "Step {num}: no verification command found for this step. Continuing."
+    "step_no_verify_warn": "Step {num}: no verification command found for this step. Continuing.",
+
+    "role_banner_planner": "◈ PLANNER · {model}",
+    "role_banner_coder": "◇ CODER · {model} — step {num}/{total}: {desc}",
+    "role_banner_verify": "◇ VERIFIER · {model}",
+    "role_banner_relay": "◈ RELAY · {model}",
+
+    "retrieval_step_note": "retrieving (step {num}) from project vector KB…",
+    "knowledge_get_tool": "knowledge_get(step {num}) → {count} chunks",
+
+    "revising_iteration": "Revising — iteration {current}/{max}",
+    "reusing_previous_plan": "Reusing previous plan; sending verifier feedback directly to coder.",
+
+    "proven_work_no_verify_command": "Step {num}: no verification command found. Continuing.",
+    "proven_work_no_safe_command": "PROVEN_WORK: no safe verification command found. Set /test <cmd> or add test instructions.",
+    "proven_work_missing_command": "PROVEN_WORK missing: no safe build/test command was configured, found in README, or inferred from project files."
   },
 
   "predict": {

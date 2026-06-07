@@ -49,9 +49,11 @@ _RULES: list[tuple[Intent, list[str]]] = [
         r'\btest\s+output\b',
     ]),
     (Intent.BUGFIX, [
-        r'\b(?:fix|bug|fehler(?:hafte?)?|broken|kaputt|crash|absturz)\b',
+        r'\b(?:fix|bug|fehler(?:hafte?)?|broken|kaputt|crash|absturz|beheb\w*|repari\w*)\b',
         r'\b(?:funktioniert\s+nicht|doesn\'?t?\s+work|not\s+working|incorrect|wrong\s+output)\b',
         r'\b(?:warum\s+(?:schlägt|gibt|ist)|why\s+(?:is|does|do)\b).{0,60}\?',
+        r'\b(?:ursache|cause|root\s+cause)\b.{0,60}\b(?:find|finden|identify|identifizier\w*|herausfind\w*)\w*',
+        r'\b(?:nicht\s+(?:richtig|korrekt|mehr))\b.{0,60}\b(?:verkn[üu]pft|verbunden|zugeordnet|funktioniert|find(?:et|en)?)\b',
     ]),
     (Intent.SHELL_GIT, [
         r'\bgit\s+(?:commit|push|pull|merge|rebase|reset|checkout|stash|tag|cherry-pick)\b',
@@ -68,6 +70,7 @@ _RULES: list[tuple[Intent, list[str]]] = [
         r'\b(?:vervollst(?:ä|ae)ndig|fertigstell|implementier|erstell|bau|hinzufüg|programmier|entwickel)\w*'
         r'\W.{0,80}\b(?:function|funktion|class|klasse|method|module|api|endpoint|feature|component|route|service|projekt|project)\b',
         r'\b(?:create?|implement\w*|build|complete\w*|finish\w*)\W.{0,60}\b(?:function|class|method|module|api|endpoint|feature|component|route|service|project)\b',
+        r'\b(?:implement\w*|complete\w*|finish\w*)\W.{0,80}\b(?:missing|todo|stubbed?|incomplete)\b.{0,80}\b(?:functionality|logic|implementation|code|tests?|features?)\b',
         r'\b(?:neue?\s+(?:function|funktion|class|klasse|feature|endpoint|route|model|module|component|service))\b',
         r'\b(?:vervollst(?:ä|ae)ndig|complet|finish)\w*\W.{0,40}\b(?:project|projekt|cli|app|script|tool)\b',
     ]),

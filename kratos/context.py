@@ -91,6 +91,10 @@ class ContextPackage:
     files:               list[FileEntry] = field(default_factory=list)
     error_lines:         list[str] = field(default_factory=list)
     token_budget:        int = 12288
+    # NEW (best-possible vector "gets"): high-signal chunks from dynamic retrieval
+    # These are the primary source of relevant code for large projects.
+    # The old .files (whole-file excerpts) are kept for compatibility/small scopes.
+    retrieved_chunks: list = field(default_factory=list)  # list[RetrievedChunk]
 
     def to_prompt(self) -> str:
         parts: list[str] = []
@@ -98,7 +102,15 @@ class ContextPackage:
             parts.append(f"## Project\n{self.project_description}")
         if self.memory_summary:
             parts.append(self.memory_summary)
-        if self.files:
+        if self.retrieved_chunks:
+            parts.append("## Relevant Code (retrieved via vector knowledge base)")
+            for ch in self.retrieved_chunks[:12]:  # keep prompt reasonable
+                try:
+                    parts.append(ch.to_prompt_block(900))
+                except Exception:
+                    parts.append(f"### {getattr(ch, 'rel_path', '?')}\n{getattr(ch, 'text', '')[:800]}")
+        if self.files and not self.retrieved_chunks:
+            # Fallback / small-project path: only show whole files if we have no rich chunks
             parts.append("## Relevant Files")
             for f in self.files:
                 parts.append(f"### {f.rel_path}\n```\n{f.excerpt(1500)}\n```")
@@ -232,6 +244,8 @@ class ContextBuilder:
             memory_summary=memory_summary,
             error_lines=analysis.error_lines,
             token_budget=token_budget,
+            # Will be populated by caller (agent) with dynamic retrieval results
+            retrieved_chunks=[],
         )
 
         if scope == "none":

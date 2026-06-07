@@ -6,8 +6,10 @@ or:   python tests/test_core.py
 
 import sys
 import json
+import threading
 import types
 import unittest
+import inspect
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -16,13 +18,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from kratos.tokens import (
     estimate, estimate_messages, fit_to_budget, fit_excerpt,
     choose_num_ctx, relay_needed, model_max_ctx,
+    effective_num_ctx, role_context_windows,
 )
 from kratos.agent import (
+    KratosAgent,
     ProvenWork,
     _extract_readme_verification_commands,
     _infer_project_verification_commands,
     _is_safe_verification_command,
     _is_test_verification_command,
+    _missing_command_paths,
     _parse_file_changes,
     _parse_file_deletions,
     _proven_work_satisfied,
@@ -37,6 +42,7 @@ from kratos.agent import (
     CommandRegistry,
 )
 from kratos.config import KratosConfig
+from kratos.bridge import OllamaBridge
 from kratos.classifier import IntentClassifier, Intent
 from kratos.analyzer import InputAnalyzer
 from kratos.router import Router, Route
@@ -119,6 +125,110 @@ class TestChooseNumCtx(unittest.TestCase):
         self.assertFalse(relay_needed(1000,  12000, 0.80))
 
 
+class TestEffectiveContextWindows(unittest.TestCase):
+    def test_effective_coder_window_respects_vram_cap(self):
+        ctx = effective_num_ctx(
+            "huihui_ai/qwen3.5-abliterated:4b",
+            configured_num_ctx=262144,
+            vram_ctx_ceiling=65536,
+        )
+        self.assertEqual(ctx, 65536)
+
+    def test_role_context_windows_show_real_model_call_limits(self):
+        cfg = KratosConfig(coder_num_ctx=262144, vram_ctx_ceiling=65536)
+        windows = role_context_windows(cfg)
+        self.assertEqual(windows["coder"], 65536)
+        self.assertEqual(windows["planner"], 40960)
+        self.assertEqual(windows["verifier"], 40960)
+
+
+class TestPromptContextGuard(unittest.TestCase):
+    def _agent(self, **kwargs):
+        params = {
+            "auto_compress": False,
+            "coder_num_ctx": 262144,
+            "vram_ctx_ceiling": 65536,
+        }
+        params.update(kwargs)
+        cfg = KratosConfig(**params)
+        return KratosAgent(cfg, MagicMock())
+
+    def test_prepare_model_prompt_never_returns_prompt_over_effective_ctx(self):
+        agent = self._agent()
+        huge_msg = "x" * 320_000
+        messages, prompt_tok, num_ctx, stored_msg, events = agent._prepare_model_prompt(
+            "coder",
+            agent.config.coder_model,
+            "system",
+            [],
+            huge_msg,
+            1024,
+        )
+        self.assertEqual(num_ctx, 65536)
+        self.assertLessEqual(prompt_tok, num_ctx)
+        self.assertLess(len(stored_msg), len(huge_msg))
+        self.assertTrue(any(ev[0] == "warn" for ev in events))
+        self.assertEqual(messages[-1]["content"], stored_msg)
+
+    def test_full_prompt_pressure_triggers_history_compression(self):
+        agent = self._agent(auto_compress=True)
+        history = [
+            {"role": "user", "content": "old user " * 2000},
+            {"role": "assistant", "content": "old assistant " * 2000},
+        ]
+        called = {"value": False}
+
+        def fake_compress(hist, keep_pairs=4):
+            called["value"] = True
+            hist.clear()
+            return True
+
+        agent._compressor.compress_history = fake_compress
+        agent._prepare_model_prompt(
+            "coder",
+            agent.config.coder_model,
+            "system",
+            history,
+            "new input " * 40_000,
+            1024,
+        )
+        self.assertTrue(called["value"])
+
+    def test_stepwise_policy_has_no_small_project_full_pass_bypass(self):
+        process_src = inspect.getsource(KratosAgent.process)
+        self.assertNotIn("small_project_full_pass", process_src)
+        self.assertNotIn("Small project detected; using full-pass", process_src)
+
+
+class TestOllamaBridgeCancel(unittest.TestCase):
+    def test_cancel_active_closes_current_response(self):
+        bridge = OllamaBridge()
+
+        class FakeResponse:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        response = FakeResponse()
+        bridge._active_response = response
+        bridge.cancel_active()
+        self.assertTrue(response.closed)
+
+    def test_chat_with_pre_set_cancel_event_does_not_call_network(self):
+        bridge = OllamaBridge()
+        cancel = threading.Event()
+        cancel.set()
+        stream = bridge.chat(
+            "model",
+            [{"role": "user", "content": "hello"}],
+            cancel_event=cancel,
+        )
+        with self.assertRaises(KeyboardInterrupt):
+            next(stream)
+
+
 # ── File operation parsers ────────────────────────────────────────────────────
 
 class TestFileParsers(unittest.TestCase):
@@ -159,6 +269,27 @@ Changed: src/main.py, src/utils.py — added main and helper"""
         self.assertEqual(_parse_file_changes("no file blocks"), [])
         self.assertEqual(_parse_file_deletions("no delete blocks"), [])
 
+    def test_malformed_file_marker_does_not_swallow_next_file_path(self):
+        text = """### FILE: src/TaskRepository.cs (updated)
+> Note: no code block for this marker.
+
+### FILE: src/Program.cs
+```csharp
+public static class Program {}
+```
+"""
+        changes = _parse_file_changes(text)
+        self.assertEqual(changes, [("src/Program.cs", "public static class Program {}\n")])
+
+    def test_file_marker_strips_trailing_parenthetical_note(self):
+        text = """### FILE: src/TaskParser.cs (updated with overdue logic)
+```csharp
+public sealed class TaskParser {}
+```
+"""
+        changes = _parse_file_changes(text)
+        self.assertEqual(changes, [("src/TaskParser.cs", "public sealed class TaskParser {}\n")])
+
 
 class TestProvenWork(unittest.TestCase):
     def test_safe_command_filter_rejects_shell_chains(self):
@@ -166,6 +297,23 @@ class TestProvenWork(unittest.TestCase):
         self.assertTrue(_is_safe_verification_command("dotnet run --project tests/TaskBoard.Tests"))
         self.assertFalse(_is_safe_verification_command("python -m pytest tests && del important.txt"))
         self.assertFalse(_is_safe_verification_command("echo hello"))
+
+    def test_missing_command_paths_flags_nonexistent_files_only(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_existing.py").write_text("x", encoding="utf-8")
+
+            self.assertEqual(
+                _missing_command_paths("python -m pytest tests/test_todo_store.py", root),
+                ["tests/test_todo_store.py"],
+            )
+            self.assertEqual(
+                _missing_command_paths("python -m pytest tests/test_existing.py", root), [],
+            )
+            # bare directory target (no file extension) is left alone
+            self.assertEqual(_missing_command_paths("python -m pytest tests", root), [])
 
     def test_test_command_detection(self):
         self.assertTrue(_is_test_verification_command("python -m pytest tests"))
@@ -192,8 +340,13 @@ dotnet run --project src/TaskBoard.Cli -- data/sample.txt list
             self.assertNotIn("dotnet build", cmd_text)
             # Explicit-path "dotnet run --project tests/..." is kept (valid + is_test)
             self.assertIn("dotnet run --project tests/TaskBoard.Tests", cmd_text)
-            # CLI-run without "test" in path is rejected by _is_safe_verification_command
-            self.assertNotIn("dotnet run --project src/TaskBoard.Cli -- data/sample.txt list", cmd_text)
+            # CLI smoke commands are safe verification commands when they use
+            # dotnet's explicit --project form and contain no shell metacharacters.
+            self.assertIn("dotnet run --project src/TaskBoard.Cli -- data/sample.txt list", cmd_text)
+            self.assertFalse([
+                item for item in commands
+                if item.cmd == "dotnet run --project src/TaskBoard.Cli -- data/sample.txt list"
+            ][0].is_test)
 
     def test_readme_command_extraction_keeps_bare_dotnet_build_when_root_has_project(self):
         import tempfile
@@ -308,6 +461,10 @@ class TestClassifierRouter(unittest.TestCase):
 
     def test_coding_intent(self):
         self.assertEqual(self._classify("implement the login feature"), Intent.CODING)
+
+    def test_implement_missing_functionality_is_coding(self):
+        text = "implement all missing CLI functionality and make the tests pass"
+        self.assertEqual(self._classify(text), Intent.CODING)
 
     def test_bugfix_intent(self):
         self.assertEqual(self._classify("fix the broken auth flow"), Intent.BUGFIX)
@@ -936,6 +1093,23 @@ class TestCompileCheckCmds(unittest.TestCase):
         self.assertFalse(cmds[0].is_test)
         self.assertEqual(cmds[0].source, "auto-compile")
 
+    def test_dotnet_nested_project_returns_explicit_build_target(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            test_dir = root / "tests" / "TaskBoard.Tests"
+            test_dir.mkdir(parents=True)
+            (test_dir / "TaskBoard.Tests.csproj").write_text("<Project/>", encoding="utf-8")
+
+            cmds = _compile_check_cmds({"dotnet"}, root)
+
+        self.assertEqual(len(cmds), 1)
+        self.assertEqual(
+            cmds[0].cmd,
+            "dotnet build tests/TaskBoard.Tests/TaskBoard.Tests.csproj --nologo -v:minimal",
+        )
+        self.assertFalse(cmds[0].is_test)
+
     def test_python_returns_empty(self):
         import tempfile
         with tempfile.TemporaryDirectory() as d:
@@ -1206,6 +1380,65 @@ class TestPromptManagerNewMethods(unittest.TestCase):
     def test_markers_includes_step_test(self):
         marker = self._pm.get_marker("step_test")
         self.assertEqual(marker, "### STEP_TEST:")
+
+
+class TestKratosCliPromptUi(unittest.TestCase):
+    """Regression tests for the interactive prompt wrapper in kratos.py."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        root = Path(__file__).resolve().parents[1]
+        spec = importlib.util.spec_from_file_location("kratos_cli_for_tests", root / "kratos.py")
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        cls.cli = module
+
+    def setUp(self):
+        if not getattr(self.cli, "_HAS_PT", False):
+            self.skipTest("prompt_toolkit is not installed")
+
+    def test_slash_completer_lists_root_commands(self):
+        from prompt_toolkit.document import Document
+
+        completions = list(self.cli._COMPLETER.get_completions(Document("/"), None))
+        texts = {item.text for item in completions}
+
+        self.assertIn("/help", texts)
+        self.assertIn("/models", texts)
+        self.assertIn("/permission", texts)
+
+    def test_slash_completer_lists_subcommands(self):
+        from prompt_toolkit.document import Document
+
+        completions = list(self.cli._COMPLETER.get_completions(Document("/models c"), None))
+        texts = {item.text for item in completions}
+
+        self.assertEqual(texts, {"coder", "compressor"})
+
+    def test_tui_slash_completions_root(self):
+        """slash_completions() in tui.py covers the same roots as the legacy completer."""
+        from kratos.tui import slash_completions
+
+        values = {v for v, _, _ in slash_completions("/")}
+        self.assertIn("/help", values)
+        self.assertIn("/models", values)
+        self.assertIn("/permission", values)
+
+    def test_tui_slash_completions_subcommands(self):
+        """slash_completions() returns correct subcommand set for /models c."""
+        from kratos.tui import slash_completions
+
+        values = {v for v, _, _ in slash_completions("/models c")}
+        self.assertEqual(values, {"coder", "compressor"})
+
+    def test_tui_slash_completions_empty_for_non_slash(self):
+        """slash_completions() returns nothing for ordinary text."""
+        from kratos.tui import slash_completions
+
+        self.assertEqual(slash_completions("hello"), [])
+        self.assertEqual(slash_completions(""), [])
 
 
 if __name__ == "__main__":

@@ -113,6 +113,15 @@ class KratosConfig:
     # the model's full context window (within vram cap). No "small prompt = small ctx".
     always_max_ctx: bool = True
 
+    # ── Vector Knowledge Base / continuous "gets" (best-possible retrieval) ──
+    # embed_model: small Ollama embed model (runs in same WSL as the coding models).
+    # enable_semantic_retrieval: master switch for the vector DB layer.
+    # retrieval_top_k: how many high-signal chunks to pull per "get".
+    embed_model: str = "nomic-embed-text"
+    enable_semantic_retrieval: bool = True
+    retrieval_top_k: int = 16
+    # knowledge_backend left for future (lancedb is the current implementation)
+
     # ── Build / test / verify ─────────────────────────────────────────────────
     build_cmd:             str | None = None
     test_cmd:              str | None = None

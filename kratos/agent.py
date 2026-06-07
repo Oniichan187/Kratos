@@ -1,4 +1,4 @@
-"""Kratos agent â€” dual-model pipeline with dynamic reasoning and auto-compression.
+"""Kratos agent — dual-model pipeline with dynamic reasoning and auto-compression.
 
 Token-stream convention:
   All generators yield (source: str, content: str, kind: str) where source is:
@@ -18,13 +18,13 @@ Token-stream convention:
     "end"      section end                      kind="end"
 
 Pipeline:
-  Input â†’ Analyze â†’ Classify â†’ Route â†’ Build Context
-    â†’ [Relay if huge] â†’ Planner â†’ Coder â†’ Verifier
-    â†’ if NEEDS_REVISION: re-plan â†’ re-code â†’ re-verify  (up to max_verify_iterations)
-    â†’ VERIFIED | UNSOLVABLE
+  Input → Analyze → Classify → Route → Build Context
+    → [Relay if huge] → Planner → Coder → Verifier
+    → if NEEDS_REVISION: re-plan → re-code → re-verify  (up to max_verify_iterations)
+    → VERIFIED | UNSOLVABLE
 
 Auto-compression: before each model call, if estimated prompt tokens >
-compress_threshold Ã— num_ctx â†’ compress_history() via the compressor model.
+compress_threshold × num_ctx → compress_history() via the compressor model.
 """
 
 from __future__ import annotations
@@ -43,14 +43,15 @@ from .classifier import IntentClassifier, Intent
 from .compress import Compressor
 from .config import KratosConfig, _project_dir, GLOBAL_DIR
 from .context import ContextBuilder, ContextPackage, ProjectIndexer, ScopeType
+from .knowledge import ProjectKnowledge, RetrievedChunk
 from .memory import MemoryEntry, MemoryManager
 from .router import Route, Router
 from .tokens import (
-    estimate, estimate_messages, choose_num_ctx,
-    fit_to_budget, relay_needed, model_max_ctx,
+    estimate, estimate_messages,
+    fit_to_budget, relay_needed, effective_num_ctx,
 )
 
-# Prompts are fully externalized to JSON â€” all AI-facing strings, patterns, and pipeline config
+# Prompts are fully externalized to JSON — all AI-facing strings, patterns, and pipeline config
 # live in prompts_default.json (user-editable). Python code contains only flow logic.
 from .prompts import (
     load_prompts,
@@ -81,8 +82,11 @@ from .verification import (
     ProvenWork,
     CommandRegistry,
     _clean_command_line,
+    _missing_command_paths,
+    _compile_check_cmds,
     _is_safe_verification_command,
     _is_test_verification_command,
+    _detect_project_toolchains,
     _command_toolchain,
     _dedupe_verification_commands,
     _extract_readme_verification_commands,
@@ -94,6 +98,7 @@ from .verification import (
     _parse_step_tests,
     _patch_dotnet_test_runner,
 )
+from .taskboard_repair import try_repair_known_probe
 
 # ── token predict limits (now sourced from prompts at runtime for full configurability) ──
 # (kept as module fallbacks only for very early import paths; prefer get_predict)
@@ -111,7 +116,10 @@ _RELAY_PREDICT       = 1200
 def _get_file_change_re():
     pm = load_prompts()
     fm = re.escape(pm.get_marker("file") or "### FILE:")
-    return re.compile(rf'{fm}\s*(.+?)\s*\n```(?:\w+)?\n(.*?)```', re.S)
+    return re.compile(
+        rf'^\s*{fm}\s*([^\r\n]+?)\s*\r?\n```(?:\w+)?[^\S\r\n]*\r?\n(.*?)^```\s*$',
+        re.S | re.M,
+    )
 
 
 def _get_file_delete_re():
@@ -122,14 +130,26 @@ def _get_file_delete_re():
 
 # Fallback module-level compiled (using defaults at import time)
 _FILE_CHANGE_RE = re.compile(
-    r'###\s+FILE:\s*(.+?)\s*\n```(?:\w+)?\n(.*?)```',
-    re.S,
+    r'^\s*###\s+FILE:\s*([^\r\n]+?)\s*\r?\n```(?:\w+)?[^\S\r\n]*\r?\n(.*?)^```\s*$',
+    re.S | re.M,
 )
 _FILE_DELETE_RE = re.compile(r'###\s+DELETE:\s*(.+?)\s*$', re.M)
 
 
 def _parse_file_changes(text: str) -> list[tuple[str, str]]:
-    return [(m.group(1).strip(), m.group(2)) for m in _get_file_change_re().finditer(text)]
+    changes: list[tuple[str, str]] = []
+    for m in _get_file_change_re().finditer(text):
+        path = m.group(1).strip()
+        path = re.sub(r'\s+\((?:updated|modified|new)\)\s*$', '', path, flags=re.I)
+        path = re.sub(
+            r'(\.[A-Za-z0-9][A-Za-z0-9._-]*)\s+\([^/\r\n]*\)\s*$',
+            r'\1',
+            path,
+        )
+        if not path or any(ch in path for ch in "\r\n`<>"):
+            continue
+        changes.append((path, m.group(2)))
+    return changes
 
 
 def _parse_file_deletions(text: str) -> list[str]:
@@ -159,20 +179,40 @@ class KratosAgent:
         self._memory      = MemoryManager(_project_dir(), GLOBAL_DIR)
         self._compressor  = Compressor(bridge, config)
 
+        # The new vector knowledge base — "the project as a queryable vector DB".
+        # Enables continuous dynamic "gets" (task-level + fresh per-step).
+        # Works in WSL (embeds via the same bridge host). Graceful fallback if no lancedb/embed model.
+        self._knowledge: ProjectKnowledge | None = None
+        try:
+            self._knowledge = ProjectKnowledge(config, bridge)
+        except Exception:
+            self._knowledge = None  # will stay in pure keyword/memory mode
+
         # Accumulated token usage for this session
         self._session_usage: dict[str, int] = {
             "prompt_tokens": 0, "completion_tokens": 0
         }
 
-        # File operations extracted from last coder run â€” applied by caller
+        # File operations extracted from last coder run — applied by caller
         self.pending_file_changes:   list[tuple[str, str]] = []
         self.pending_file_deletions: list[str] = []
+        self._cancel_event = None
 
     # ── session usage ─────────────────────────────────────────────────────────
 
     @property
     def session_usage(self) -> dict[str, int]:
         return dict(self._session_usage)
+
+    # ── knowledge base exposure (for /knowledge commands and status) ─────────
+    @property
+    def knowledge(self) -> "ProjectKnowledge | None":
+        return self._knowledge
+
+    def rebuild_knowledge(self, force: bool = False) -> int:
+        if self._knowledge is None:
+            return 0
+        return self._knowledge.rebuild(force=force)
 
     def _record_usage(self, usage_json: str) -> None:
         try:
@@ -182,12 +222,23 @@ class KratosAgent:
         except Exception:
             pass
 
+    def set_cancel_event(self, cancel_event) -> None:
+        self._cancel_event = cancel_event
+
+    def _is_cancelled(self) -> bool:
+        return bool(self._cancel_event is not None and self._cancel_event.is_set())
+
     # ── intelligent pipeline ─────────────────────────────────────────────────
 
     def process(self, task: str) -> Generator[tuple[str, str, str], None, None]:
         """Full pipeline. Yields (source, content, kind) events."""
         self.pending_file_changes.clear()
         self.pending_file_deletions.clear()
+
+        # Unconditional PromptManager so all pm.get_snippet / revising / proven_work paths
+        # (including retries, legacy coder, early errors, and branches that only assign inside
+        # if use_stepwise or CODER_ONLY) are safe. load_prompts() is cached.
+        pm = load_prompts()
 
         analysis = self._analyzer.analyze(task)
         intent   = self._classifier.classify(analysis)
@@ -201,25 +252,45 @@ class KratosAgent:
         )
         memory_summary = self._memory.format_for_prompt(mem_entries)
 
+        # ── NEW: dynamic vector "get" (continuous retrieval) ──────────────────
+        # This is the heart of the best-possible design: instead of a static index
+        # we do fresh, targeted semantic+hybrid retrieval ("gets") at the moments
+        # that matter. The 262k coder + stepwise love this.
+        retrieved_chunks: list[RetrievedChunk] = []
+        if self._knowledge is not None:
+            try:
+                yield ("info", "retrieving (task-level) from project vector knowledge base…", "info")
+                retrieved_chunks = self._knowledge.retrieve(
+                    analysis.normalized or task,
+                    top_k=getattr(self.config, "retrieval_top_k", 16),
+                )
+                yield ("tool", f"knowledge_get(task) → {len(retrieved_chunks)} chunks (vector+hybrid)", "tool")
+            except Exception as exc:
+                yield ("warn", f"knowledge retrieval failed (falling back): {exc}", "warn")
+
         # ── context build ─────────────────────────────────────────────────────
         scope = _scope_for(route, intent)
         n_indexed = len(self._indexer.index)
-        yield ("tool", f"index_project({self._indexer.root.name!r}) â†’ {n_indexed} files", "tool")
+        yield ("tool", f"index_project({self._indexer.root.name!r}) → {n_indexed} files", "tool")
 
         ctx = self._ctx_builder.build(
             analysis, intent=intent.value, route=route.value,
             memory_summary=memory_summary, scope=scope,
             token_budget=self.config.planner_num_ctx,
         )
+        ctx.retrieved_chunks = retrieved_chunks  # task-level dynamic "get" results
+
         coder_scope = _coder_scope_for(intent)
+        coder_context_budget = self._role_num_ctx("coder", self.config.coder_model, 0, 0)
         coder_ctx = self._ctx_builder.build(
             analysis, intent=intent.value, route=route.value,
             memory_summary="", scope=coder_scope,
-            token_budget=self.config.coder_num_ctx,
+            token_budget=coder_context_budget,
         )
+        coder_ctx.retrieved_chunks = retrieved_chunks  # initial broad retrieval for legacy full-pass path
         for f in ctx.files:
             sz = f"{f.size / 1024:.1f} KB" if f.size > 0 else "n/a"
-            yield ("tool", f"read_file({f.rel_path!r}) â†’ {sz}", "tool")
+            yield ("tool", f"read_file({f.rel_path!r}) → {sz}", "tool")
 
         # ── log context ───────────────────────────────────────────────────────
         yield ("log", json.dumps({
@@ -257,13 +328,16 @@ class KratosAgent:
                 route, keep_alive="5m", scope=scope, task=task, is_retry=False,
             )
             yield ("end", "planner", "end")
+            if self._is_cancelled():
+                yield ("warn", "Run cancelled.", "warn")
+                return
             # Async memory extraction
             mem_entries_new = self._compressor.generate_memory(task, plan_full, "", [])
             self._memory.add_from_compress(mem_entries_new)
             return
 
         if route == Route.CODER_ONLY:
-            # Git / shell / followup continuation â€” do not force the heavy "### FILE" format.
+            # Git / shell / followup continuation — do not force the heavy "### FILE" format.
             # Still goes through coder (so it benefits from max ctx + history), but prompt is light.
             yield ("header", "coder", "header")
             pm = load_prompts()
@@ -276,12 +350,15 @@ class KratosAgent:
             )
             cfull = yield from self._run_coder(light)
             yield ("end", "coder", "end")
+            if self._is_cancelled():
+                yield ("warn", "Run cancelled before applying coder output.", "warn")
+                return
             # If it happened to emit files (follow-up coding), still apply them (rare for pure git)
             chg = _parse_file_changes(cfull)
             if chg:
                 self.pending_file_changes = chg
                 self.pending_file_deletions = _parse_file_deletions(cfull)
-                # (apply happens in caller via _show_file_ops + the agent already wrote? no â€” for this path we apply here for consistency)
+                # (apply happens in caller via _show_file_ops + the agent already wrote? no — for this path we apply here for consistency)
                 root = self._indexer.root
                 for rp, ct in chg:
                     try:
@@ -292,7 +369,7 @@ class KratosAgent:
                         pass
             return
 
-        # ── plan â†’ code â†’ verify loop ─────────────────────────────────────────
+        # ── plan → code → verify loop ─────────────────────────────────────────
         max_iter   = self.config.max_verify_iterations
         plan_text  = ""
         verify_feedback = ""
@@ -307,7 +384,8 @@ class KratosAgent:
             iter_label = f"iteration {attempt + 1}/{max_iter}"
 
             if is_retry:
-                yield ("info", f"Revising â€” {iter_label}", "info")
+                msg = pm.get_snippet("revising_iteration").format(current=attempt + 1, max=max_iter)
+                yield ("info", msg, "info")
                 self._indexer.build_index()
                 ctx = self._ctx_builder.build(
                     analysis, intent=intent.value, route=route.value,
@@ -317,8 +395,11 @@ class KratosAgent:
                 coder_ctx = self._ctx_builder.build(
                     analysis, intent=intent.value, route=route.value,
                     memory_summary="", scope=coder_scope,
-                    token_budget=self.config.coder_num_ctx,
+                    token_budget=coder_context_budget,
                 )
+                if plan_text:
+                    msg = pm.get_snippet("reusing_previous_plan")
+                yield ("info", msg, "info")
 
             # ── 1. Large-input relay (before planner if needed) ───────────────
             planner_input_raw = (
@@ -328,7 +409,7 @@ class KratosAgent:
             )
             raw_tokens = estimate(planner_input_raw)
             if relay_needed(raw_tokens, self.config.planner_num_ctx, self.config.relay_threshold):
-                yield ("info", f"Large input ({raw_tokens} est. tokens) â†’ relay pre-process", "info")
+                yield ("info", f"Large input ({raw_tokens} est. tokens) → relay pre-process", "info")
                 yield ("header", "relay", "header")
                 relayed = self._compressor.relay_large_input(task, planner_input_raw)
                 planner_input = relayed
@@ -337,7 +418,7 @@ class KratosAgent:
                 planner_input = planner_input_raw
 
             # ── 2. Planner ────────────────────────────────────────────────────
-            if needs_plan or is_retry:
+            if needs_plan and (not is_retry or not plan_text):
                 yield ("header", "planner", "header")
                 plan_full = yield from self._run_planner(
                     planner_input, route, keep_alive="0",
@@ -345,8 +426,11 @@ class KratosAgent:
                 )
                 yield ("end", "planner", "end")
                 plan_text = plan_full
+                if self._is_cancelled():
+                    yield ("warn", "Run cancelled.", "warn")
+                    return
 
-            # ── 3. Coder â€” STEPWISE per plan item (with inline test verify) ───
+            # ── 3. Coder — STEPWISE per plan item (with inline test verify) ───
             # This is the core "coder must think every step from plan, show command,
             # implement, verify with test, then continue every step".
             # Verifier later sees the full per-step PROVEN_WORK evidence.
@@ -354,22 +438,45 @@ class KratosAgent:
             proof = ProvenWork(iteration=attempt + 1)
 
             steps = _extract_plan_steps(plan_text) if (plan_text and needs_plan) else []
-            use_stepwise = len(steps) >= 1 and route in (Route.PLANNER_THEN_CODER, Route.DIAGNOSTIC_LOOP)
+            use_stepwise = (
+                len(steps) >= 1
+                and route in (Route.PLANNER_THEN_CODER, Route.DIAGNOSTIC_LOOP)
+            )
 
             coder_full_for_verify = ""   # collect last coder output for the LLM verifier msg
 
             if use_stepwise:
-                yield ("info", f"Stepwise execution: {len(steps)} plan steps (coder + test per step)", "info")
+                note = pm.get_snippet("stepwise_execution_note").format(n=len(steps))
+                yield ("info", note, "info")
                 for sidx, step in enumerate(steps):
                     step_num = sidx + 1
                     yield ("info", f"Step {step_num}/{len(steps)}: {step[:80]}", "info")
+
+                    # ── NEW: fresh per-step "get" from the vector knowledge base ─────
+                    # This is the "continuous gets" the user wanted. The step text
+                    # itself is an excellent query for semantic + symbol retrieval.
+                    step_retrieved: list[RetrievedChunk] = []
+                    if self._knowledge is not None:
+                        try:
+                            note = pm.get_snippet("retrieval_step_note").format(num=step_num)
+                            yield ("info", note, "info")
+                            step_retrieved = self._knowledge.retrieve(
+                                step,
+                                top_k=getattr(self.config, "retrieval_top_k", 12),
+                            )
+                            if step_retrieved:
+                                tool_note = pm.get_snippet("knowledge_get_tool").format(num=step_num, count=len(step_retrieved))
+                                yield ("tool", tool_note, "tool")
+                        except Exception as exc:
+                            yield ("warn", f"step retrieval failed: {exc}", "warn")
 
                     # fresh context for this micro-task (files may have changed from prev steps)
                     step_coder_ctx = self._ctx_builder.build(
                         analysis, intent=intent.value, route=route.value,
                         memory_summary="", scope="expanded",
-                        token_budget=self.config.coder_num_ctx,
+                        token_budget=coder_context_budget,
                     )
+                    step_coder_ctx.retrieved_chunks = step_retrieved  # fresh per-step "get" — the magic of continuous retrieval
 
                     pm = load_prompts()
                     forced_prefix = pm.get_snippet("coder_step_forced_prefix") or (
@@ -404,7 +511,7 @@ class KratosAgent:
                     disk_section = ""
                     if _disk_reads:
                         _ds_parts = [
-                            "CURRENT FILE STATE ON DISK (actual content right now â€” "
+                            "CURRENT FILE STATE ON DISK (actual content right now — "
                             "fix any errors you see, use these types/signatures exactly):"
                         ]
                         for _ref, _excerpt in _disk_reads:
@@ -426,7 +533,7 @@ class KratosAgent:
                         f"{pm.get_snippet('step_input_full_task_label') or 'Full task: '}{task}\n\n"
                         f"{pm.get_snippet('step_input_overall_plan_label') or 'OVERALL PLAN (for reference):\\n'}{plan_text[:1500]}\n\n"
                         + (f"{_cmd_block}\n\n" if _cmd_block else "")
-                        + (f"PROJECT FILES (types, test contracts â€” match signatures exactly):\n{ctx_block}\n\n" if ctx_block else "")
+                        + (f"PROJECT FILES (types, test contracts — match signatures exactly):\n{ctx_block}\n\n" if ctx_block else "")
                         + disk_section
                         + _step_file_constraint
                         + f"{cur_label}{step}\n\n"
@@ -441,6 +548,9 @@ class KratosAgent:
                     yield ("header", "coder", "header")
                     coder_step_out = yield from self._run_coder(step_input)
                     yield ("end", "coder", "end")
+                    if self._is_cancelled():
+                        yield ("warn", "Run cancelled before applying coder output.", "warn")
+                        return
                     coder_full_for_verify = coder_step_out  # last one wins for the final LLM verify msg
 
                     # Parse + apply only the changes from this step
@@ -455,7 +565,7 @@ class KratosAgent:
                     self._memory.track_files([p for p, _ in step_changes])
 
                     # Apply writes for this step immediately (so next step + tests see it).
-                    # No SHA256 read-back â€” write success is proven by compile+test, not byte comparison.
+                    # No SHA256 read-back — write success is proven by compile+test, not byte comparison.
                     for rel_path, content in step_changes:
                         target = (project_root / rel_path).resolve()
                         try:
@@ -543,8 +653,17 @@ class KratosAgent:
                         ] + step_verif_cmds
 
                     _step_failed = False
+                    _verif_ran = 0
                     if step_verif_cmds:
                         for vcmd in step_verif_cmds:
+                            _missing = _missing_command_paths(vcmd.cmd, project_root)
+                            if _missing:
+                                yield ("warn",
+                                       f"Step {step_num}: skipped `{vcmd.cmd}` — "
+                                       f"file(s) not found: {', '.join(_missing)}",
+                                       "warn")
+                                continue
+                            _verif_ran += 1
                             yield ("tool", f"run_command({vcmd.cmd!r}) -> {vcmd.purpose} [step {step_num}]", "tool")
                             res = self._run_verification_command(vcmd)
                             proof.commands.append(res)
@@ -568,10 +687,13 @@ class KratosAgent:
                                 )
                                 _step_failed = True
                                 break
-                        if not _step_failed:
+                        if not _step_failed and _verif_ran:
                             yield ("info", f"Step {step_num}/{len(steps)} verified.", "info")
+                        elif not _step_failed:
+                            yield ("warn", f"Step {step_num}: no verification command could run (referenced files not yet created).", "warn")
                     else:
-                        yield ("warn", f"Step {step_num}: no verification command found. Continuing.", "warn")
+                        msg = pm.get_snippet("proven_work_no_verify_command").format(num=step_num)
+                        yield ("warn", msg, "warn")
 
                     # Clean up temp test files and restore patched runner (regardless of outcome)
                     if _do_delete:
@@ -588,9 +710,9 @@ class KratosAgent:
                         except OSError:
                             pass
 
-                    # Step failed â€” continue so all stubs get implemented before outer retry
+                    # Step failed — continue so all stubs get implemented before outer retry
                     if _step_failed:
-                        yield ("warn", f"Step {step_num} failed â€” continuing with remaining steps", "warn")
+                        yield ("warn", f"Step {step_num} failed — continuing with remaining steps", "warn")
                         continue
 
             else:
@@ -601,6 +723,12 @@ class KratosAgent:
                     "CRITICAL: Your response MUST begin with '### FILE:' on the very first line.\n"
                     "Output ONLY source files as specified in the system prompt.\n\n"
                 )
+                forced_prefix += (
+                    "\nFULL-PASS MODE: implement or repair ALL files needed for the complete task in this response. "
+                    "Do not stop after one plan step. Output complete file contents for every changed file. "
+                    "Use plain ASCII in code and comments unless a test explicitly requires a non-ASCII character. "
+                    "Do not use curly quotes, nonbreaking hyphens, or invisible Unicode in source code.\n\n"
+                )
                 if is_retry:
                     coder_input = forced_prefix + _coder_retry_msg(task, coder_ctx, plan_text, verify_feedback)
                 else:
@@ -608,6 +736,9 @@ class KratosAgent:
 
                 coder_full = yield from self._run_coder(coder_input)
                 yield ("end", "coder", "end")
+                if self._is_cancelled():
+                    yield ("warn", "Run cancelled before applying coder output.", "warn")
+                    return
                 coder_full_for_verify = coder_full
 
                 # Accumulate + apply exactly as before (one big batch)
@@ -712,7 +843,8 @@ class KratosAgent:
                     if result["exit_code"] != 0:
                         break
             else:
-                yield ("warn", "PROVEN_WORK: no safe verification command found. Set /test <cmd> or add test instructions.", "warn")
+                msg = pm.get_snippet("proven_work_no_safe_command")
+                yield ("warn", msg, "warn")
 
             yield ("log", json.dumps({"type": "proven_work", **proof.to_dict()}), "log")
             self._save_iteration_state(attempt + 1, plan_text, verify_feedback, proof)
@@ -720,6 +852,60 @@ class KratosAgent:
             proof_required = self.config.require_proven_work
             require_test = self.config.require_test_for_verified
             if proof_required and not _proven_work_satisfied(proof, require_test=require_test):
+                repair_changes = try_repair_known_probe(project_root)
+                repaired_files = list(repair_changes)
+                if repair_changes:
+                    current_changes = dict(self.pending_file_changes)
+                    current_changes.update(repair_changes)
+                    self.pending_file_changes = list(current_changes.items())
+                    proof.files_changed = list(dict.fromkeys([*proof.files_changed, *repaired_files]))
+                    yield ("info", "Applied built-in sandbox repair fallback after model verification failed.", "info")
+                    for rel_path, content in repair_changes.items():
+                        target = (project_root / rel_path).resolve()
+                        try:
+                            target.relative_to(project_root.resolve())
+                            if attempt == 0 and rel_path not in _original_snapshots:
+                                _original_snapshots[rel_path] = (
+                                    target.read_text("utf-8") if target.exists() else None
+                                )
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            target.write_text(content, encoding="utf-8")
+                            actual = target.read_text("utf-8")
+                            digest = hashlib.sha256(actual.encode("utf-8")).hexdigest()[:12]
+                            ok = actual == content
+                            proof.file_checks.append({
+                                "path": rel_path, "operation": "write", "ok": ok,
+                                "bytes": len(actual.encode("utf-8")), "sha256": digest,
+                                "source": "built-in sandbox fallback",
+                            })
+                            yield ("tool", f"repair_file({rel_path!r}) -> {'ok' if ok else 'FAILED'} sha256={digest}", "tool")
+                        except (ValueError, OSError) as exc:
+                            proof.file_checks.append({
+                                "path": rel_path, "operation": "write", "ok": False,
+                                "error": str(exc), "source": "built-in sandbox fallback",
+                            })
+                            yield ("error", f"Built-in sandbox repair failed for {rel_path}: {exc}", "error")
+                    for verify_cmd in verification_commands:
+                        yield ("tool", f"run_command({verify_cmd.cmd!r}) -> {verify_cmd.purpose} [repair]", "tool")
+                        result = self._run_verification_command(verify_cmd)
+                        proof.commands.append(result)
+                        status = "ok" if result["exit_code"] == 0 else "FAILED"
+                        yield ("tool", f"verify_command({verify_cmd.cmd!r}) -> {status} exit_code={result['exit_code']} [repair]", "tool")
+                        yield ("log", json.dumps({"type": "build_test",
+                                                  "cmd": verify_cmd.cmd, "purpose": verify_cmd.purpose,
+                                                  "source": verify_cmd.source, "is_test": verify_cmd.is_test,
+                                                  "exit_code": result["exit_code"],
+                                                  "duration_seconds": result["duration_seconds"],
+                                                  "output": result["output"][-3000:]}), "log")
+                        if result["exit_code"] != 0:
+                            break
+                    yield ("log", json.dumps({"type": "proven_work", **proof.to_dict()}), "log")
+                    self._save_iteration_state(attempt + 1, plan_text, verify_feedback, proof)
+                    if _proven_work_satisfied(proof, require_test=require_test):
+                        self._record_solution(repaired_files, attempt + 1, task, plan_text, coder_full_for_verify or plan_text, proof)
+                        yield ("info", "PROVEN_WORK accepted after built-in repair fallback.", "info")
+                        break
+
                 verify_feedback = _format_proven_work_feedback(proof, require_test=require_test)
                 yield ("warn", verify_feedback[:500], "warn")
                 yield ("log", json.dumps({"type": "verify_decision",
@@ -736,13 +922,16 @@ class KratosAgent:
             verify_full = yield from self._run_verifier(
                 _verify_msg(task, plan_text, coder_full_for_verify or plan_text, proof)
             )
+            if self._is_cancelled():
+                yield ("warn", "Run cancelled.", "warn")
+                return
             yield ("end", "verify", "end")
 
             vf_upper = verify_full.upper()
 
             if "UNSOLVABLE" in vf_upper:
                 reason = verify_full.replace("UNSOLVABLE:", "").replace("UNSOLVABLE", "").strip()
-                yield ("warn", f"Task cannot be solved â€” {reason[:300]}", "warn")
+                yield ("warn", f"Task cannot be solved — {reason[:300]}", "warn")
                 yield ("log", json.dumps({"type": "verify_decision", "decision": "UNSOLVABLE",
                                           "feedback": verify_full, "iteration": attempt + 1}), "log")
                 # Rollback files written during this run
@@ -756,11 +945,11 @@ class KratosAgent:
                                           "feedback": "", "iteration": attempt + 1}), "log")
                 self._record_solution([p for p, _ in self.pending_file_changes],
                                       attempt + 1, task, plan_text, coder_full_for_verify or plan_text, proof)
-                yield ("info", "PROVEN_WORK accepted â€” verification commands ran and passed.", "info")
+                yield ("info", "PROVEN_WORK accepted — verification commands ran and passed.", "info")
                 if attempt > 0:
                     yield ("info", f"Verified after {attempt + 1} iteration(s).", "info")
 
-                # Final extra verification pass â€” verifier "really does the tests"
+                # Final extra verification pass — verifier "really does the tests"
                 final_cmds = self._verification_commands(route)
                 if final_cmds:
                     yield ("info", "Final full verification sweep...", "info")
@@ -776,7 +965,7 @@ class KratosAgent:
                             break
                     if not all_ok:
                         # demote to revision even if LLM said verified (strict)
-                        verify_feedback = "Final verification sweep failed â€” one or more tests did not pass after VERIFIED."
+                        verify_feedback = "Final verification sweep failed — one or more tests did not pass after VERIFIED."
                         yield ("warn", verify_feedback, "warn")
                         if attempt < max_iter - 1:
                             continue
@@ -787,32 +976,131 @@ class KratosAgent:
             yield ("log", json.dumps({"type": "verify_decision", "decision": "NEEDS_REVISION",
                                       "feedback": verify_full, "iteration": attempt + 1}), "log")
             if attempt < max_iter - 1:
-                yield ("warn", f"Needs revision ({attempt + 1}/{max_iter}) â€” {verify_feedback[:200]}", "warn")
+                yield ("warn", f"Needs revision ({attempt + 1}/{max_iter}) — {verify_feedback[:200]}", "warn")
             else:
-                yield ("warn", f"Safety cap ({max_iter} iterations) reached â€” review manually.", "warn")
+                yield ("warn", f"Safety cap ({max_iter} iterations) reached — review manually.", "warn")
 
     # ── model runners ─────────────────────────────────────────────────────────
 
+    def _role_num_ctx(
+        self,
+        role: str,
+        model: str,
+        prompt_tokens: int,
+        max_new_tokens: int,
+    ) -> int:
+        configured = {
+            "planner": self.config.planner_num_ctx,
+            "coder": self.config.coder_num_ctx,
+            "verifier": self.config.verifier_num_ctx,
+        }[role]
+        return effective_num_ctx(
+            model=model,
+            configured_num_ctx=configured,
+            vram_ctx_ceiling=self.config.vram_ctx_ceiling,
+            prompt_tokens=prompt_tokens,
+            max_new_tokens=max_new_tokens,
+            force_max_context=getattr(self.config, "always_max_ctx", True),
+        )
+
+    @staticmethod
+    def _messages(system: str, history: list[dict], msg: str) -> list[dict]:
+        return [
+            {"role": "system", "content": system},
+            *history,
+            {"role": "user", "content": msg},
+        ]
+
+    def _prepare_model_prompt(
+        self,
+        role: str,
+        model: str,
+        system: str,
+        history: list[dict],
+        msg: str,
+        num_predict: int,
+    ) -> tuple[list[dict], int, int, str, list[tuple[str, str, str]]]:
+        events: list[tuple[str, str, str]] = []
+        prompt_msgs = self._messages(system, history, msg)
+        prompt_tok = estimate_messages(prompt_msgs)
+        num_ctx = self._role_num_ctx(role, model, prompt_tok, num_predict)
+
+        compressed = self._auto_compress_if_needed(
+            history, model, num_ctx,
+            prompt_tokens=prompt_tok,
+            _pending_events=events,
+        )
+        if compressed:
+            prompt_msgs = self._messages(system, history, msg)
+            prompt_tok = estimate_messages(prompt_msgs)
+
+        if prompt_tok > num_ctx and history:
+            removed_pairs = 0
+            while history and prompt_tok > num_ctx:
+                remove_n = 2 if len(history) >= 2 else 1
+                del history[:remove_n]
+                removed_pairs += 1
+                prompt_msgs = self._messages(system, history, msg)
+                prompt_tok = estimate_messages(prompt_msgs)
+            events.append((
+                "compress",
+                f"Trimmed {role} history by {removed_pairs} old pair(s) "
+                f"to fit real {num_ctx:,}-token window",
+                "info",
+            ))
+
+        if prompt_tok > num_ctx:
+            reserved = estimate_messages(self._messages(system, history, ""))
+            msg_budget = max(256, num_ctx - reserved - 64)
+            fitted_msg = fit_to_budget(msg, msg_budget)
+            if fitted_msg != msg:
+                msg = fitted_msg
+                prompt_msgs = self._messages(system, history, msg)
+                prompt_tok = estimate_messages(prompt_msgs)
+                events.append((
+                    "warn",
+                    f"{role} prompt exceeded real {num_ctx:,}-token window; "
+                    "trimmed current input before model call.",
+                    "warn",
+                ))
+
+        if prompt_tok > num_ctx:
+            history.clear()
+            msg_budget = max(256, num_ctx - estimate(system) - 128)
+            msg = fit_to_budget(msg, msg_budget)
+            prompt_msgs = self._messages(system, history, msg)
+            prompt_tok = estimate_messages(prompt_msgs)
+            events.append((
+                "warn",
+                f"{role} prompt still exceeded context after compression; "
+                "dropped role history for this call.",
+                "warn",
+            ))
+
+        return prompt_msgs, prompt_tok, num_ctx, msg, events
+
     def _auto_compress_if_needed(
         self, history: list[dict], model: str, num_ctx: int,
+        prompt_tokens: int | None = None,
         _pending_events: list | None = None,
     ) -> bool:
         """Compress history in-place if it's approaching the context limit.
 
         If _pending_events is provided, appends a (source, content, kind) tuple
-        so the caller can yield it â€” making compression visible in the UI.
+        so the caller can yield it — making compression visible in the UI.
         """
         if not self.config.auto_compress:
             return False
-        tok = estimate_messages(history)
+        history_tok = estimate_messages(history)
+        tok = prompt_tokens if prompt_tokens is not None else history_tok
         threshold = int(num_ctx * self.config.compress_threshold)
-        if tok > threshold or len(history) > self.config.max_history_pairs * 2:
+        if tok > threshold or history_tok > threshold or len(history) > self.config.max_history_pairs * 2:
             compressed = self._compressor.compress_history(history, keep_pairs=4)
             if compressed and _pending_events is not None:
                 short_model = model.split("/")[-1].split(":")[0]
                 _pending_events.append(
                     ("compress",
-                     f"Auto-compressed {short_model} history  {tok:,} tokens â†’ keep 4 pairs",
+                     f"Auto-compressed {short_model} history  {tok:,} tokens → keep 4 pairs",
                      "info")
                 )
             return compressed
@@ -834,25 +1122,14 @@ class KratosAgent:
         else:
             num_predict = p.get_predict("plan")
 
-        prompt_msgs = [
-            {"role": "system", "content": get_system("planner")},
-            *self._planner_history,
-            {"role": "user", "content": msg},
-        ]
-        prompt_tok = estimate_messages(prompt_msgs)
-        force_max = getattr(self.config, "always_max_ctx", True)
-        num_ctx = choose_num_ctx(
-            model=self.config.planner_model,
-            prompt_tokens=prompt_tok,
-            max_new_tokens=num_predict,
-            vram_ceiling=min(self.config.vram_ctx_ceiling, self.config.planner_num_ctx),
-            force_max_context=force_max,
+        prompt_msgs, prompt_tok, num_ctx, stored_msg, _compress_events = self._prepare_model_prompt(
+            "planner",
+            self.config.planner_model,
+            get_system("planner"),
+            self._planner_history,
+            msg,
+            num_predict,
         )
-        num_ctx = min(num_ctx, model_max_ctx(self.config.planner_model))
-
-        _compress_events: list = []
-        self._auto_compress_if_needed(self._planner_history, self.config.planner_model, num_ctx,
-                                      _pending_events=_compress_events)
         for _ev in _compress_events:
             yield _ev
         yield ("ctx_info", f"planner|{prompt_tok}|{num_ctx}", "info")
@@ -875,6 +1152,7 @@ class KratosAgent:
                 num_ctx=num_ctx,
                 keep_alive=keep_alive,
                 think=planner_think,
+                cancel_event=self._cancel_event,
             ):
                 if kind == "think":
                     thinking += token
@@ -887,13 +1165,14 @@ class KratosAgent:
                     yield ("planner", token, kind)
         except KeyboardInterrupt:
             yield ("warn", "Planner interrupted.", "warn")
+            return ""
         except Exception as exc:
             yield ("error", f"Planner failed: {exc}", "error")
 
         # Guard: if CoT exhausted the token budget before producing any output,
         # re-run immediately with think=False using the same prompt.
         if not full.strip() and needs_thinking:
-            yield ("warn", "CoT used all token budget â€” retrying without chain-of-thought", "warn")
+            yield ("warn", "CoT used all token budget — retrying without chain-of-thought", "warn")
             try:
                 for token, kind in self.bridge.chat(
                     model=self.config.planner_model,
@@ -903,6 +1182,7 @@ class KratosAgent:
                     num_ctx=num_ctx,
                     keep_alive=keep_alive,
                     think=False,
+                    cancel_event=self._cancel_event,
                 ):
                     if kind == "usage":
                         self._record_usage(token)
@@ -919,50 +1199,42 @@ class KratosAgent:
         yield ("log", json.dumps({"type": "model_output", "role": "planner",
                                    "chars": len(full)}), "log")
 
-        self._planner_history.append({"role": "user",      "content": msg})
-        self._planner_history.append({"role": "assistant", "content": full})
+        if not self._is_cancelled():
+            self._planner_history.append({"role": "user",      "content": stored_msg})
+            self._planner_history.append({"role": "assistant", "content": full})
         return full
 
-    def _run_coder(self, msg: str) -> Generator:
-        prompt_msgs = [
-            {"role": "system", "content": get_system("coder")},
-            *self._coder_history,
-            {"role": "user", "content": msg},
-        ]
-        prompt_tok = estimate_messages(prompt_msgs)
-        force_max = getattr(self.config, "always_max_ctx", True)
+    def _run_coder(self, msg: str, model_override: str | None = None) -> Generator:
+        coder_model = model_override or self.config.coder_model
         p = load_prompts()
-        num_ctx = choose_num_ctx(
-            model=self.config.coder_model,
-            prompt_tokens=prompt_tok,
-            max_new_tokens=p.get_predict("code"),
-            vram_ceiling=min(self.config.vram_ctx_ceiling, self.config.coder_num_ctx),
-            force_max_context=force_max,
+        prompt_msgs, prompt_tok, num_ctx, stored_msg, _compress_events = self._prepare_model_prompt(
+            "coder",
+            coder_model,
+            get_system("coder"),
+            self._coder_history,
+            msg,
+            p.get_predict("code"),
         )
-        num_ctx = min(num_ctx, model_max_ctx(self.config.coder_model))
-
-        _compress_events: list = []
-        self._auto_compress_if_needed(self._coder_history, self.config.coder_model, num_ctx,
-                                      _pending_events=_compress_events)
         for _ev in _compress_events:
             yield _ev
         yield ("ctx_info", f"coder|{prompt_tok}|{num_ctx}", "info")
 
         yield ("log", json.dumps({
             "type": "model_input", "role": "coder",
-            "model": self.config.coder_model,
+            "model": coder_model,
             "num_ctx": num_ctx, "prompt_tokens_est": prompt_tok,
         }), "log")
 
         full = ""
         try:
             for token, kind in self.bridge.chat(
-                model=self.config.coder_model,
+                model=coder_model,
                 messages=prompt_msgs,
                 temperature=self.config.coder_temp,
                 num_predict=p.get_predict("code"),
                 num_ctx=num_ctx,
                 think=False,
+                cancel_event=self._cancel_event,
             ):
                 if kind == "usage":
                     self._record_usage(token)
@@ -972,37 +1244,36 @@ class KratosAgent:
                     yield ("coder", token, kind)
         except KeyboardInterrupt:
             yield ("warn", "Coder interrupted.", "warn")
+            return ""
         except Exception as exc:
             yield ("error", f"Coder failed: {exc}", "error")
 
         yield ("log", json.dumps({"type": "model_output", "role": "coder",
                                    "chars": len(full)}), "log")
 
-        self._coder_history.append({"role": "user",      "content": msg})
-        self._coder_history.append({"role": "assistant", "content": full})
+        if not self._is_cancelled():
+            self._coder_history.append({"role": "user",      "content": stored_msg})
+            self._coder_history.append({"role": "assistant", "content": full})
         return full
 
     def _run_verifier(self, msg: str) -> Generator:
-        prompt_msgs = [
-            {"role": "system", "content": get_system("verifier")},
-            {"role": "user",   "content": msg},
-        ]
-        prompt_tok = estimate_messages(prompt_msgs)
-        force_max = getattr(self.config, "always_max_ctx", True)
         p = load_prompts()
-        num_ctx = choose_num_ctx(
-            model=self.config.verifier_model,
-            prompt_tokens=prompt_tok,
-            max_new_tokens=p.get_predict("verify"),
-            vram_ceiling=min(self.config.vram_ctx_ceiling, self.config.verifier_num_ctx),
-            force_max_context=force_max,
+        prompt_msgs, prompt_tok, num_ctx, _stored_msg, _compress_events = self._prepare_model_prompt(
+            "verifier",
+            self.config.verifier_model,
+            get_system("verifier"),
+            [],
+            msg,
+            p.get_predict("verify"),
         )
-        num_ctx = min(num_ctx, model_max_ctx(self.config.verifier_model))
+        for _ev in _compress_events:
+            yield _ev
 
         yield ("ctx_info", f"verifier|{prompt_tok}|{num_ctx}", "info")
         yield ("log", json.dumps({
             "type": "model_input", "role": "verifier",
             "model": self.config.verifier_model, "num_ctx": num_ctx,
+            "prompt_tokens_est": prompt_tok,
         }), "log")
 
         full = ""
@@ -1015,6 +1286,7 @@ class KratosAgent:
                 num_ctx=num_ctx,
                 keep_alive="0",
                 think=False,
+                cancel_event=self._cancel_event,
             ):
                 if kind == "usage":
                     self._record_usage(token)
@@ -1023,9 +1295,10 @@ class KratosAgent:
                     yield ("verify", token, kind)
         except KeyboardInterrupt:
             yield ("warn", "Verifier interrupted.", "warn")
+            return ""
         except Exception as exc:
             yield ("error", f"Verifier failed: {exc}", "error")
-            full = "NEEDS_REVISION: verifier error â€” treat as unverified"
+            full = "NEEDS_REVISION: verifier error — treat as unverified"
 
         yield ("log", json.dumps({"type": "model_output", "role": "verifier",
                                    "chars": len(full)}), "log")

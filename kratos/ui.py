@@ -26,7 +26,7 @@ from rich.table import Table
 from rich.text import Text
 from rich import box
 
-from .tokens import model_max_ctx
+from .tokens import model_max_ctx, role_context_windows
 
 
 def _make_console() -> Console:
@@ -43,9 +43,27 @@ def _make_console() -> Console:
                 k32.SetConsoleMode(h, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
         except Exception:
             pass
-        # 2. Wrap stdout in a UTF-8 TextIOWrapper so Python encodes in UTF-8,
-        #    not the legacy cp1252 codec.
+        # 2. Force UTF-8 encoding on stdout so Python encodes in UTF-8, not the
+        #    legacy cp1252 codec — *in place* via reconfigure() rather than
+        #    wrapping it in a fresh TextIOWrapper. A fresh wrapper would be
+        #    captured once as Console(file=...) and rich would then write to
+        #    that pinned object forever — bypassing any later `sys.stdout`
+        #    swap (e.g. prompt_toolkit's `patch_stdout()`, used to coexist
+        #    with the persistent live-status bar; see _LiveStatus in kratos.py).
+        #    Passing file=None makes rich re-resolve `sys.stdout` on every
+        #    write, so it automatically routes through such a swap.
         try:
+            if hasattr(sys.stdout, "reconfigure"):
+                sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+                sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+                return Console(
+                    file=None,
+                    force_terminal=True,
+                    legacy_windows=False,
+                    highlight=False,
+                )
+            # Fallback for stdout objects without reconfigure() (e.g. redirected
+            # / piped output) — pin a UTF-8 wrapper as before.
             utf8_out = io.TextIOWrapper(
                 sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True
             )
@@ -169,22 +187,30 @@ def refresh_status(
 
 def planner_header(model: str) -> None:
     console.print()
-    console.print(Rule(f"[{PLANNER_COLOR}]◈  PLANNER  ·  {model}[/{PLANNER_COLOR}]", style="cyan"))
+    pm = load_prompts()
+    text = pm.get_snippet("role_banner_planner").format(model=model) or f"◈  PLANNER  ·  {model}"
+    console.print(Rule(f"[{PLANNER_COLOR}]{text}[/{PLANNER_COLOR}]", style="cyan"))
 
 
 def coder_header(model: str) -> None:
     console.print()
-    console.print(Rule(f"[{CODER_COLOR}]◈  CODER  ·  {model}[/{CODER_COLOR}]", style="green"))
+    pm = load_prompts()
+    text = pm.get_snippet("role_banner_coder").format(model=model) or f"◈  CODER  ·  {model}"
+    console.print(Rule(f"[{CODER_COLOR}]{text}[/{CODER_COLOR}]", style="green"))
 
 
 def verify_header(model: str) -> None:
     console.print()
-    console.print(Rule(f"[bold yellow]◈  VERIFY  ·  {model}[/bold yellow]", style="yellow"))
+    pm = load_prompts()
+    text = pm.get_snippet("role_banner_verify").format(model=model) or f"◈  VERIFY  ·  {model}"
+    console.print(Rule(f"[bold yellow]{text}[/bold yellow]", style="yellow"))
 
 
 def relay_header(model: str) -> None:
     console.print()
-    console.print(Rule(f"[bold magenta]◈  RELAY  ·  {model}[/bold magenta]", style="magenta"))
+    pm = load_prompts()
+    text = pm.get_snippet("role_banner_relay").format(model=model) or f"◈  RELAY  ·  {model}"
+    console.print(Rule(f"[bold magenta]{text}[/bold magenta]", style="magenta"))
 
 
 def section_end() -> None:
@@ -277,31 +303,32 @@ def input_capsule(
 ) -> None:
     """Render a capsule-style info panel directly above the kratos ❯ prompt.
 
-    Displays: session lifetime (m/h) · token usage (xk) · % until auto-compose
+    Always shows: ⏱ (session or last task, grows with m/h) + ∑ tokens + P/C/V ctx + %→compose + project + perm
+    The Uhr moves left (takes more space from left) as duration lengthens because it is placed early.
     """
-    import time as _t
-
     parts: list[str] = []
 
-    # 1. Session lifetime
-    if session_start is not None:
-        age_s = _t.time() - session_start
-        if age_s < 60:
-            life = "<1m"
-        elif age_s < 3600:
-            life = f"{int(age_s // 60)}m"
-        else:
-            h, m = int(age_s // 3600), int((age_s % 3600) // 60)
-            life = f"{h}h {m}m"
-        parts.append(f"[dim]⏱[/dim] [bold white]{life}[/bold white]")
+    # 1. Time (Uhr) first so it expands left as it grows to minutes/hours; always present
+    display_t = last_task_s
+    if display_t is None and session_start is not None:
+        display_t = _time.time() - session_start
+    t_str = elapsed_str(display_t) if display_t and display_t > 0 else "0s"
+    parts.append(f"[dim]⏱[/dim] [cyan]{t_str}[/cyan]")
 
-    # 2. Session token usage
-    tok_str = _tok_short(total_tokens) if total_tokens > 0 else "0"
+    # 2. Session token usage — exact, comma-grouped (live, no 'k' rounding)
+    tok_str = f"{total_tokens:,}" if total_tokens > 0 else "0"
     parts.append(f"[dim]∑[/dim] [cyan]{tok_str}[/cyan]")
 
-    # 3. % until auto-compose
+    # 3. Effective context windows + % until auto-compose (both % and time now always together with others)
     if config is not None:
-        coder_total = getattr(config, "coder_num_ctx", 262144)
+        windows = role_context_windows(config)
+        for role, abbr in (("planner", "P"), ("coder", "C"), ("verifier", "V")):
+            used = 0
+            if ctx_state:
+                used = ctx_state.get(role, (0, windows[role]))[0]
+            parts.append(f"[dim]{abbr}[/dim] [white]{_tok_short(used)}/{_tok_short(windows[role])}[/white]")
+
+        coder_total = windows["coder"]
         threshold = float(getattr(config, "compress_threshold", 0.75))
         coder_used = 0
         if ctx_state:
@@ -320,11 +347,6 @@ def input_capsule(
         pcolor = _PERM_COLORS.get(perm, "green")
         proj = project_name or "·"
         parts.append(f"[dim]{proj}[/dim]  [{pcolor}]{perm}[/]")
-
-    # 5. Last task duration (if any)
-    if last_task_s is not None:
-        t = f"{last_task_s:.0f}s" if last_task_s < 60 else f"{last_task_s / 60:.1f}m"
-        parts.append(f"[dim]last {t}[/dim]")
 
     sep = "   [dim]│[/dim]   "
     capsule_text = sep.join(parts)
@@ -549,13 +571,16 @@ def status_bar(
     goal: str | None = None,
     user_label: str = "",
     hint: str = "",
+    compose_pct: int | None = None,
 ) -> Panel:
     """Build the persistent bottom status bar as a Rich Panel.
 
     Line 1: user message (if any) + hint
-    Line 2: scope, permission, ctx bars, elapsed, project
+    Line 2: scope, permission, ctx bars, elapsed, tokens, %->compose, project
 
     ctx_state is {role: (used_tokens, total_ctx)} per active role.
+    compose_pct, when given, renders the same live "N%->compose" indicator
+    shown in the input frame and TUI footer — kept consistent across all states.
     """
     from rich.markup import escape as _me
 
@@ -602,10 +627,19 @@ def status_bar(
         ts = elapsed_str(elapsed_s)
         parts.append(f"[bold white]⏱{ts}[/]")
 
-    # session tokens
+    # session tokens — exact, comma-grouped (live ticking, no 'k' rounding)
     p_tok, c_tok = session_tokens
-    if p_tok + c_tok > 0:
-        parts.append(f"[dim]∑{_tok_short(p_tok + c_tok)}[/]")
+    total_tok = p_tok + c_tok
+    if total_tok > 0:
+        parts.append(f"[dim]∑{total_tok:,}[/]")
+
+    # %->compose — same live indicator as the input frame and TUI footer
+    if compose_pct is not None:
+        bw = 8
+        filled = min(bw, int(bw * compose_pct / 100))
+        bar = "▓" * filled + "░" * (bw - filled)
+        bc = "red" if compose_pct > 80 else "yellow" if compose_pct > 50 else "dim"
+        parts.append(f"[{bc}]{bar} {compose_pct}%[/][dim]→compose[/]")
 
     # project name
     parts.append(f"[dim italic]{_me(project_name)}[/]")
@@ -637,19 +671,23 @@ def _fmt_time(ts: float | None) -> str:
 
 
 def elapsed_str(seconds: float) -> str:
+    """Compact duration for logs and live stats. Grows left in variable-width bars (s → m → h)."""
     if seconds < 60:
-        return f"{seconds:.0f}s"
+        return f"{int(seconds)}s"
     m = int(seconds // 60)
     s = int(seconds % 60)
-    return f"{m}m{s}s"
+    if m < 60:
+        return f"{m}m {s}s" if s else f"{m}m"
+    h = m // 60
+    mm = m % 60
+    return f"{h}h {mm}m" if mm else f"{h}h"
 
 
 def user_message_panel(text: str) -> Panel:
     """Chat-bubble panel for the user's message."""
     from rich.markup import escape as _escape
     now = _fmt_time(_time.time())
-    display = text if len(text) <= 400 else text[:397] + "…"
-    safe = _escape(display)
+    safe = _escape(text)
     body_lines: list[str] = []
     for line in safe.splitlines():
         body_lines.append(f"  {line}")

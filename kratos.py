@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 try:
     from rich.console import Console
     from rich.markup import escape
+    from rich.live import Live
 except ImportError:
     sys.exit("Install dependencies first:  pip install -r requirements.txt")
 
@@ -50,12 +51,14 @@ from kratos.agent import KratosAgent
 from kratos.commands import handle
 from kratos.logger import SessionLogger
 from kratos.prompts import load_prompts, reload_prompts
+from kratos.tokens import role_context_windows
 from kratos.ui import (
     console,
     print_banner, print_error, print_info, print_warn, print_success,
     print_usage,
     user_message_panel, task_summary_panel,
     section_banner, elapsed_str,
+    status_bar,
 )
 
 _HISTORY_FILE = GLOBAL_DIR / "history.txt"
@@ -124,21 +127,19 @@ else:
     _COMPLETER = None
 
 
-# ── framed bottom prompt panel ────────────────────────────────────────────────
+# ── prompt input + slash-command completion ──────────────────────────────────
 
 if _HAS_PT:
     class _BottomPanel:
         """Non-fullscreen prompt_toolkit Application — framed input + live info bar.
 
-        Terminal layout while waiting for input:
+        Terminal layout while waiting for input (input expands up to 5 lines):
           ╭────────────────────────────────────────────────────────╮
           │  ⏱ 3m  ∑ 8k  ░░░░░░░░ 0%→compose  project  mid       │
           ├────────────────────────────────────────────────────────┤
-          │  kratos ❯ _                                            │
+          │  kratos ❯ line 1                                       │
+          │           line 2  (Alt+Enter to insert newline)        │
           ╰────────────────────────────────────────────────────────╯
-
-        erase_when_done=True erases the frame on Enter so the chat log above
-        grows cleanly and the frame always re-renders at the bottom.
         """
 
         def __init__(
@@ -156,29 +157,24 @@ if _HAS_PT:
                 completer=completer,
                 complete_while_typing=True,
                 auto_suggest=_ASFH(),
+                multiline=True,
             )
 
         def prompt(self) -> str:
             """Block until Enter; return stripped text. Raises KeyboardInterrupt / EOFError."""
-            import sys as _sys
             import shutil
-            # Save cursor position here (right after last output line).
-            # After app.run() we restore to this point and clear to end of screen,
-            # which removes both the blank-line push and the frame without touching
-            # any content above — even if erase_when_done left residue.
-            _sys.stdout.write("\033[s")
-            # Push cursor toward terminal bottom so the frame always anchors there.
-            _rows = shutil.get_terminal_size((80, 24)).lines
-            _sys.stdout.write("\n" * max(0, _rows - 7))
-            _sys.stdout.flush()
             from prompt_toolkit.application import Application as _App
             from prompt_toolkit.layout import Layout as _Lay
-            from prompt_toolkit.layout.containers import HSplit as _HS, Window as _W
+            from prompt_toolkit.layout.containers import (
+                HSplit as _HS, VSplit as _VS, Window as _W,
+                FloatContainer as _FC, Float as _Fl,
+            )
             from prompt_toolkit.layout.controls import (
                 BufferControl as _BC,
                 FormattedTextControl as _FTC,
             )
-            from prompt_toolkit.layout.processors import BeforeInput as _BI
+
+            from prompt_toolkit.layout.menus import CompletionsMenu as _CM
             from prompt_toolkit.key_binding import KeyBindings as _KB
             from prompt_toolkit.key_binding.defaults import load_key_bindings as _lkb
             from prompt_toolkit.key_binding import merge_key_bindings as _mkb
@@ -186,8 +182,96 @@ if _HAS_PT:
 
             buf = self._buf
 
+            _BORDER = "│  "
+            _LABEL  = "kratos ❯ "
+            _PREFIX_LEN = len(_BORDER) + len(_LABEL)
+
             def _cols() -> int:
                 return shutil.get_terminal_size((80, 24)).columns
+
+            def _line_prefix(line_number: int, wrap_count: int) -> list[tuple[str, str]]:
+                """Left border on every visual row — keeps the frame intact when wrapping."""
+                if line_number == 0 and wrap_count == 0:
+                    return [("class:bdr", _BORDER), ("class:prompt", _LABEL)]
+                return [("class:bdr", _BORDER), ("", " " * len(_LABEL))]
+
+            def _content_width() -> int:
+                return max(1, _cols() - _PREFIX_LEN - 1)  # -1 reserves the scrollbar column
+
+            def _wrapped_rows(line: str, width: int) -> int:
+                return max(1, -(-len(line) // width))
+
+            def _total_rows() -> int:
+                w = _content_width()
+                return sum(_wrapped_rows(ln, w) for ln in buf.document.lines)
+
+            def _input_height() -> int:
+                """Visual row count after line-wrapping, capped at 5 (then scrolls)."""
+                return max(1, min(_total_rows(), 5))
+
+            def _cursor_visual_row() -> int:
+                """Visual row of the cursor — used to position the scrollbar thumb."""
+                w = _content_width()
+                doc = buf.document
+                row = 0
+                for i, ln in enumerate(doc.lines):
+                    if i == doc.cursor_position_row:
+                        return row + doc.cursor_position_col // w
+                    row += _wrapped_rows(ln, w)
+                return row
+
+            def _visual_rows_map() -> list[tuple[int, int]]:
+                """(start, end) buffer-offset of each visually-wrapped row, across all lines."""
+                w = _content_width()
+                rows: list[tuple[int, int]] = []
+                offset = 0
+                for ln in buf.document.lines:
+                    n = len(ln)
+                    if n == 0:
+                        rows.append((offset, offset))
+                    else:
+                        i = 0
+                        while i < n:
+                            seg_len = min(w, n - i)
+                            rows.append((offset + i, offset + i + seg_len))
+                            i += seg_len
+                    offset += n + 1  # +1 for the '\n' separator
+                return rows
+
+            def _move_visual_row(delta: int) -> bool:
+                """Move the cursor up/down one *wrapped* row, preserving its column.
+
+                Returns False at the first/last visual row so the caller can fall
+                back to history navigation (matches Buffer.auto_up/auto_down, which
+                only do this correctly for logical — i.e. unwrapped — lines).
+                """
+                rows = _visual_rows_map()
+                pos = buf.cursor_position
+                cur = next(i for i, (s, e) in enumerate(rows) if pos <= e)
+                target = cur + delta
+                if target < 0 or target >= len(rows):
+                    return False
+                col = pos - rows[cur][0]
+                t_start, t_end = rows[target]
+                buf.cursor_position = min(t_start + col, t_end)
+                return True
+
+            def _scrollbar() -> list[tuple[str, str]]:
+                """Right-edge slider — '│' tinted where the thumb covers the visible window."""
+                displayed = _input_height()
+                total = max(displayed, _total_rows())
+                if total <= displayed:
+                    return [("class:bdr", "│\n" * (displayed - 1) + "│")]
+                thumb = max(1, round(displayed * displayed / total))
+                span = displayed - thumb
+                top = int(_cursor_visual_row() / max(1, total - 1) * span + 0.5)
+                parts: list[tuple[str, str]] = []
+                for i in range(displayed):
+                    style = "class:sbar-thumb" if top <= i < top + thumb else "class:bdr"
+                    parts.append((style, "│"))
+                    if i < displayed - 1:
+                        parts.append(("", "\n"))
+                return parts
 
             def _top() -> list[tuple[str, str]]:
                 return [("class:bdr", "╭" + "─" * (_cols() - 2) + "╮")]
@@ -211,6 +295,20 @@ if _HAS_PT:
                 buf.reset(append_to_history=True)
                 event.app.exit(result=text)
 
+            @kb.add("escape", "enter")   # Alt+Enter — insert literal newline
+            def _alt_enter(event) -> None:
+                buf.insert_text("\n")
+
+            @kb.add("up")    # scroll within wrapped text; only switch history at the very top
+            def _up(event) -> None:
+                if not _move_visual_row(-1):
+                    buf.history_backward()
+
+            @kb.add("down")  # scroll within wrapped text; only switch history at the very bottom
+            def _down(event) -> None:
+                if not _move_visual_row(1):
+                    buf.history_forward()
+
             @kb.add("c-c")
             def _cc(event) -> None:
                 buf.reset()
@@ -224,20 +322,33 @@ if _HAS_PT:
                     buf.reset()
 
             layout = _Lay(
-                _HS([
-                    _W(_FTC(_top), height=1, dont_extend_height=True),
-                    _W(_FTC(_info), height=1, dont_extend_height=True),
-                    _W(_FTC(_mid), height=1, dont_extend_height=True),
-                    _W(
-                        _BC(
-                            buffer=buf,
-                            input_processors=[_BI([("class:prompt", "│  kratos ❯ ")])],
+                _FC(
+                    content=_HS([
+                        _W(_FTC(_top), height=1, dont_extend_height=True),
+                        _W(_FTC(_info), height=1, dont_extend_height=True),
+                        _W(_FTC(_mid), height=1, dont_extend_height=True),
+                        _VS(
+                            [
+                                _W(
+                                    _BC(buffer=buf),
+                                    wrap_lines=True,
+                                    get_line_prefix=_line_prefix,
+                                ),
+                                _W(_FTC(_scrollbar), width=1, dont_extend_width=True),
+                            ],
+                            # Grows 1→5 rows with content (incl. line-wrap); right edge becomes
+                            # a slider (tinted '│' segment) once content overflows and scrolls.
+                            height=_input_height,
                         ),
-                        height=1,
-                        dont_extend_height=True,
-                    ),
-                    _W(_FTC(_bot), height=1, dont_extend_height=True),
-                ]),
+                        _W(_FTC(_bot), height=1, dont_extend_height=True),
+                    ]),
+                    floats=[
+                        _Fl(
+                            xcursor=True, ycursor=True,
+                            content=_CM(max_height=8, scroll_offset=2),
+                        ),
+                    ],
+                ),
                 focused_element=buf,
             )
 
@@ -249,7 +360,16 @@ if _HAS_PT:
                 "completion-menu.completion.current":       "bg:#0078d4 #ffffff bold",
                 "completion-menu.meta.completion":          "bg:#1e2a35 #666666",
                 "completion-menu.meta.completion.current":  "bg:#005fa3 #cccccc",
+                "sbar-thumb":                               "ansicyan bold",
             })
+
+            # Save cursor position, then push it to bottom with plain newlines
+            # (plain \n always scrolls; ANSI cursor sequences are unreliable on ConPTY).
+            sys.stdout.write("\033[s")
+            _rows = shutil.get_terminal_size((80, 24)).lines
+            # Reserve 9 lines for the full frame (top+info+mid+up to 5×input+bot).
+            sys.stdout.write("\n" * max(0, (_rows - 9) // 2))
+            sys.stdout.flush()
 
             app = _App(
                 layout=layout,
@@ -260,12 +380,10 @@ if _HAS_PT:
                 mouse_support=False,
             )
             result = app.run()
-            # Restore cursor to the saved position (before blank-line push),
-            # then clear everything from there to end of screen.
-            # This guarantees the frame and padding are fully gone regardless of
-            # whether erase_when_done worked correctly on this terminal.
-            _sys.stdout.write("\033[u\033[0J")
-            _sys.stdout.flush()
+
+            # Restore cursor to pre-push position and clear to end of screen.
+            sys.stdout.write("\033[u\033[0J")
+            sys.stdout.flush()
             return (result or "").strip()
 
 else:
@@ -278,14 +396,7 @@ else:
 
 
 def _ctx_display(config: KratosConfig) -> dict[str, int]:
-    d = {
-        "planner": config.planner_num_ctx,
-        "coder": config.coder_num_ctx,
-        "verifier": config.verifier_num_ctx,
-        "compressor": config.compressor_num_ctx,
-        "relay": config.relay_num_ctx,
-        "vram_cap": config.vram_ctx_ceiling,
-    }
+    d = role_context_windows(config)
     if getattr(config, "always_max_ctx", True):
         d["max_policy"] = 1
     return d
@@ -379,26 +490,121 @@ class _CoderFilter:
 
 # ── agent streaming ───────────────────────────────────────────────────────────
 
+class _LineFilter:
+    """Buffer streamed chunks and emit complete lines only.
+
+    Per-token `console.print(..., end="")` cannot coexist with a pinned
+    bottom region (rich.Live or prompt_toolkit alike — both redraw the live
+    area on every write, and a redraw mid-partial-line mangles the stream
+    and injects stray control characters). Buffering to whole lines — the
+    same approach `_CoderFilter` already uses for coder output — sidesteps
+    that entirely: each `console.print(line, ...)` is a complete, atomic
+    write that Live can safely interleave with its own redraws.
+    """
+
+    def __init__(self, style: str = "") -> None:
+        self._buf = ""
+        self._style = style
+
+    def feed(self, chunk: str, style: str = "") -> None:
+        if style != self._style:
+            self.flush()
+            self._style = style
+        self._buf += chunk
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            console.print(line, style=self._style or None, highlight=False)
+
+    def flush(self) -> None:
+        if self._buf:
+            console.print(self._buf, style=self._style or None, highlight=False)
+            self._buf = ""
+
+
+class _LiveBar:
+    """Renderable wrapper so `rich.Live` re-evaluates the status bar on every
+    refresh tick — the idiomatic way to keep a `Live` display showing
+    *current* values rather than a snapshot taken at construction time.
+    """
+
+    def __init__(self, build: "Callable[[], object]") -> None:
+        self._build = build
+
+    def __rich__(self) -> object:
+        return self._build()
+
+
 def _stream_agent(
     agent: KratosAgent, task: str, logger: "SessionLogger",
     _ctx_state: "dict | None" = None,
 ) -> float:
-    """Run the agent pipeline; stream output inline via console.print.
+    """Run the agent pipeline; stream output inline via console.print,
+    with a `rich.Live` status bar pinned to the bottom for the duration.
 
-    No alternate screen / Live — output prints directly so the chat
-    history accumulates above the prompt frame.  Returns elapsed seconds.
+    Single render system (rich) — `Live(console=console)` installs a render
+    hook so every `console.print(...)` call automatically prints *above* the
+    live area and the bar redraws below; no second UI layer fighting for the
+    terminal (that fight — a background prompt_toolkit app + patch_stdout —
+    is what previously corrupted the stream and froze the stats; see the
+    removed `_LiveStatus`). Returns elapsed seconds.
     """
+    windows = role_context_windows(agent.config)
     ctx_live: dict[str, tuple[int, int]] = {
-        "planner": (0, agent.config.planner_num_ctx),
-        "coder":   (0, agent.config.coder_num_ctx),
-        "verifier": (0, agent.config.verifier_num_ctx),
+        "planner": (0, windows["planner"]),
+        "coder":   (0, windows["coder"]),
+        "verifier": (0, windows["verifier"]),
     }
     current_section = ""
+    last_banner_section = ""
     section_start = time.monotonic()
     task_start = time.monotonic()
     planner_buf = ""
     coder_buf = ""
     coder_filter = _CoderFilter()
+    planner_filter = _LineFilter()
+    verify_filter = _LineFilter()
+    coder_think_filter = _LineFilter(style="dim italic")
+
+    # Running completion-token estimate — Ollama only reports real counts at
+    # the *end* of each model call (the "usage"/"ctx_info" events), so without
+    # this the bar's ∑ and "%→compose" numbers would sit frozen mid-stream.
+    # ~4 chars/token is the standard rough estimate; good enough for a live
+    # indicator that the real end-of-call numbers immediately correct.
+    running_completion = 0
+    session_completion_base = 0
+
+    def _est_tokens(s: str) -> int:
+        return max(1, len(s) // 4)
+
+    _ROLE_BY_SOURCE = {"planner": "planner", "coder": "coder", "verify": "verifier"}
+
+    def _build_bar():
+        role = _ROLE_BY_SOURCE.get(current_section, "")
+        state = dict(ctx_live)
+        if role and running_completion:
+            used, total = state.get(role, (0, 0))
+            state[role] = (used + running_completion, total)
+        usage = agent.session_usage
+        sess_tok = (
+            usage.get("prompt_tokens", 0),
+            usage.get("completion_tokens", 0) + session_completion_base + running_completion,
+        )
+        coder_used, coder_total = state.get("coder", (0, windows["coder"]))
+        threshold = float(getattr(agent.config, "compress_threshold", 0.75))
+        compose_at = max(1, threshold * coder_total)
+        compose_pct = min(100, int(coder_used * 100 / compose_at))
+        return status_bar(
+            scope=agent.config.scope or "project",
+            permission=agent.config.permission,
+            ctx_state=state,
+            elapsed_s=time.monotonic() - task_start,
+            project_name=agent._indexer.root.name,
+            current_section=role,
+            session_tokens=sess_tok,
+            goal=agent.config.goal,
+            hint="Ctrl+C to stop",
+            compose_pct=compose_pct,
+        )
 
     def _smodel(role: str) -> str:
         if role == "planner": return agent.config.planner_model
@@ -415,6 +621,11 @@ def _stream_agent(
         else:
             logger.log_tool(name=c, args={})
 
+    live = Live(
+        _LiveBar(_build_bar), console=console, refresh_per_second=8,
+        transient=True, vertical_overflow="visible",
+    )
+    live.start()
     try:
         for source, content, kind in agent.process(task):
 
@@ -437,27 +648,34 @@ def _stream_agent(
                 _log_tool(content)
 
             elif source == "header":
+                session_completion_base += running_completion
+                running_completion = 0
                 current_section = content
                 section_start = time.monotonic()
-                console.print()
-                console.print(section_banner(content, _smodel(content)))
+                # Dedup across stepwise re-entries too: print the role banner only when
+                # the role changes (e.g. coder -> verify -> coder), not on every step's
+                # repeated "coder" header — the "Step N/M" info line is the per-step marker.
+                if content != last_banner_section:
+                    last_banner_section = content
+                    console.print()
+                    console.print(section_banner(content, _smodel(content)))
 
             elif source == "planner":
-                if kind == "think":
-                    console.print(content, end="", style="dim italic", highlight=False)
-                else:
-                    console.print(content, end="", highlight=False)
+                running_completion += _est_tokens(content)
+                style = "dim italic" if kind == "think" else ""
+                planner_filter.feed(content, style=style)
+                if kind != "think":
                     planner_buf += content
 
             elif source == "verify":
-                if kind == "think":
-                    console.print(content, end="", style="dim italic", highlight=False)
-                else:
-                    console.print(content, end="", highlight=False)
+                running_completion += _est_tokens(content)
+                style = "dim italic" if kind == "think" else ""
+                verify_filter.feed(content, style=style)
 
             elif source == "coder":
+                running_completion += _est_tokens(content)
                 if kind == "think":
-                    console.print(content, end="", style="dim italic", highlight=False)
+                    coder_think_filter.feed(content, style="dim italic")
                 else:
                     coder_buf += content
                     coder_filter.feed(content)
@@ -476,6 +694,13 @@ def _stream_agent(
 
             elif source == "end":
                 sec_elapsed = time.monotonic() - section_start
+                if current_section == "planner":
+                    planner_filter.flush()
+                elif current_section == "verify":
+                    verify_filter.flush()
+                elif current_section == "coder":
+                    coder_filter.flush()
+                    coder_think_filter.flush()
                 console.print()
                 console.print(f"  [dim]⏱ {elapsed_str(sec_elapsed)}[/dim]")
                 console.print()
@@ -483,10 +708,11 @@ def _stream_agent(
                     logger.log_model_output("planner", agent.config.planner_model, planner_buf)
                     planner_buf = ""
                 elif current_section == "coder":
-                    coder_filter.flush()
                     if coder_buf:
                         logger.log_model_output("coder", agent.config.coder_model, coder_buf)
                     coder_buf = ""
+                session_completion_base += running_completion
+                running_completion = 0
                 current_section = ""
                 if _ctx_state is not None:
                     _ctx_state.update(ctx_live)
@@ -524,6 +750,11 @@ def _stream_agent(
     except KeyboardInterrupt:
         console.print()
         console.print("[yellow]⚠[/yellow]  Interrupted.")
+    finally:
+        planner_filter.flush()
+        verify_filter.flush()
+        coder_think_filter.flush()
+        live.stop()
 
     _show_file_ops(agent, logger)
     console.print()
@@ -607,44 +838,41 @@ def main() -> None:
     GLOBAL_DIR.mkdir(parents=True, exist_ok=True)
 
     # Live ctx tracking: updated by _stream_agent as model calls report token counts.
+    _windows = role_context_windows(config)
     _ctx_live: dict[str, tuple[int, int]] = {
-        "planner": (0, config.planner_num_ctx),
-        "coder":   (0, config.coder_num_ctx),
-        "verifier": (0, config.verifier_num_ctx),
+        "planner": (0, _windows["planner"]),
+        "coder":   (0, _windows["coder"]),
+        "verifier": (0, _windows["verifier"]),
     }
     _last_task_s: float | None = None
 
     # ── live info content for the panel frame ─────────────────────────────────
     def _make_toolbar() -> list[tuple[str, str]]:
-        """Builds prompt_toolkit bottom-toolbar: ⏱ lifetime · ∑ tokens · %→compose · project · perm."""
-        import time as _t
+        """Builds prompt_toolkit bottom-toolbar: ⏱ (grows left on m/h) + tokens + ctx + %→compose + project + perm.
+        Both % and the Uhr/time are always shown together with the other live stats.
+        """
         SEP = "   │   "
         out: list[tuple[str, str]] = [("", "  ")]
 
-        # Session lifetime
-        age_s = _t.time() - _session_start
-        if age_s < 60:
-            life = "<1m"
-        elif age_s < 3600:
-            life = f"{int(age_s // 60)}m"
-        else:
-            _h, _m = int(age_s // 3600), int((age_s % 3600) // 60)
-            life = f"{_h}h {_m}m"
-        out += [("", "⏱ "), ("bold", life), ("", SEP)]
+        # Time (Uhr) early in the line: its string growth (s→m→h) makes the clock "move further left"
+        # and pushes the following stats right in a controlled way inside the frame.
+        _time_val = _last_task_s if _last_task_s is not None else (time.time() - _session_start)
+        _t_str = elapsed_str(_time_val) if _time_val and _time_val > 0 else "0s"
+        out += [("", "⏱ "), ("ansiyellow", _t_str), ("", SEP)]
 
-        # Cumulative token usage
+        # Cumulative token usage — prefer Ollama eval counts; fall back to ctx_info sizes
         _tok = agent.session_usage
         _total = _tok.get("prompt_tokens", 0) + _tok.get("completion_tokens", 0)
-        if _total >= 1_000_000:
-            tok_str = f"{_total / 1_000_000:.1f}M"
-        elif _total >= 1000:
-            tok_str = f"{_total // 1000}k"
-        else:
-            tok_str = str(_total)
+        tok_str = "--" if _total == 0 else f"{_total:,}"
         out += [("", "∑ "), ("ansicyan", tok_str), ("", SEP)]
 
-        # % until auto-compose
-        _coder_total = config.coder_num_ctx
+        _windows_now = role_context_windows(config)
+        for _role, _abbr in (("planner", "P"), ("coder", "C"), ("verifier", "V")):
+            _used = _ctx_live.get(_role, (0, _windows_now[_role]))[0]
+            out += [("", f"{_abbr} {_used // 1024}k/{_windows_now[_role] // 1024}k"), ("", SEP)]
+
+        # % until auto-compose (always present together with the time)
+        _coder_total = _windows_now["coder"]
         _threshold = float(getattr(config, "compress_threshold", 0.75))
         _coder_used = _ctx_live.get("coder", (0, _coder_total))[0]
         _compose_at = max(1, _threshold * _coder_total)
@@ -659,11 +887,6 @@ def main() -> None:
         _perm = config.permission
         _pc = {"low": "ansiyellow", "mid": "ansigreen", "high": "ansired"}.get(_perm, "ansigreen")
         out += [("", f"{project_root.name}  "), (f"{_pc} bold", _perm)]
-
-        # Last task duration
-        if _last_task_s is not None:
-            _t_str = f"{_last_task_s:.0f}s" if _last_task_s < 60 else f"{_last_task_s / 60:.1f}m"
-            out += [("", SEP), ("", f"last {_t_str}")]
 
         out.append(("", "  "))
         return out
@@ -708,6 +931,7 @@ def main() -> None:
         # immediate feedback on main screen
         console.print(user_message_panel(line))
         logger.log_input(line)
+
         try:
             _last_task_s = _stream_agent(agent, line, logger, _ctx_state=_ctx_live)
         except Exception as exc:
@@ -719,5 +943,29 @@ if __name__ == "__main__":
     if "--setup" in sys.argv:
         import setup_models as sm
         sm.setup()
+    elif "--tui" in sys.argv:
+        import time as _t
+        from pathlib import Path as _Path
+        from kratos.config import KratosConfig as _KC, _project_dir as _pd
+        from kratos.bridge import OllamaBridge as _OB
+        from kratos.agent import KratosAgent as _KA
+        from kratos.logger import SessionLogger as _SL
+        from kratos.prompts import load_prompts as _lp
+        from kratos.tui import run_tui as _run_tui
+        _cfg    = _KC.load()
+        _scope  = _cfg.scope or "project"
+        _bridge = _OB(_cfg.ollama_host)
+        _prm    = _lp()
+        _agent  = _KA(_cfg, _bridge, prompts=_prm)
+        _logger = _SL(_pd())
+        _run_tui(
+            config=_cfg,
+            bridge=_bridge,
+            agent=_agent,
+            logger=_logger,
+            project_root=_Path.cwd(),
+            session_start=_t.time(),
+            scope=_scope,
+        )
     else:
         main()

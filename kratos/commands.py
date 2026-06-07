@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from .config import KratosConfig, GLOBAL_DIR, _project_dir
+from .tokens import role_context_windows
 from .ui import (
     console,
     print_error, print_info, print_success, print_warn, print_help,
@@ -23,14 +24,7 @@ from .ui import (
 
 
 def _ctx_display(config: KratosConfig) -> dict[str, int]:
-    d = {
-        "planner": config.planner_num_ctx,
-        "coder": config.coder_num_ctx,
-        "verifier": config.verifier_num_ctx,
-        "compressor": config.compressor_num_ctx,
-        "relay": config.relay_num_ctx,
-        "vram_cap": config.vram_ctx_ceiling,
-    }
+    d = role_context_windows(config)
     if getattr(config, "always_max_ctx", True):
         d["max_policy"] = 1  # signal in show
     return d
@@ -193,7 +187,7 @@ def handle(
         print_info("Run: [cyan]python setup_models.py[/cyan]")
         print_info("Or in WSL: [cyan]bash setup_wsl.sh[/cyan]  to install Ollama with CUDA.")
 
-    # ── index ─────────────────────────────────────────────────────────────────
+    # ── index / knowledge (vector DB + continuous "gets") ─────────────────────
     elif cmd == "index":
         if agent is None:
             print_warn("Agent not available.")
@@ -212,6 +206,21 @@ def handle(
             if len(index) > 30:
                 table.add_row(f"… and {len(index) - 30} more", "")
             console.print(table)
+
+    # ── knowledge (the new vector DB / continuous retrieval surface) ──────────
+    elif cmd == "knowledge":
+        if agent is None or agent.knowledge is None:
+            print_warn("Knowledge base not available (no embed model or lancedb?). Falling back to classic index/memory.")
+        elif not args or args[0] in ("status", "info"):
+            st = agent.knowledge.status()
+            print_info(f"Knowledge base: backend={st.get('backend')}  chunks={st.get('chunks')}  embed_model={st.get('embed_model')}")
+            print_info(f"  location: {st.get('kb_dir')}")
+        elif args[0] == "rebuild":
+            force = "force" in " ".join(args[1:]).lower()
+            n = agent.rebuild_knowledge(force=force)
+            print_success(f"Knowledge base rebuilt: {n} chunks (embed model: {getattr(agent.config, 'embed_model', '?')}).")
+        else:
+            print_info("Usage: /knowledge [status|rebuild [force]]")
 
     # ── memory ────────────────────────────────────────────────────────────────
     elif cmd == "memory":
