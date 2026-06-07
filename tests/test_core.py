@@ -15,25 +15,22 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from kratos.tokens import (
+from kratos.llm.tokens import (
     estimate, estimate_messages, fit_to_budget, fit_excerpt,
     choose_num_ctx, relay_needed, model_max_ctx,
     effective_num_ctx, role_context_windows,
 )
-from kratos.agent import (
-    KratosAgent,
+from kratos.core.agent import KratosAgent
+from kratos.verification import (
     ProvenWork,
     _extract_readme_verification_commands,
     _infer_project_verification_commands,
     _is_safe_verification_command,
     _is_test_verification_command,
     _missing_command_paths,
-    _parse_file_changes,
-    _parse_file_deletions,
     _proven_work_satisfied,
     _detect_project_toolchains,
     _command_toolchain,
-    _coder_context_block,
     _compile_check_cmds,
     _extract_step_file_refs,
     _extract_plan_steps,
@@ -41,8 +38,10 @@ from kratos.agent import (
     _patch_dotnet_test_runner,
     CommandRegistry,
 )
+from kratos.execution.parsing import _parse_file_changes, _parse_file_deletions
+from kratos.roles import _coder_context_block
 from kratos.config import KratosConfig
-from kratos.bridge import OllamaBridge
+from kratos.llm.bridge import OllamaBridge
 from kratos.classifier import IntentClassifier, Intent
 from kratos.analyzer import InputAnalyzer
 from kratos.router import Router, Route
@@ -1383,20 +1382,16 @@ class TestPromptManagerNewMethods(unittest.TestCase):
 
 
 class TestKratosCliPromptUi(unittest.TestCase):
-    """Regression tests for the interactive prompt wrapper in kratos.py."""
+    """Regression tests for the interactive prompt wrapper (now kratos/app/*)."""
 
     @classmethod
     def setUpClass(cls):
-        import importlib.util
-        root = Path(__file__).resolve().parents[1]
-        spec = importlib.util.spec_from_file_location("kratos_cli_for_tests", root / "kratos.py")
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        cls.cli = module
+        from kratos.app import cli, prompt_frame
+        cls.cli = cli
+        cls.prompt_frame = prompt_frame
 
     def setUp(self):
-        if not getattr(self.cli, "_HAS_PT", False):
+        if not getattr(self.prompt_frame, "_HAS_PT", False):
             self.skipTest("prompt_toolkit is not installed")
 
     def test_slash_completer_lists_root_commands(self):
@@ -1419,7 +1414,7 @@ class TestKratosCliPromptUi(unittest.TestCase):
 
     def test_tui_slash_completions_root(self):
         """slash_completions() in tui.py covers the same roots as the legacy completer."""
-        from kratos.tui import slash_completions
+        from kratos.app.tui import slash_completions
 
         values = {v for v, _, _ in slash_completions("/")}
         self.assertIn("/help", values)
@@ -1428,14 +1423,14 @@ class TestKratosCliPromptUi(unittest.TestCase):
 
     def test_tui_slash_completions_subcommands(self):
         """slash_completions() returns correct subcommand set for /models c."""
-        from kratos.tui import slash_completions
+        from kratos.app.tui import slash_completions
 
         values = {v for v, _, _ in slash_completions("/models c")}
         self.assertEqual(values, {"coder", "compressor"})
 
     def test_tui_slash_completions_empty_for_non_slash(self):
         """slash_completions() returns nothing for ordinary text."""
-        from kratos.tui import slash_completions
+        from kratos.app.tui import slash_completions
 
         self.assertEqual(slash_completions("hello"), [])
         self.assertEqual(slash_completions(""), [])

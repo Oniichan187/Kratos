@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from .config import KratosConfig, GLOBAL_DIR, _project_dir
-from .tokens import role_context_windows
+from .llm.tokens import role_context_windows
 from .ui import (
     console,
     print_error, print_info, print_success, print_warn, print_help,

@@ -52,10 +52,10 @@ except Exception:
     _HAS_NUMPY = False
 
 
-from .bridge import OllamaBridge
-from .config import KratosConfig, _project_dir
-from .memory import MemoryManager
-from .tokens import estimate  # rough token helper for budgets
+from ..llm.bridge import OllamaBridge
+from ..config import KratosConfig, _project_dir
+from ..memory import MemoryManager
+from ..llm.tokens import estimate  # rough token helper for budgets
 
 
 @dataclass
@@ -258,7 +258,7 @@ class ProjectKnowledge:
         but is not bound by the old FileEntry design.
         """
         # Lightweight reuse of existing ignore logic (avoid duplicating regexes)
-        from .context import _IGNORE, _SECRET_FILE, _PRIORITY_RULES  # type: ignore
+        from ..context.indexer import _IGNORE, _SECRET_FILE, _PRIORITY_RULES  # type: ignore
 
         records: list[_ChunkRecord] = []
         seen: set[str] = set()
@@ -421,8 +421,8 @@ class ProjectKnowledge:
         return chunks
 
     def _priority_for(self, rel_path: str) -> int:
-        # Lightweight reuse of the spirit of the old rules (from context.py)
-        from .context import _PRIORITY_RULES  # type: ignore
+        # Lightweight reuse of the spirit of the old rules (from context/indexer.py)
+        from ..context.indexer import _PRIORITY_RULES  # type: ignore
         for pri, pat in _PRIORITY_RULES:
             if pat.search(rel_path):
                 return pri

@@ -34,72 +34,9 @@ from textual.message import Message
 from textual.widgets import Static, TextArea
 from textual import events
 
-from .tokens import role_context_windows
+from ..llm.tokens import role_context_windows
 from kratos.ui import elapsed_str, _tok_short
-
-
-# ── Slash completion data (mirrors kratos.py _SLASH_TREE) ────────────────────
-
-_SLASH_TREE: dict[str, tuple[dict[str, str] | None, str]] = {
-    "exit":       (None,                                                "Quit Kratos"),
-    "quit":       (None,                                                "Quit Kratos"),
-    "q":          (None,                                                "Quit Kratos"),
-    "help":       (None,                                                "Show all commands"),
-    "clear":      (None,                                                "Clear screen"),
-    "status":     (None,                                                "Show status bar"),
-    "setup":      (None,                                                "Model setup info"),
-    "tokens":     (None,                                                "Show session token usage"),
-    "goal":       ({"clear": "Clear goal"},                             "Set or show goal"),
-    "scope":      ({"global": "Machine-wide config",
-                    "project": "Per-project config",
-                    "info":    "Show paths"},                           "Config scope"),
-    "permission": ({"low":  "Read only",
-                    "mid":  "Read + write",
-                    "high": "Read + write + delete"},                   "Coder permissions"),
-    "models":     ({"planner":    "Change planner model",
-                    "coder":      "Change coder model",
-                    "verifier":   "Change verifier model",
-                    "compressor": "Change compressor model"},           "Model config"),
-    "index":      ({"rebuild": "Rescan project files"},                 "Project file index"),
-    "memory":     ({"list":    "Show all entries",
-                    "clear":   "Clear session/project/all"},            "Persistent memory"),
-    "prompts":    ({"list": "Show roles/snippets",
-                    "reload": "Reload from json",
-                    "dump": "Write defaults to file"},                  "Edit system prompts"),
-    "history":    ({"clear": "Reset conversation"},                     "Conversation history"),
-    "build":      ({"clear": "Remove build command"},                   "Build command"),
-    "test":       ({"clear": "Remove test command"},                    "Test command"),
-    "logging":    ({"on": "Start logging", "off": "Stop logging"},      "Session logging"),
-}
-
-
-def slash_completions(text: str) -> list[tuple[str, str, str]]:
-    """Return (value, display, meta) completion tuples for a partial slash-command text.
-
-    `text` must start with "/". Used by the autocomplete overlay and in tests.
-    """
-    if not text.startswith("/"):
-        return []
-    after = text[1:]
-    space = after.find(" ")
-    if space == -1:
-        partial = after.lower()
-        return [
-            ("/" + name, "/" + name, desc)
-            for name, (_, desc) in sorted(_SLASH_TREE.items())
-            if name.startswith(partial)
-        ]
-    cmd = after[:space].lower()
-    partial_sub = after[space + 1:].lower()
-    if cmd in _SLASH_TREE:
-        subs, _ = _SLASH_TREE[cmd]
-        if subs:
-            return [
-                (sub, sub, desc)
-                for sub, desc in sorted(subs.items())
-                if sub.startswith(partial_sub)
-            ]
-    return []
+from .slash import _SLASH_TREE, slash_completions
 
 
 # ── Ported CoderFilter ────────────────────────────────────────────────────────

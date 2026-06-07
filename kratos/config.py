@@ -164,7 +164,7 @@ class KratosConfig:
         # This upgrades old/small saved configs automatically to the model's true max.
         if getattr(inst, "always_max_ctx", True):
             try:
-                from .tokens import model_max_ctx
+                from .llm.tokens import model_max_ctx
                 inst.planner_num_ctx = max(inst.planner_num_ctx, model_max_ctx(inst.planner_model))
                 inst.coder_num_ctx = max(inst.coder_num_ctx, model_max_ctx(inst.coder_model))
                 inst.verifier_num_ctx = max(inst.verifier_num_ctx, model_max_ctx(inst.verifier_model))

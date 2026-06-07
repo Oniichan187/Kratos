@@ -27,7 +27,7 @@ import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .bridge import OllamaBridge
+    from .llm.bridge import OllamaBridge
     from .config import KratosConfig
 
 # Prompts externalized to JSON (see kratos/prompts.py). Import the getters so the
@@ -170,7 +170,7 @@ class Compressor:
             transcript_parts.append(f"User: {u}\nAssistant: {a}")
         transcript = "\n\n---\n\n".join(transcript_parts)
 
-        from .tokens import choose_num_ctx, estimate as _est
+        from .llm.tokens import choose_num_ctx, estimate as _est
         _sys = get_system("compress")
         _ptok = _est(transcript) + _est(_sys)
         _fmax = getattr(self._config, "always_max_ctx", True)
@@ -224,7 +224,7 @@ class Compressor:
             f"Key output: {coder_output[:600]}\n\n"
             f"Files changed: {', '.join(changed_files[:8])}"
         )
-        from .tokens import choose_num_ctx, estimate as _est
+        from .llm.tokens import choose_num_ctx, estimate as _est
         _sys = get_system("memory")
         _ptok = _est(user_text) + _est(_sys)
         _fmax = getattr(self._config, "always_max_ctx", True)
@@ -282,7 +282,7 @@ class Compressor:
             f"Large input to summarise:\n{large_context}"
         )
 
-        from .tokens import choose_num_ctx, estimate
+        from .llm.tokens import choose_num_ctx, estimate
         _sys = get_system("relay_detailed") or get_system("relay")
         prompt_tokens = estimate(user_text) + estimate(_sys)
         force_max = getattr(self._config, "always_max_ctx", True)

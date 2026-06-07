@@ -27,7 +27,7 @@ try:
 except ImportError:
     sys.exit("pip install rich")
 
-from kratos.bridge import OllamaBridge, win_to_wsl
+from kratos.llm.bridge import OllamaBridge, win_to_wsl
 from kratos.ui import console
 from kratos.config import (
     KratosConfig,

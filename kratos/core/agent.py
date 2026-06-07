@@ -32,28 +32,29 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import subprocess
-import time
 from pathlib import Path
 from typing import Generator
 
-from .analyzer import InputAnalyzer
-from .bridge import OllamaBridge
-from .classifier import IntentClassifier, Intent
-from .compress import Compressor
-from .config import KratosConfig, _project_dir, GLOBAL_DIR
-from .context import ContextBuilder, ContextPackage, ProjectIndexer, ScopeType
-from .knowledge import ProjectKnowledge, RetrievedChunk
-from .memory import MemoryEntry, MemoryManager
-from .router import Route, Router
-from .tokens import (
+from ..analyzer import InputAnalyzer
+from .buildtest import _VerificationRunnerMixin
+from .retry import _RetryMixin
+from .runners import _RoleRunnerMixin
+from ..llm.bridge import OllamaBridge
+from ..classifier import IntentClassifier, Intent
+from ..compress import Compressor
+from ..config import KratosConfig, _project_dir, GLOBAL_DIR
+from ..context import ContextBuilder, ContextPackage, ProjectIndexer, ScopeType
+from ..knowledge import ProjectKnowledge, RetrievedChunk
+from ..memory import MemoryManager
+from ..router import Route, Router
+from ..llm.tokens import (
     estimate, estimate_messages,
-    fit_to_budget, relay_needed, effective_num_ctx,
+    fit_to_budget, relay_needed,
 )
 
 # Prompts are fully externalized to JSON — all AI-facing strings, patterns, and pipeline config
 # live in prompts_default.json (user-editable). Python code contains only flow logic.
-from .prompts import (
+from ..prompts import (
     load_prompts,
     get_system,
     get_snippet,
@@ -63,7 +64,7 @@ from .prompts import (
     get_plan_config,
     reload_prompts,
 )
-from .builders import (
+from ..roles import (
     _scope_for,
     _coder_scope_for,
     _needs_thinking,
@@ -77,20 +78,16 @@ from .builders import (
     _direct_file_search,
     _direct_code_search,
 )
-from .verification import (
+from ..verification import (
     VerificationCommand,
     ProvenWork,
     CommandRegistry,
     _clean_command_line,
     _missing_command_paths,
-    _compile_check_cmds,
     _is_safe_verification_command,
     _is_test_verification_command,
-    _detect_project_toolchains,
     _command_toolchain,
     _dedupe_verification_commands,
-    _extract_readme_verification_commands,
-    _infer_project_verification_commands,
     _proven_work_satisfied,
     _format_proven_work_feedback,
     _extract_plan_steps,
@@ -98,7 +95,15 @@ from .verification import (
     _parse_step_tests,
     _patch_dotnet_test_runner,
 )
-from .taskboard_repair import try_repair_known_probe
+from ..execution.parsing import (
+    _FILE_CHANGE_RE,
+    _FILE_DELETE_RE,
+    _get_file_change_re,
+    _get_file_delete_re,
+    _parse_file_changes,
+    _parse_file_deletions,
+)
+from ..execution.repair import try_repair_known_probe
 
 # ── token predict limits (now sourced from prompts at runtime for full configurability) ──
 # (kept as module fallbacks only for very early import paths; prefer get_predict)
@@ -111,56 +116,9 @@ _VERIFY_PREDICT      = 512
 _RELAY_PREDICT       = 1200
 
 
-# ── output parsers (markers sourced from prompts at runtime for perfect sync with JSON) ──
-
-def _get_file_change_re():
-    pm = load_prompts()
-    fm = re.escape(pm.get_marker("file") or "### FILE:")
-    return re.compile(
-        rf'^\s*{fm}\s*([^\r\n]+?)\s*\r?\n```(?:\w+)?[^\S\r\n]*\r?\n(.*?)^```\s*$',
-        re.S | re.M,
-    )
-
-
-def _get_file_delete_re():
-    pm = load_prompts()
-    dm = re.escape(pm.get_marker("delete") or "### DELETE:")
-    return re.compile(rf'{dm}\s*(.+?)\s*$', re.M)
-
-
-# Fallback module-level compiled (using defaults at import time)
-_FILE_CHANGE_RE = re.compile(
-    r'^\s*###\s+FILE:\s*([^\r\n]+?)\s*\r?\n```(?:\w+)?[^\S\r\n]*\r?\n(.*?)^```\s*$',
-    re.S | re.M,
-)
-_FILE_DELETE_RE = re.compile(r'###\s+DELETE:\s*(.+?)\s*$', re.M)
-
-
-def _parse_file_changes(text: str) -> list[tuple[str, str]]:
-    changes: list[tuple[str, str]] = []
-    for m in _get_file_change_re().finditer(text):
-        path = m.group(1).strip()
-        path = re.sub(r'\s+\((?:updated|modified|new)\)\s*$', '', path, flags=re.I)
-        path = re.sub(
-            r'(\.[A-Za-z0-9][A-Za-z0-9._-]*)\s+\([^/\r\n]*\)\s*$',
-            r'\1',
-            path,
-        )
-        if not path or any(ch in path for ch in "\r\n`<>"):
-            continue
-        changes.append((path, m.group(2)))
-    return changes
-
-
-def _parse_file_deletions(text: str) -> list[str]:
-    return [m.group(1).strip() for m in _get_file_delete_re().finditer(text)]
-
-
-
-
 # ── main agent ────────────────────────────────────────────────────────────────
 
-class KratosAgent:
+class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
     def __init__(self, config: KratosConfig, bridge: OllamaBridge, prompts=None) -> None:
         self.config = config
         self.bridge = bridge
@@ -979,469 +937,6 @@ class KratosAgent:
                 yield ("warn", f"Needs revision ({attempt + 1}/{max_iter}) — {verify_feedback[:200]}", "warn")
             else:
                 yield ("warn", f"Safety cap ({max_iter} iterations) reached — review manually.", "warn")
-
-    # ── model runners ─────────────────────────────────────────────────────────
-
-    def _role_num_ctx(
-        self,
-        role: str,
-        model: str,
-        prompt_tokens: int,
-        max_new_tokens: int,
-    ) -> int:
-        configured = {
-            "planner": self.config.planner_num_ctx,
-            "coder": self.config.coder_num_ctx,
-            "verifier": self.config.verifier_num_ctx,
-        }[role]
-        return effective_num_ctx(
-            model=model,
-            configured_num_ctx=configured,
-            vram_ctx_ceiling=self.config.vram_ctx_ceiling,
-            prompt_tokens=prompt_tokens,
-            max_new_tokens=max_new_tokens,
-            force_max_context=getattr(self.config, "always_max_ctx", True),
-        )
-
-    @staticmethod
-    def _messages(system: str, history: list[dict], msg: str) -> list[dict]:
-        return [
-            {"role": "system", "content": system},
-            *history,
-            {"role": "user", "content": msg},
-        ]
-
-    def _prepare_model_prompt(
-        self,
-        role: str,
-        model: str,
-        system: str,
-        history: list[dict],
-        msg: str,
-        num_predict: int,
-    ) -> tuple[list[dict], int, int, str, list[tuple[str, str, str]]]:
-        events: list[tuple[str, str, str]] = []
-        prompt_msgs = self._messages(system, history, msg)
-        prompt_tok = estimate_messages(prompt_msgs)
-        num_ctx = self._role_num_ctx(role, model, prompt_tok, num_predict)
-
-        compressed = self._auto_compress_if_needed(
-            history, model, num_ctx,
-            prompt_tokens=prompt_tok,
-            _pending_events=events,
-        )
-        if compressed:
-            prompt_msgs = self._messages(system, history, msg)
-            prompt_tok = estimate_messages(prompt_msgs)
-
-        if prompt_tok > num_ctx and history:
-            removed_pairs = 0
-            while history and prompt_tok > num_ctx:
-                remove_n = 2 if len(history) >= 2 else 1
-                del history[:remove_n]
-                removed_pairs += 1
-                prompt_msgs = self._messages(system, history, msg)
-                prompt_tok = estimate_messages(prompt_msgs)
-            events.append((
-                "compress",
-                f"Trimmed {role} history by {removed_pairs} old pair(s) "
-                f"to fit real {num_ctx:,}-token window",
-                "info",
-            ))
-
-        if prompt_tok > num_ctx:
-            reserved = estimate_messages(self._messages(system, history, ""))
-            msg_budget = max(256, num_ctx - reserved - 64)
-            fitted_msg = fit_to_budget(msg, msg_budget)
-            if fitted_msg != msg:
-                msg = fitted_msg
-                prompt_msgs = self._messages(system, history, msg)
-                prompt_tok = estimate_messages(prompt_msgs)
-                events.append((
-                    "warn",
-                    f"{role} prompt exceeded real {num_ctx:,}-token window; "
-                    "trimmed current input before model call.",
-                    "warn",
-                ))
-
-        if prompt_tok > num_ctx:
-            history.clear()
-            msg_budget = max(256, num_ctx - estimate(system) - 128)
-            msg = fit_to_budget(msg, msg_budget)
-            prompt_msgs = self._messages(system, history, msg)
-            prompt_tok = estimate_messages(prompt_msgs)
-            events.append((
-                "warn",
-                f"{role} prompt still exceeded context after compression; "
-                "dropped role history for this call.",
-                "warn",
-            ))
-
-        return prompt_msgs, prompt_tok, num_ctx, msg, events
-
-    def _auto_compress_if_needed(
-        self, history: list[dict], model: str, num_ctx: int,
-        prompt_tokens: int | None = None,
-        _pending_events: list | None = None,
-    ) -> bool:
-        """Compress history in-place if it's approaching the context limit.
-
-        If _pending_events is provided, appends a (source, content, kind) tuple
-        so the caller can yield it — making compression visible in the UI.
-        """
-        if not self.config.auto_compress:
-            return False
-        history_tok = estimate_messages(history)
-        tok = prompt_tokens if prompt_tokens is not None else history_tok
-        threshold = int(num_ctx * self.config.compress_threshold)
-        if tok > threshold or history_tok > threshold or len(history) > self.config.max_history_pairs * 2:
-            compressed = self._compressor.compress_history(history, keep_pairs=4)
-            if compressed and _pending_events is not None:
-                short_model = model.split("/")[-1].split(":")[0]
-                _pending_events.append(
-                    ("compress",
-                     f"Auto-compressed {short_model} history  {tok:,} tokens → keep 4 pairs",
-                     "info")
-                )
-            return compressed
-        return False
-
-    def _run_planner(
-        self, msg: str, route: Route, keep_alive: str = "0",
-        scope: ScopeType = "targeted", task: str = "", is_retry: bool = False,
-    ) -> Generator:
-        needs_thinking = _needs_thinking(task, scope, route, is_retry, 0)
-        planner_think: bool | None = None if needs_thinking else False
-        p = load_prompts()
-
-        # Larger budget on retry+CoT so thinking doesn't crowd out the actual plan
-        if needs_thinking and is_retry:
-            num_predict = p.get_predict("plan_retry")
-        elif needs_thinking:
-            num_predict = p.get_predict("plan_heavy")
-        else:
-            num_predict = p.get_predict("plan")
-
-        prompt_msgs, prompt_tok, num_ctx, stored_msg, _compress_events = self._prepare_model_prompt(
-            "planner",
-            self.config.planner_model,
-            get_system("planner"),
-            self._planner_history,
-            msg,
-            num_predict,
-        )
-        for _ev in _compress_events:
-            yield _ev
-        yield ("ctx_info", f"planner|{prompt_tok}|{num_ctx}", "info")
-
-        yield ("log", json.dumps({
-            "type": "model_input", "role": "planner",
-            "model": self.config.planner_model,
-            "num_ctx": num_ctx, "prompt_tokens_est": prompt_tok,
-            "think": needs_thinking,
-        }), "log")
-
-        thinking = ""
-        full = ""
-        try:
-            for token, kind in self.bridge.chat(
-                model=self.config.planner_model,
-                messages=prompt_msgs,
-                temperature=self.config.planner_temp,
-                num_predict=num_predict,
-                num_ctx=num_ctx,
-                keep_alive=keep_alive,
-                think=planner_think,
-                cancel_event=self._cancel_event,
-            ):
-                if kind == "think":
-                    thinking += token
-                    yield ("planner", token, "think")   # stream so user sees progress
-                elif kind == "usage":
-                    self._record_usage(token)
-                    yield ("usage", token, "usage")
-                else:
-                    full += token
-                    yield ("planner", token, kind)
-        except KeyboardInterrupt:
-            yield ("warn", "Planner interrupted.", "warn")
-            return ""
-        except Exception as exc:
-            yield ("error", f"Planner failed: {exc}", "error")
-
-        # Guard: if CoT exhausted the token budget before producing any output,
-        # re-run immediately with think=False using the same prompt.
-        if not full.strip() and needs_thinking:
-            yield ("warn", "CoT used all token budget — retrying without chain-of-thought", "warn")
-            try:
-                for token, kind in self.bridge.chat(
-                    model=self.config.planner_model,
-                    messages=prompt_msgs,
-                    temperature=self.config.planner_temp,
-                    num_predict=p.get_predict("plan"),
-                    num_ctx=num_ctx,
-                    keep_alive=keep_alive,
-                    think=False,
-                    cancel_event=self._cancel_event,
-                ):
-                    if kind == "usage":
-                        self._record_usage(token)
-                        yield ("usage", token, "usage")
-                    elif kind != "think":
-                        full += token
-                        yield ("planner", token, kind)
-            except Exception as exc:
-                yield ("error", f"Planner no-think retry failed: {exc}", "error")
-
-        if thinking:
-            yield ("log", json.dumps({"type": "model_thinking", "role": "planner",
-                                       "chars": len(thinking)}), "log")
-        yield ("log", json.dumps({"type": "model_output", "role": "planner",
-                                   "chars": len(full)}), "log")
-
-        if not self._is_cancelled():
-            self._planner_history.append({"role": "user",      "content": stored_msg})
-            self._planner_history.append({"role": "assistant", "content": full})
-        return full
-
-    def _run_coder(self, msg: str, model_override: str | None = None) -> Generator:
-        coder_model = model_override or self.config.coder_model
-        p = load_prompts()
-        prompt_msgs, prompt_tok, num_ctx, stored_msg, _compress_events = self._prepare_model_prompt(
-            "coder",
-            coder_model,
-            get_system("coder"),
-            self._coder_history,
-            msg,
-            p.get_predict("code"),
-        )
-        for _ev in _compress_events:
-            yield _ev
-        yield ("ctx_info", f"coder|{prompt_tok}|{num_ctx}", "info")
-
-        yield ("log", json.dumps({
-            "type": "model_input", "role": "coder",
-            "model": coder_model,
-            "num_ctx": num_ctx, "prompt_tokens_est": prompt_tok,
-        }), "log")
-
-        full = ""
-        try:
-            for token, kind in self.bridge.chat(
-                model=coder_model,
-                messages=prompt_msgs,
-                temperature=self.config.coder_temp,
-                num_predict=p.get_predict("code"),
-                num_ctx=num_ctx,
-                think=False,
-                cancel_event=self._cancel_event,
-            ):
-                if kind == "usage":
-                    self._record_usage(token)
-                    yield ("usage", token, "usage")
-                elif kind != "think":
-                    full += token
-                    yield ("coder", token, kind)
-        except KeyboardInterrupt:
-            yield ("warn", "Coder interrupted.", "warn")
-            return ""
-        except Exception as exc:
-            yield ("error", f"Coder failed: {exc}", "error")
-
-        yield ("log", json.dumps({"type": "model_output", "role": "coder",
-                                   "chars": len(full)}), "log")
-
-        if not self._is_cancelled():
-            self._coder_history.append({"role": "user",      "content": stored_msg})
-            self._coder_history.append({"role": "assistant", "content": full})
-        return full
-
-    def _run_verifier(self, msg: str) -> Generator:
-        p = load_prompts()
-        prompt_msgs, prompt_tok, num_ctx, _stored_msg, _compress_events = self._prepare_model_prompt(
-            "verifier",
-            self.config.verifier_model,
-            get_system("verifier"),
-            [],
-            msg,
-            p.get_predict("verify"),
-        )
-        for _ev in _compress_events:
-            yield _ev
-
-        yield ("ctx_info", f"verifier|{prompt_tok}|{num_ctx}", "info")
-        yield ("log", json.dumps({
-            "type": "model_input", "role": "verifier",
-            "model": self.config.verifier_model, "num_ctx": num_ctx,
-            "prompt_tokens_est": prompt_tok,
-        }), "log")
-
-        full = ""
-        try:
-            for token, kind in self.bridge.chat(
-                model=self.config.verifier_model,
-                messages=prompt_msgs,
-                temperature=self.config.verifier_temp,
-                num_predict=p.get_predict("verify"),
-                num_ctx=num_ctx,
-                keep_alive="0",
-                think=False,
-                cancel_event=self._cancel_event,
-            ):
-                if kind == "usage":
-                    self._record_usage(token)
-                elif kind != "think":
-                    full += token
-                    yield ("verify", token, kind)
-        except KeyboardInterrupt:
-            yield ("warn", "Verifier interrupted.", "warn")
-            return ""
-        except Exception as exc:
-            yield ("error", f"Verifier failed: {exc}", "error")
-            full = "NEEDS_REVISION: verifier error — treat as unverified"
-
-        yield ("log", json.dumps({"type": "model_output", "role": "verifier",
-                                   "chars": len(full)}), "log")
-        return full
-
-    # ── build/test runner ─────────────────────────────────────────────────────
-
-    def _verification_commands(self, route: Route) -> list[VerificationCommand]:
-        commands: list[VerificationCommand] = []
-
-        if self.config.build_cmd:
-            commands.append(VerificationCommand(
-                cmd=self.config.build_cmd,
-                purpose="configured build verification",
-                source="/build",
-                is_test=_is_test_verification_command(self.config.build_cmd),
-            ))
-        if self.config.test_cmd:
-            commands.append(VerificationCommand(
-                cmd=self.config.test_cmd,
-                purpose="configured test verification",
-                source="/test",
-                is_test=True,
-            ))
-
-        if commands:
-            return _dedupe_verification_commands(commands)
-
-        if not self.config.auto_discover_verification:
-            return []
-
-        root = self._indexer.root
-        commands.extend(_extract_readme_verification_commands(root))
-        commands.extend(_infer_project_verification_commands(root))
-
-        safe = [item for item in commands if _is_safe_verification_command(item.cmd)]
-        return _dedupe_verification_commands(safe)
-
-    def _run_verification_command(self, command: VerificationCommand) -> dict:
-        started = time.monotonic()
-        try:
-            result = subprocess.run(
-                command.cmd,
-                shell=True,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=self.config.verification_timeout_seconds,
-                cwd=str(self._indexer.root),
-            )
-            output = (result.stdout or "") + (result.stderr or "")
-            exit_code = int(result.returncode)
-        except Exception as exc:
-            output = str(exc)
-            exit_code = 1
-
-        return {
-            "cmd": command.cmd,
-            "purpose": command.purpose,
-            "source": command.source,
-            "is_test": command.is_test,
-            "exit_code": exit_code,
-            "duration_seconds": round(time.monotonic() - started, 3),
-            "output": output,
-        }
-
-    def _run_build_test(self) -> tuple[bool, str, str] | None:
-        commands = self._verification_commands(Route.DIAGNOSTIC_LOOP)
-        if not commands:
-            return None
-        result = self._run_verification_command(commands[0])
-        return (result["exit_code"] == 0, result["output"], result["cmd"])
-
-    # ── rollback ──────────────────────────────────────────────────────────────
-
-    def _rollback(
-        self, snapshots: dict[str, str | None], project_root: Path
-    ) -> None:
-        """Restore files to their state before this run (called on UNSOLVABLE)."""
-        for rel_path, original_content in snapshots.items():
-            target = (project_root / rel_path).resolve()
-            try:
-                target.relative_to(project_root.resolve())
-                if original_content is None:
-                    if target.exists():
-                        target.unlink()
-                else:
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_text(original_content, encoding="utf-8")
-            except (ValueError, OSError):
-                pass
-
-    # ── session persistence ────────────────────────────────────────────────────
-
-    def _save_iteration_state(
-        self,
-        iteration: int,
-        plan: str,
-        feedback: str,
-        proof: ProvenWork | None = None,
-    ) -> None:
-        state_dir = _project_dir()
-        try:
-            state_dir.mkdir(parents=True, exist_ok=True)
-            state = {
-                "iteration": iteration,
-                "plan": plan[:2000],
-                "last_feedback": feedback[:2000],
-                "pending_files": [p for p, _ in self.pending_file_changes],
-                "proven_work": proof.to_dict() if proof else None,
-                "session_usage": self._session_usage,
-            }
-            (state_dir / "session.json").write_text(
-                json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8"
-            )
-        except OSError:
-            pass
-
-    def _record_solution(
-        self,
-        files_changed: list[str],
-        iteration: int,
-        task: str,
-        plan: str,
-        coder_output: str,
-        proof: ProvenWork | None = None,
-    ) -> None:
-        if not files_changed:
-            return
-        # Semantic memory extraction via compressor
-        mem_entries = self._compressor.generate_memory(task, plan, coder_output, files_changed)
-        self._memory.add_from_compress(mem_entries, tier="project")
-        # Also record the basic solution fact
-        proof_cmds = []
-        if proof:
-            proof_cmds = [item["cmd"] for item in proof.commands if item.get("exit_code") == 0]
-        suffix = f"; PROVEN_WORK: {', '.join(proof_cmds[:3])}" if proof_cmds else ""
-        self._memory.add(MemoryEntry(
-            category="solution",
-            content=f"Solved in {iteration} iteration(s). Files: {', '.join(files_changed[:6])}{suffix}",
-            tags=["verified", "proven_work"] if proof_cmds else ["verified"],
-        ), "project")
 
     # ── public API ────────────────────────────────────────────────────────────
 
