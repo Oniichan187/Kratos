@@ -166,9 +166,20 @@ Kratos kann nicht mehr „erfolgreich klingen", ohne gearbeitet zu haben:
   mit der Meldung „Keine echten Dateiänderungen erkannt".
 - Der Abschlussbericht (`kratos/reporter.py`) wird nur aus Evidenz gebaut:
   Teststatus nur aus echten Exitcodes („Tests nicht ausgeführt" statt erfundener Erfolge),
-  Diff nur aus `git diff --stat` bzw. Hash-Abgleich — nie erfunden.
+  Diff nur aus `git diff HEAD --stat` (staged + unstaged) bzw. echtem `difflib`-Vergleich — nie erfunden.
 
-Details: `docs/agent_architecture.md`, `docs/tools.md`, `docs/safety.md`, `docs/verification.md`.
+- `files_changed` kommt technisch aus Write/Delete + Hash-Abgleich plus einer
+  modellfreien `git_changed_files()`-Querprüfung — nie aus Modelltext.
+- Ausgeführte Befehle stammen nur aus echten `CommandResult`-Logs (Exitcode,
+  getrenntes stdout/stderr, Timeout → 124, blockiert → 126).
+
+Echte Diff-Erkennung: `kratos/execution/diffing.py`. Generischer Repair-Loop:
+`kratos/execution/repair_loop.py` (analysiert echte Testfehler, fixt gezielt,
+testet erneut; Erfolg nur bei echtem `exit_code == 0`). Importsicher:
+`import kratos.app` bricht nie mehr mit `sys.exit` ab.
+
+Details: `docs/analysis_rebuild_plan.md`, `docs/hardening_changes.md`,
+`docs/agent_architecture.md`, `docs/verification.md`, `docs/tools.md`, `docs/safety.md`.
 
 Wenn keine Tests auto-entdeckt werden:
 
@@ -292,17 +303,21 @@ C:\Tools\Kratos\
 ├── requirements.txt
 ├── setup_models.py        ← Modell-Setup-Wizard (idempotent)
 ├── setup_wsl.sh           ← WSL + CUDA Setup (einmalig)
-├── tests/
-│   └── test_core.py       ← comprehensive unit tests (kein Ollama nötig)
+├── docs/                  ← Architektur, Verifikation, Tools, Safety, Hardening
+├── tests/                 ← test_core, test_agent_tools, test_godmode, test_run_regressions
 └── kratos/
-    ├── tokens.py          ← choose_num_ctx with force_max_context=True (default)
-    ├── compress.py        ← Auto-Composer: lossless history + Markdown knowledge artifacts + .kratos memory (max ctx)
-    ├── agent.py           ← KratosAgent: Planner→Adaptive Coder Action Loop→Verifier loop
-    ├── bridge.py          ← OllamaBridge (full num_ctx always passed)
-    ├── config.py          ← always_max_ctx + bumped role num_ctx defaults + auto-upgrade on load
-    ├── context.py         ← full file listing + token-aware excerpts (benefits from huge budgets)
-    ├── memory.py          ← 4-tier (.kratos/memory.json project + global)
-    ... (analyzer, classifier, router, commands, logger, ui)
+    ├── safety.py          ← SafetyGuard: Command-/Path-Gate (blockiert destruktiv/exfil)
+    ├── reporter.py        ← Anti-Fake-Erfolg-Gate (Status nur aus Evidenz)
+    ├── verification.py    ← Command-Discovery + ProvenWork-Evidenz
+    ├── web.py             ← HTTP-Fetch/HTML-Scrape/Web-Search (ehrliche Fehler, SSRF-Guard)
+    ├── app/               ← CLI + Textual TUI (lazy imports, kein sys.exit beim Import)
+    ├── core/              ← agent.py (Loop), runners, retry, buildtest (Command-Runner)
+    ├── execution/         ← tools, shell (ShellRunner), search, diffing (NEU),
+    │                         repair_loop (NEU), diagnostics, parsing, testguard, ...
+    ├── llm/               ← bridge (OllamaBridge), tokens (max-ctx Policy)
+    ├── roles/             ← planner, coder, verifier
+    ├── context/, knowledge/, ui/
+    └── compress.py, memory.py, config.py, planning.py, ...
 ```
 
 ---
