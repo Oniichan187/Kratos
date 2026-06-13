@@ -64,6 +64,32 @@ class _VerificationRunnerMixin:
 
     def _run_verification_command(self, command: VerificationCommand) -> dict:
         started = time.monotonic()
+        workdir = self._indexer.root
+        rel_cwd = getattr(command, "cwd", None)
+        if rel_cwd:
+            candidate = (self._indexer.root / rel_cwd).resolve()
+            try:
+                candidate.relative_to(self._indexer.root.resolve())
+                if candidate.is_dir():
+                    workdir = candidate
+            except ValueError:
+                pass
+
+        # Defense in depth: even allowlisted build/test commands pass the
+        # SafetyGuard blocklist before execution.
+        from ..safety import check_command
+        verdict = check_command(command.cmd)
+        if not verdict:
+            return {
+                "cmd": command.cmd, "purpose": command.purpose,
+                "source": command.source, "is_test": command.is_test,
+                "exit_code": 126, "duration_seconds": 0.0,
+                "output": f"SafetyGuard: {verdict.reason}",
+                "stdout": "", "stderr": f"SafetyGuard: {verdict.reason}",
+                "cwd": str(workdir), "timeout_seconds": self.config.verification_timeout_seconds,
+                "blocked": True, "block_reason": verdict.reason,
+                "timed_out": False, "shell": "system",
+            }
         try:
             result = subprocess.run(
                 command.cmd,
@@ -73,13 +99,29 @@ class _VerificationRunnerMixin:
                 encoding="utf-8",
                 errors="replace",
                 timeout=self.config.verification_timeout_seconds,
-                cwd=str(self._indexer.root),
+                cwd=str(workdir),
             )
-            output = (result.stdout or "") + (result.stderr or "")
+            stdout = result.stdout or ""
+            stderr = result.stderr or ""
+            output = stdout + stderr
             exit_code = int(result.returncode)
+            timed_out = False
+        except subprocess.TimeoutExpired as exc:
+            def _txt(value) -> str:
+                if isinstance(value, bytes):
+                    return value.decode("utf-8", "replace")
+                return value or ""
+            stdout = _txt(exc.stdout)
+            stderr = _txt(exc.stderr) or f"timeout after {self.config.verification_timeout_seconds}s"
+            output = stdout + stderr
+            exit_code = 124
+            timed_out = True
         except Exception as exc:
-            output = str(exc)
+            stdout = ""
+            stderr = str(exc)
+            output = stderr
             exit_code = 1
+            timed_out = False
 
         return {
             "cmd": command.cmd,
@@ -89,27 +131,72 @@ class _VerificationRunnerMixin:
             "exit_code": exit_code,
             "duration_seconds": round(time.monotonic() - started, 3),
             "output": output,
+            "stdout": stdout,
+            "stderr": stderr,
+            "cwd": str(workdir),
+            "timeout_seconds": self.config.verification_timeout_seconds,
+            "blocked": False,
+            "block_reason": "",
+            "timed_out": timed_out,
+            "shell": "system",
         }
 
     def _run_readonly_command(self, cmd: str, root=None) -> dict:
         started = time.monotonic()
-        shell = shutil.which("pwsh") or shutil.which("powershell") or "powershell"
+        workdir = root or self._indexer.root
+        from ..safety import check_command
+        verdict = check_command(cmd)
+        if not verdict:
+            return {
+                "cmd": cmd, "purpose": "readonly inspection",
+                "source": "coder-inspect", "is_test": False,
+                "exit_code": 126, "duration_seconds": 0.0,
+                "output": f"SafetyGuard: {verdict.reason}",
+                "stdout": "", "stderr": f"SafetyGuard: {verdict.reason}",
+                "cwd": str(workdir), "timeout_seconds": self.config.verification_timeout_seconds,
+                "blocked": True, "block_reason": verdict.reason,
+                "timed_out": False, "shell": "powershell" if shutil.which("pwsh") or shutil.which("powershell") else "bash",
+            }
+        ps = shutil.which("pwsh") or shutil.which("powershell")
+        if ps:
+            argv = [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", cmd]
+            shell_name = "powershell"
+        else:
+            # POSIX/WSL host without PowerShell — run via bash/sh instead.
+            argv = [shutil.which("bash") or "sh", "-c", cmd]
+            shell_name = "bash"
         try:
             result = subprocess.run(
-                [shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", cmd],
+                argv,
                 shell=False,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
                 timeout=self.config.verification_timeout_seconds,
-                cwd=str(root or self._indexer.root),
+                cwd=str(workdir),
             )
-            output = (result.stdout or "") + (result.stderr or "")
+            stdout = result.stdout or ""
+            stderr = result.stderr or ""
+            output = stdout + stderr
             exit_code = int(result.returncode)
+            timed_out = False
+        except subprocess.TimeoutExpired as exc:
+            def _txt(value) -> str:
+                if isinstance(value, bytes):
+                    return value.decode("utf-8", "replace")
+                return value or ""
+            stdout = _txt(exc.stdout)
+            stderr = _txt(exc.stderr) or f"timeout after {self.config.verification_timeout_seconds}s"
+            output = stdout + stderr
+            exit_code = 124
+            timed_out = True
         except Exception as exc:
-            output = str(exc)
+            stdout = ""
+            stderr = str(exc)
+            output = stderr
             exit_code = 1
+            timed_out = False
 
         return {
             "cmd": cmd,
@@ -119,6 +206,14 @@ class _VerificationRunnerMixin:
             "exit_code": exit_code,
             "duration_seconds": round(time.monotonic() - started, 3),
             "output": output,
+            "stdout": stdout,
+            "stderr": stderr,
+            "cwd": str(workdir),
+            "timeout_seconds": self.config.verification_timeout_seconds,
+            "blocked": False,
+            "block_reason": "",
+            "timed_out": timed_out,
+            "shell": shell_name,
         }
 
     def _run_build_test(self) -> tuple[bool, str, str] | None:

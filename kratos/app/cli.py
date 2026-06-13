@@ -10,6 +10,7 @@ filters live in ``app/prompt_frame``; the slash-command tree lives in
 
 from __future__ import annotations
 
+import hashlib
 import sys
 import time
 from pathlib import Path
@@ -70,20 +71,44 @@ def _show_file_ops(agent: KratosAgent, logger: "SessionLogger | None" = None) ->
             print_warn(f"Write blocked (permission={perm}). Use /permission mid or high.")
             break
         if logger:
-            logger.log_file_write(rel_path, content)
+            target = (agent.indexer.root / rel_path).resolve()
+            try:
+                previous = target.read_text("utf-8") if target.exists() else None
+            except OSError:
+                previous = None
+            logger.log_file_write(
+                rel_path,
+                content,
+                previous_content=previous,
+                sha256=hashlib.sha256(content.encode("utf-8", "replace")).hexdigest(),
+                source="pending_file_changes_summary",
+            )
 
     for rel_path in deletions:
         if not agent.config.can_delete():
             print_warn(f"Delete blocked (permission={perm}). Use /permission high.")
             break
         if logger:
-            logger.log_file_delete(rel_path)
+            target = (agent.indexer.root / rel_path).resolve()
+            try:
+                previous = target.read_text("utf-8") if target.exists() else None
+                existed = target.exists()
+            except OSError:
+                previous = None
+                existed = None
+            logger.log_file_delete(
+                rel_path,
+                previous_content=previous,
+                existed=existed,
+                source="pending_file_deletions_summary",
+            )
 
 
 def _stream_agent(
     agent: KratosAgent, task: str, logger: "SessionLogger",
     _ctx_state: "dict | None" = None,
     _active_role: "dict | None" = None,
+    _plan_state: "dict | None" = None,  # in/out: caller can pass a dict to receive final compact plan
 ) -> float:
     """Run the agent pipeline; stream output inline via console.print,
     with a `rich.Live` status bar pinned to the bottom for the duration.
@@ -112,6 +137,10 @@ def _stream_agent(
     verify_filter = _LineFilter()
     coder_think_filter = _LineFilter(style="dim italic")
 
+    # Live plan/todo state (compact) — updated from planner flush + change-aware coder events.
+    # Mirrors the ctx_live pattern so the bottom status bar can show it next to the live P/C/V stats.
+    plan_live: dict = {"done": 0, "total": 0, "compact": "", "label": ""}
+
     # Running completion-token estimate — Ollama only reports real counts at
     # the *end* of each model call (the "usage"/"ctx_info" events), so without
     # this the bar's ∑ and "%→compose" numbers would sit frozen mid-stream.
@@ -139,6 +168,7 @@ def _stream_agent(
             current_section=role,
             goal=agent.config.goal,
             hint="Ctrl+C to stop",
+            plan_state=dict(plan_live),  # compact live todo for the bottom bar (next to ctx stats)
         )
 
     def _smodel(role: str) -> str:
@@ -163,13 +193,14 @@ def _stream_agent(
     live.start()
     try:
         for source, content, kind in agent.process(task):
+            logger.log_agent_event(source, content, kind)
 
             if source == "log":
                 if logger.enabled:
                     try:
                         import json as _j
                         d = _j.loads(content); et = d.pop("type", "unknown")
-                        logger._write(et, **d)
+                        logger.log_event(et, **d)
                     except Exception:
                         pass
 
@@ -179,7 +210,17 @@ def _stream_agent(
                 logger.log_route(intent=kv.get("intent", ""), route=kv.get("route", ""))
 
             elif source == "tool":
-                console.print(f"  [dim blue]↳[/dim blue]  [dim]{content}[/dim]")
+                # Make the critical parts of a work step (search result, read range, write with deltas) very visible to the human.
+                # The model is supposed to do Search (with match count) → Read (lines X-Y) → Write (file + +/- lines) → Verify.
+                if content.startswith("write_file("):
+                    # Write command feedback must clearly show file + line deltas (user request).
+                    console.print(f"  [bold green]↳ WRITE[/bold green]  {content}")
+                elif content.startswith("read_file("):
+                    console.print(f"  [cyan]↳ READ[/cyan]  {content}")
+                elif content.startswith("inspect_result("):
+                    console.print(f"  [yellow]↳ INSPECT RESULT[/yellow]  {content}")
+                else:
+                    console.print(f"  [dim blue]↳[/dim blue]  [dim]{content}[/dim]")
                 _log_tool(content)
 
             elif source == "header":
@@ -223,7 +264,7 @@ def _stream_agent(
             elif source == "usage":
                 try:
                     import json as _j
-                    d = _j.loads(content); logger._write("token_usage", **d)
+                    d = _j.loads(content); logger.log_event("token_usage", **d)
                 except Exception:
                     pass
 
@@ -231,6 +272,18 @@ def _stream_agent(
                 sec_elapsed = time.monotonic() - section_start
                 if current_section == "planner":
                     planner_filter.flush()
+                    # Feed the live plan state for the bottom bar right after the (one-time) checklist print.
+                    try:
+                        from kratos.planning import parse_execution_plan, render_checklist
+                        p = parse_execution_plan(planner_buf or "")
+                        if p.items:
+                            done = sum(1 for it in p.items if it.status == "done")
+                            plan_live["done"] = done
+                            plan_live["total"] = len(p.items)
+                            plan_live["compact"] = render_checklist(p.items, compact=True)
+                            plan_live["label"] = f"PLAN {done}/{len(p.items)}"
+                    except Exception:
+                        pass
                 elif current_section == "verify":
                     verify_filter.flush()
                 elif current_section == "coder":
@@ -256,6 +309,35 @@ def _stream_agent(
             elif source == "info":
                 console.print(f"  [blue]ℹ[/blue]  [dim]{content}[/dim]")
                 logger.log_info(content)
+
+            elif source == "command":
+                # Prominent echo of the actual command the coder decided + runtime is running.
+                # Complements the model ### VERIFY lines (now printed by _CoderFilter) and the dim tool notes.
+                console.print(f"  [bold cyan]$[/bold cyan] {content}")
+                logger.log_info(f"command: {content}")
+
+            elif source == "plan_status":
+                # Compact live plan update (change-aware from coder loop or planner).
+                # We keep history clean — only a tiny note (or nothing). The real live view
+                # is in the bottom status bar (integrated with the ctx "live stats").
+                if content:
+                    # Parse the compact form we now receive: "PLAN d/t | compact text"
+                    try:
+                        label, rest = content.split(" | ", 1)
+                        plan_live["label"] = label.strip()
+                        plan_live["compact"] = rest.strip()
+                        # crude done/total from the label if present
+                        if "/" in label:
+                            nums = label.split()[-1]
+                            if "/" in nums:
+                                d, t = nums.split("/")
+                                plan_live["done"] = int(d)
+                                plan_live["total"] = int(t)
+                    except Exception:
+                        plan_live["compact"] = str(content)[:200]
+                # very quiet in transcript (no more full 20-item spam)
+                # console.print(f"  [dim]PLAN {plan_live.get('label','')}[/dim]")  # optional one-liner
+
 
             elif source == "warn":
                 console.print(f"  [yellow]⚠[/yellow]  {content}")
@@ -283,6 +365,20 @@ def _stream_agent(
                 console.print()
                 console.print(f"  [cyan]Kratos:[/cyan] {content}")
 
+            elif source == "report":
+                # Evidence-based final report from the Reporter (never free-form
+                # model text). Printed verbatim so the user sees real status,
+                # real file changes, real command results.
+                console.print()
+                try:
+                    from rich.markdown import Markdown
+                    from rich.panel import Panel
+                    console.print(Panel(Markdown(content), title="Abschlussbericht (evidenzbasiert)",
+                                        border_style="cyan"))
+                except Exception:
+                    console.print(content)
+                logger.log_info(f"final_report:\n{content}")
+
     except KeyboardInterrupt:
         console.print()
         console.print("[yellow]⚠[/yellow]  Interrupted.")
@@ -290,6 +386,10 @@ def _stream_agent(
         planner_filter.flush()
         verify_filter.flush()
         coder_think_filter.flush()
+        # Sync final compact plan back to caller so the next idle _BottomPanel toolbar
+        # (the info line with the live stats, above the input) can show it.
+        if _plan_state is not None:
+            _plan_state.update(plan_live)
         live.stop()
 
     _show_file_ops(agent, logger)
@@ -381,6 +481,7 @@ def main() -> None:
     }
     _active_role: dict[str, str] = {"role": ""}
     _last_task_s: float | None = None
+    _last_plan: dict = {"done": 0, "total": 0, "label": "", "compact": ""}  # compact live todo shown in the idle bottom info line (with the live stats)
 
     # ── live info content for the panel frame ─────────────────────────────────
     def _make_toolbar() -> list[tuple[str, str]]:
@@ -411,6 +512,16 @@ def main() -> None:
         _perm = config.permission
         _pc = {"low": "ansiyellow", "mid": "ansigreen", "high": "ansired"}.get(_perm, "ansigreen")
         out += [("", f"{project_root.name}  "), (f"{_pc} bold", _perm)]
+
+        # Compact live plan/todo in the same info line (the "über dem userinput mit den live stats").
+        # Populated from the last task's plan_live (updated during the rich bar + planner flush).
+        _plabel = (_last_plan or {}).get("label") or ""
+        _pcomp = (_last_plan or {}).get("compact") or ""
+        if _plabel or _pcomp:
+            out += [("", "  │  "), ("magenta", _plabel)]
+            if _pcomp:
+                short = _pcomp[:45] + ("…" if len(_pcomp) > 45 else "")
+                out += [("", " "), ("dim", short)]
 
         out.append(("", "  "))
         return out
@@ -457,7 +568,11 @@ def main() -> None:
         logger.log_input(line)
 
         try:
-            _last_task_s = _stream_agent(agent, line, logger, _ctx_state=_ctx_live, _active_role=_active_role)
+            _plan_holder = dict(_last_plan)  # mutable for the task
+            _last_task_s = _stream_agent(agent, line, logger, _ctx_state=_ctx_live, _active_role=_active_role, _plan_state=_plan_holder)
+            # Persist for the next idle prompt's toolbar (the line above the input with the live stats)
+            if _plan_holder.get("label") or _plan_holder.get("compact"):
+                _last_plan.update(_plan_holder)
         except Exception as exc:
             print_error(f"Agent error: {escape(str(exc))}")
             logger.log_error(str(exc))

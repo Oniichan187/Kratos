@@ -270,8 +270,15 @@ class _RoleRunnerMixin:
             "type": "model_input", "role": "planner",
             "model": self.config.planner_model,
             "num_ctx": num_ctx, "prompt_tokens_est": prompt_tok,
+            "num_predict": num_predict,
+            "temperature": self.config.planner_temp,
             "think": needs_thinking,
-        }), "log")
+            "keep_alive": keep_alive,
+            "system_prompt": prompt_msgs[0]["content"] if prompt_msgs else "",
+            "message": prompt_msgs[-1]["content"] if prompt_msgs else "",
+            "messages": prompt_msgs,
+            "history_message_count": max(0, len(prompt_msgs) - 2),
+        }, ensure_ascii=False), "log")
 
         thinking = ""
         full = ""
@@ -288,12 +295,24 @@ class _RoleRunnerMixin:
             ):
                 if kind == "think":
                     thinking += token
+                    yield ("log", json.dumps({
+                        "type": "model_stream", "role": "planner",
+                        "model": self.config.planner_model,
+                        "kind": "think", "token": token,
+                        "chars": len(token),
+                    }, ensure_ascii=False), "log")
                     yield ("planner", token, "think")   # stream so user sees progress
                 elif kind == "usage":
                     self._record_usage(token)
                     yield ("usage", token, "usage")
                 else:
                     full += token
+                    yield ("log", json.dumps({
+                        "type": "model_stream", "role": "planner",
+                        "model": self.config.planner_model,
+                        "kind": kind, "token": token,
+                        "chars": len(token),
+                    }, ensure_ascii=False), "log")
                     yield ("planner", token, kind)
         except KeyboardInterrupt:
             yield ("warn", "Planner interrupted.", "warn")
@@ -305,6 +324,20 @@ class _RoleRunnerMixin:
         # re-run immediately with think=False using the same prompt.
         if not full.strip() and needs_thinking:
             yield ("warn", "CoT used all token budget — retrying without chain-of-thought", "warn")
+            yield ("log", json.dumps({
+                "type": "model_input", "role": "planner",
+                "model": self.config.planner_model,
+                "num_ctx": num_ctx, "prompt_tokens_est": prompt_tok,
+                "num_predict": p.get_predict("plan"),
+                "temperature": self.config.planner_temp,
+                "think": False,
+                "keep_alive": keep_alive,
+                "retry": "no_think_after_empty_output",
+                "system_prompt": prompt_msgs[0]["content"] if prompt_msgs else "",
+                "message": prompt_msgs[-1]["content"] if prompt_msgs else "",
+                "messages": prompt_msgs,
+                "history_message_count": max(0, len(prompt_msgs) - 2),
+            }, ensure_ascii=False), "log")
             try:
                 for token, kind in self.bridge.chat(
                     model=self.config.planner_model,
@@ -321,15 +354,26 @@ class _RoleRunnerMixin:
                         yield ("usage", token, "usage")
                     elif kind != "think":
                         full += token
+                        yield ("log", json.dumps({
+                            "type": "model_stream", "role": "planner",
+                            "model": self.config.planner_model,
+                            "kind": kind, "token": token,
+                            "chars": len(token),
+                            "retry": "no_think_after_empty_output",
+                        }, ensure_ascii=False), "log")
                         yield ("planner", token, kind)
             except Exception as exc:
                 yield ("error", f"Planner no-think retry failed: {exc}", "error")
 
         if thinking:
             yield ("log", json.dumps({"type": "model_thinking", "role": "planner",
-                                       "chars": len(thinking)}), "log")
+                                       "model": self.config.planner_model,
+                                       "text": thinking,
+                                       "chars": len(thinking)}, ensure_ascii=False), "log")
         yield ("log", json.dumps({"type": "model_output", "role": "planner",
-                                   "chars": len(full)}), "log")
+                                   "model": self.config.planner_model,
+                                   "text": full,
+                                   "chars": len(full)}, ensure_ascii=False), "log")
 
         if not self._is_cancelled():
             self._planner_history.append({"role": "user",      "content": stored_msg})
@@ -355,7 +399,14 @@ class _RoleRunnerMixin:
             "type": "model_input", "role": "coder",
             "model": coder_model,
             "num_ctx": num_ctx, "prompt_tokens_est": prompt_tok,
-        }), "log")
+            "num_predict": p.get_predict("code"),
+            "temperature": self.config.coder_temp,
+            "think": False,
+            "system_prompt": prompt_msgs[0]["content"] if prompt_msgs else "",
+            "message": prompt_msgs[-1]["content"] if prompt_msgs else "",
+            "messages": prompt_msgs,
+            "history_message_count": max(0, len(prompt_msgs) - 2),
+        }, ensure_ascii=False), "log")
 
         full = ""
         try:
@@ -373,6 +424,12 @@ class _RoleRunnerMixin:
                     yield ("usage", token, "usage")
                 elif kind != "think":
                     full += token
+                    yield ("log", json.dumps({
+                        "type": "model_stream", "role": "coder",
+                        "model": coder_model,
+                        "kind": kind, "token": token,
+                        "chars": len(token),
+                    }, ensure_ascii=False), "log")
                     yield ("coder", token, kind)
         except KeyboardInterrupt:
             yield ("warn", "Coder interrupted.", "warn")
@@ -381,7 +438,9 @@ class _RoleRunnerMixin:
             yield ("error", f"Coder failed: {exc}", "error")
 
         yield ("log", json.dumps({"type": "model_output", "role": "coder",
-                                   "chars": len(full)}), "log")
+                                   "model": coder_model,
+                                   "text": full,
+                                   "chars": len(full)}, ensure_ascii=False), "log")
 
         if not self._is_cancelled():
             self._coder_history.append({"role": "user",      "content": stored_msg})
@@ -406,7 +465,15 @@ class _RoleRunnerMixin:
             "type": "model_input", "role": "verifier",
             "model": self.config.verifier_model, "num_ctx": num_ctx,
             "prompt_tokens_est": prompt_tok,
-        }), "log")
+            "num_predict": p.get_predict("verify"),
+            "temperature": self.config.verifier_temp,
+            "think": False,
+            "keep_alive": "0",
+            "system_prompt": prompt_msgs[0]["content"] if prompt_msgs else "",
+            "message": prompt_msgs[-1]["content"] if prompt_msgs else "",
+            "messages": prompt_msgs,
+            "history_message_count": max(0, len(prompt_msgs) - 2),
+        }, ensure_ascii=False), "log")
 
         full = ""
         try:
@@ -424,6 +491,12 @@ class _RoleRunnerMixin:
                     self._record_usage(token)
                 elif kind != "think":
                     full += token
+                    yield ("log", json.dumps({
+                        "type": "model_stream", "role": "verifier",
+                        "model": self.config.verifier_model,
+                        "kind": kind, "token": token,
+                        "chars": len(token),
+                    }, ensure_ascii=False), "log")
                     yield ("verify", token, kind)
         except KeyboardInterrupt:
             yield ("warn", "Verifier interrupted.", "warn")
@@ -433,5 +506,7 @@ class _RoleRunnerMixin:
             full = "NEEDS_REVISION: verifier error — treat as unverified"
 
         yield ("log", json.dumps({"type": "model_output", "role": "verifier",
-                                   "chars": len(full)}), "log")
+                                   "model": self.config.verifier_model,
+                                   "text": full,
+                                   "chars": len(full)}, ensure_ascii=False), "log")
         return full

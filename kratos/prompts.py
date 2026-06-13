@@ -34,9 +34,14 @@ _DEFAULT_JSON: Path = Path(__file__).with_name("prompts_default.json")
 
 
 def _load_json_safe(path: Path) -> dict:
-    """Load a JSON file; return {} on any error (missing, malformed, wrong type)."""
+    """Load a JSON file; return {} on any error (missing, malformed, wrong type).
+
+    Uses ``strict=False`` so hand-edited prompt files with literal control
+    characters (e.g. a raw newline inside a string) still load instead of
+    silently degrading the whole prompt/toolchain config to {}.
+    """
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"), strict=False)
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}

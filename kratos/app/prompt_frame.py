@@ -377,6 +377,25 @@ class _CoderFilter:
             self._in_code = not self._in_code
         elif self._in_summary and not self._in_code and s:
             console.print(f"  [dim]{s}[/dim]")
+        else:
+            # Print coder action commands (### VERIFY / RUN / READ / INSPECT / DONE) so they are visible
+            # to the user ("Befehle wirklich gedruckt"). Use tolerant check against current markers.
+            try:
+                from kratos.prompts import get_marker
+                vm = (get_marker("verify") or "### VERIFY:").rstrip(":") + ":"
+                rm = (get_marker("run") or "### RUN:").rstrip(":") + ":"
+                im = (get_marker("inspect") or "### INSPECT:").rstrip(":") + ":"
+                rdm = (get_marker("read") or "### READ:").rstrip(":") + ":"
+                donem = (get_marker("done") or "### DONE").rstrip(":")
+            except Exception:
+                vm, rm, im, rdm, donem = "### VERIFY:", "### RUN:", "### INSPECT:", "### READ:", "### DONE"
+            low = s.lower()
+            if low.startswith(vm.lower()) or low.startswith(rm.lower()):
+                console.print(f"  [cyan]↳[/cyan] {s}")
+            elif low.startswith(im.lower()) or low.startswith(rdm.lower()):
+                console.print(f"  [dim cyan]↳[/dim cyan] {s}")
+            elif low.startswith(donem.lower()):
+                console.print(f"  [green]↳[/green] {s}")
 
 
 # ── agent streaming ───────────────────────────────────────────────────────────

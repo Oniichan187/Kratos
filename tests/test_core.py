@@ -9,6 +9,7 @@ import sys
 import json
 import tempfile
 import threading
+import time
 import types
 import unittest
 import inspect
@@ -217,6 +218,67 @@ class TestPromptContextGuard(unittest.TestCase):
         self.assertNotIn("small_project_full_pass", process_src)
         self.assertNotIn("Small project detected; using full-pass", process_src)
 
+    def test_knowledge_bootstrap_rebuilds_only_when_empty(self):
+        agent = self._agent()
+
+        class FakeKnowledge:
+            def __init__(self, chunks):
+                self._chunks = chunks
+                self.rebuild_calls = []
+
+            def status(self):
+                return {"chunks": self._chunks}
+
+            def rebuild(self, force=False):
+                self.rebuild_calls.append(force)
+                self._chunks = 17
+                return 17
+
+        empty = FakeKnowledge(0)
+        agent._knowledge = empty
+        self.assertEqual(agent._knowledge_chunk_count(), 0)
+        self.assertEqual(agent._ensure_knowledge_bootstrap(), 17)
+        self.assertEqual(empty.rebuild_calls, [False])
+
+        ready = FakeKnowledge(9)
+        agent._knowledge = ready
+        self.assertEqual(agent._knowledge_chunk_count(), 9)
+        self.assertEqual(agent._ensure_knowledge_bootstrap(), 9)
+        self.assertEqual(ready.rebuild_calls, [])
+
+    def test_role_runner_logs_full_model_payloads(self):
+        class FakeBridge:
+            def chat(self, **kwargs):
+                yield ("alpha", "text")
+                yield ("beta", "text")
+                yield (json.dumps({
+                    "prompt_tokens": 3,
+                    "completion_tokens": 2,
+                    "total_tokens": 5,
+                }), "usage")
+
+        agent = KratosAgent(
+            KratosConfig(auto_compress=False, enable_semantic_retrieval=False),
+            FakeBridge(),
+        )
+        events, value = drain_generator(agent._run_coder("unique-user-message"))
+        self.assertEqual(value, "alphabeta")
+
+        payloads = [
+            json.loads(content)
+            for source, content, _kind in events
+            if source == "log"
+        ]
+        model_input = next(item for item in payloads if item["type"] == "model_input")
+        model_output = next(item for item in payloads if item["type"] == "model_output")
+        model_stream = [item for item in payloads if item["type"] == "model_stream"]
+
+        self.assertEqual(model_input["role"], "coder")
+        self.assertIn("messages", model_input)
+        self.assertEqual(model_input["messages"][-1]["content"], "unique-user-message")
+        self.assertEqual(model_output["text"], "alphabeta")
+        self.assertEqual([item["token"] for item in model_stream], ["alpha", "beta"])
+
 
 class TestOllamaBridgeCancel(unittest.TestCase):
     def test_cancel_active_closes_current_response(self):
@@ -329,6 +391,29 @@ class TestExecutionPlanHelpers(unittest.TestCase):
         self.assertIn("kratos/roles/coder.py", plan.items[0].file_refs)
         self.assertEqual(plan.items[0].verify_cmd, "python -m pytest tests/test_core.py")
 
+    def test_parse_execution_plan_execution_order_fallback(self):
+        markdown = (
+            "## Summary\n"
+            "- Goal\n\n"
+            "## Execution Order\n"
+            "1. First fix kratos/app/tui.py\n"
+            "2. Then update kratos/prompts_default.json\n"
+        )
+        plan = parse_execution_plan(markdown)
+        self.assertEqual(len(plan.items), 2)
+        self.assertEqual(plan.items[0].title, "First fix kratos/app/tui.py")
+        self.assertIn("kratos/app/tui.py", plan.items[0].file_refs)
+
+    def test_planner_prompt_requires_order_files_and_verification_sections(self):
+        prompts = load_prompts()
+        text = prompts.get_system("planner")
+        self.assertIn("## Execution Order", text)
+        self.assertIn("## Success Criteria", text)
+        self.assertIn("## Risks", text)
+        self.assertIn("## Files", text)
+        self.assertIn("## Verification", text)
+        self.assertIn("## CHECKLIST", text)
+
     def test_render_checklist_and_status(self):
         plan = ExecutionPlan(
             markdown="## CHECKLIST\n- First\n- Second",
@@ -430,6 +515,92 @@ class TestExecutionPlanHelpers(unittest.TestCase):
         self.assertIn("C ", rendered)
         self.assertNotIn("P ", rendered)
         self.assertNotIn("V ", rendered)
+
+    def test_plan_box_limits_to_five_lines_and_shows_overflow(self):
+        app = object.__new__(KratosApp)
+        app._busy = True
+        app._task_start = 0.0
+        app._last_task_s = None
+        app._ctx_live = {"planner": (0, 40960), "coder": (2048, 65536), "verifier": (0, 40960)}
+        app._current_section = "coder"
+        app._plan_state = ExecutionPlan(
+            markdown="## CHECKLIST\n- One\n- Two\n- Three\n- Four\n- Five\n- Six",
+            items=[
+                PlanItem(index=i + 1, title=f"Item {i + 1}", status="pending")
+                for i in range(6)
+            ],
+        )
+        app._plan_proof = ProvenWork(iteration=0)
+        app._plan_done_at = {}
+        app._plan_last_status = {}
+        app.kratos_config = KratosConfig(always_max_ctx=False, permission="mid")
+        app.project_root = Path("demo")
+
+        text = KratosApp._plan_box_text(app)
+        lines = text.plain.splitlines()
+        self.assertLessEqual(len(lines), 5)
+        self.assertIn("PLAN", lines[0])
+        self.assertIn("more items", lines[-1])
+
+    def test_plan_box_hides_done_items_after_delay(self):
+        app = object.__new__(KratosApp)
+        app._busy = True
+        app._task_start = 0.0
+        app._last_task_s = None
+        app._ctx_live = {"planner": (0, 40960), "coder": (2048, 65536), "verifier": (0, 40960)}
+        app._current_section = "coder"
+        app._plan_state = ExecutionPlan(
+            markdown="## CHECKLIST\n- One",
+            items=[PlanItem(index=1, title="One", status="done")],
+        )
+        app._plan_proof = ProvenWork(iteration=0)
+        app._plan_done_at = {1: time.monotonic() - 6.0}
+        app._plan_last_status = {1: "done"}
+        app.kratos_config = KratosConfig(always_max_ctx=False, permission="mid")
+        app.project_root = Path("demo")
+
+        visible = KratosApp._plan_visible_items(app)
+        self.assertEqual(visible, [])
+        text = KratosApp._plan_box_text(app)
+        self.assertIn("all checklist items completed", text.plain)
+
+    def test_tui_layout_reserves_fixed_plan_box_band(self):
+        css = KratosApp.CSS
+        self.assertIn("#status_footer_row", css)
+        self.assertIn("#plan_box_row", css)
+        self.assertIn("height: 5;", css)
+        self.assertIn("min-height: 5;", css)
+        self.assertIn("max-height: 16;", css)
+        self.assertLess(css.index("#status_footer_row"), css.index("#plan_box_row"))
+        self.assertLess(css.index("#plan_box_row"), css.index("#input_row"))
+
+    def test_planner_buffer_syncs_live_plan_box_before_end(self):
+        app = object.__new__(KratosApp)
+        app._planner_buf = (
+            "## Summary\n"
+            "- Goal\n\n"
+            "## Execution Order\n"
+            "1. First fix kratos/app/tui.py\n"
+            "2. Then update kratos/prompts_default.json\n"
+        )
+        app._plan_state = None
+        app._plan_source_text = ""
+        app._plan_done_at = {}
+        app._plan_last_status = {}
+        app._busy = False
+        app._current_section = "planner"
+        app._ctx_live = {"planner": (0, 40960), "coder": (0, 65536), "verifier": (0, 40960)}
+        app._task_start = 0.0
+        app._last_task_s = None
+        app.kratos_config = KratosConfig(always_max_ctx=False, permission="mid")
+        app.project_root = Path("demo")
+        app._refresh_plan_box = lambda: None
+
+        KratosApp._sync_plan_from_planner_buffer(app)
+        self.assertIsNotNone(app._plan_state)
+        self.assertGreaterEqual(len(app._plan_state.items), 2)
+        rendered = KratosApp._plan_box_text(app).plain
+        self.assertIn("First fix kratos/app/tui.py", rendered)
 
 
 class TestPlannerArtifacts(unittest.TestCase):
@@ -805,6 +976,38 @@ def add(a, b):
             self.assertIn("return a - b", agent.prompts[2])
             self.assertIn("CODER LOOP ITERATION 3", transcript)
             self.assertTrue(any("converged" in ev[1] for ev in events if ev[0] == "info"))
+
+    def test_loop_runs_unbounded_when_max_iterations_is_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            reg = CommandRegistry(KratosConfig(always_max_ctx=False), root).discover()
+            outputs = [
+                "### VERIFY: python -m pytest tests",
+                "### VERIFY: python -m pytest tests",
+                "### VERIFY: python -m pytest tests",
+                "### VERIFY: python -m pytest tests",
+                "### VERIFY: python -m pytest tests",
+                "### VERIFY: python -m pytest tests",
+                "### DONE",
+            ]
+            results = [
+                {"exit_code": 0, "duration_seconds": 0.01, "output": "1 passed"},
+                {"exit_code": 0, "duration_seconds": 0.01, "output": "1 passed"},
+                {"exit_code": 0, "duration_seconds": 0.01, "output": "1 passed"},
+                {"exit_code": 0, "duration_seconds": 0.01, "output": "1 passed"},
+                {"exit_code": 0, "duration_seconds": 0.01, "output": "1 passed"},
+                {"exit_code": 0, "duration_seconds": 0.01, "output": "1 passed"},
+            ]
+            agent = self.FakeAgent(root, outputs, results, max_coder_iterations=0)
+            proof = ProvenWork(iteration=1)
+
+            events, _ = drain_generator(run_coder_loop(
+                agent, "fix", "## CHECKLIST\n- First\n", None, Intent.CODING, Route.PLANNER_THEN_CODER,
+                self._ctx(), reg, proof, 0, "", root, {},
+            ))
+            self.assertEqual(len(agent.prompts), 7)
+            self.assertFalse(any("max_coder_iterations=" in ev[1] for ev in events if ev[0] == "warn"))
 
     def test_loop_honors_max_iterations_without_done(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1470,6 +1673,16 @@ class TestPromptManager(unittest.TestCase):
         self.assertNotIn("prefer pytest, cargo test", p)
         # New toolchain-neutral instruction must be present
         self.assertIn("project's real", p.lower())
+
+    def test_planner_prompt_uses_markdown_template_with_checklist(self):
+        p = DEFAULT_PROMPTS.get("planner_system", "")
+        self.assertIn("## Summary", p)
+        self.assertIn("## Key Changes", p)
+        self.assertIn("## Test Plan", p)
+        self.assertIn("## Assumptions", p)
+        self.assertIn("## CHECKLIST", p)
+        self.assertIn("File:", p)
+        self.assertIn("VERIFY:", p)
 
     def test_coder_prompt_no_pytest_example(self):
         """coder_system must not use pytest as the canonical STEP_VERIFY example."""

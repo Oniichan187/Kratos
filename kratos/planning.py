@@ -12,6 +12,10 @@ _CHECKLIST_HEADING_RE = re.compile(
     r"^\s*#{1,3}\s*(?:user\s+)?(?:plan\s+)?(?:check\s*list|checklist|todo|to\s*do|tasks?)\b",
     re.I,
 )
+_EXECUTION_ORDER_HEADING_RE = re.compile(
+    r"^\s*#{1,3}\s*(?:user\s+)?(?:plan\s+)?(?:execution\s+order|implementation\s+order|order\s+of\s+work|workflow|steps?)\b",
+    re.I,
+)
 _NEXT_SECTION_RE = re.compile(r"^\s*#{1,3}\s+\S")
 _ITEM_START_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)]|[□☐☑☒])\s*(.+?)\s*$")
 _FIELD_RE = re.compile(r"^\s*(?:[-*+]\s*)?(File|Files?|VERIFY|RUN|STEP_VERIFY|Details?)\s*:\s*(.+?)\s*$", re.I)
@@ -77,11 +81,11 @@ def _make_item(index: int, title: str, details: str = "") -> PlanItem:
     )
 
 
-def _collect_checklist_lines(markdown: str) -> list[str]:
+def _collect_section_lines(markdown: str, heading_re: re.Pattern[str]) -> list[str]:
     lines = markdown.splitlines()
     start = None
     for idx, raw in enumerate(lines):
-        if _CHECKLIST_HEADING_RE.match(raw):
+        if heading_re.match(raw):
             start = idx + 1
             break
     if start is None:
@@ -95,8 +99,8 @@ def _collect_checklist_lines(markdown: str) -> list[str]:
     return collected
 
 
-def _parse_explicit_checklist(markdown: str) -> list[PlanItem]:
-    section = _collect_checklist_lines(markdown)
+def _parse_section_items(markdown: str, heading_re: re.Pattern[str]) -> list[PlanItem]:
+    section = _collect_section_lines(markdown, heading_re)
     if not section:
         return []
 
@@ -134,16 +138,50 @@ def _parse_explicit_checklist(markdown: str) -> list[PlanItem]:
     return items
 
 
+def _parse_explicit_checklist(markdown: str) -> list[PlanItem]:
+    return _parse_section_items(markdown, _CHECKLIST_HEADING_RE)
+
+
+def _parse_execution_order(markdown: str) -> list[PlanItem]:
+    return _parse_section_items(markdown, _EXECUTION_ORDER_HEADING_RE)
+
+
+def _clean_item_title(title: str) -> str:
+    """Strip markdown bold/backticks the planner wraps around item titles."""
+    t = title.strip()
+    if t.startswith("**") and t.endswith("**") and len(t) > 4:
+        t = t[2:-2]
+    return t.strip().strip("`").strip()
+
+
+def _dedupe_items(items: list[PlanItem]) -> list[PlanItem]:
+    """Drop checklist items with identical normalized titles (planners often
+    repeat e.g. 'Tests ausführen' twice); reindex the survivors."""
+    seen: set[str] = set()
+    unique: list[PlanItem] = []
+    for item in items:
+        key = " ".join(_clean_item_title(item.title).lower().split())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        item.title = _clean_item_title(item.title)
+        item.index = len(unique) + 1
+        unique.append(item)
+    return unique
+
+
 def parse_execution_plan(markdown: str) -> ExecutionPlan:
     """Parse a detailed planner markdown response into structured checklist items."""
     markdown = markdown or ""
     items = _parse_explicit_checklist(markdown)
     if not items:
+        items = _parse_execution_order(markdown)
+    if not items:
         steps = _extract_plan_steps(markdown)
         items = [_make_item(i + 1, step, step) for i, step in enumerate(steps)]
     if not items and markdown.strip():
         items = [_make_item(1, markdown.strip()[:120], markdown.strip())]
-    return ExecutionPlan(markdown=markdown, items=items)
+    return ExecutionPlan(markdown=markdown, items=_dedupe_items(items))
 
 
 def render_checklist(items: list[PlanItem], *, compact: bool = True) -> str:
@@ -197,7 +235,7 @@ def refresh_plan_status(plan: ExecutionPlan, proof, touched_paths: list[str] | N
             wanted = " ".join(item.verify_cmd.split()).lower()
             for cmd in commands:
                 cmd_text = " ".join(str(cmd.get("cmd", "")).split()).lower()
-                if cmd_text == wanted and int(cmd.get("exit_code", 1)) == 0:
+                if (cmd_text == wanted or (wanted and wanted in cmd_text)) and int(cmd.get("exit_code", 1)) == 0:
                     verify_ok = True
                     matched_cmd = str(cmd.get("cmd", ""))
                     break
@@ -207,7 +245,12 @@ def refresh_plan_status(plan: ExecutionPlan, proof, touched_paths: list[str] | N
                     verify_ok = True
                     matched_cmd = str(cmd.get("cmd", ""))
                     break
-        if file_ok and verify_ok:
+        # An item may only be auto-completed if there is at least ONE form of
+        # evidence to evaluate (a file to touch or a verify command). Without
+        # that, file_ok and verify_ok both default to True and a vague item
+        # ("understand the codebase") would be marked done with zero evidence.
+        has_evidence = bool(file_refs) or bool(item.verify_cmd)
+        if has_evidence and file_ok and verify_ok:
             item.status = "done"
             if matched_cmd and matched_cmd not in item.evidence:
                 item.evidence.append(matched_cmd)
@@ -219,6 +262,17 @@ def refresh_plan_status(plan: ExecutionPlan, proof, touched_paths: list[str] | N
                 item.status = "in_progress"
         elif item.status == "done":
             item.status = "done"
+
+        # Extra: if files for this item were touched and we have *any* passing test command
+        # in this proof, consider it done (helps checklist items that don't list an explicit
+        # VERIFY: or when the coder used a close variant). This reduces "stuck on same file".
+        if item.status != "done" and file_refs and any(ref in touched or ref in changed for ref in file_refs):
+            any_passing_test = any(
+                int(c.get("exit_code", 1)) == 0 and c.get("is_test")
+                for c in commands
+            )
+            if any_passing_test:
+                item.status = "done"
     return plan
 
 

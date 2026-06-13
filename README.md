@@ -137,10 +137,12 @@ Coder arbeitet in einem echten OBSERVE -> ACT Loop:
 
 1. Planner liefert einen ausführlichen Markdown-Plan plus die sichtbare Checkliste.
 2. Der Coder kann pro Turn mehrere Marker kombinieren:
-   - `### READ` für on-disk Inhalte
+   - `### READ` für on-disk Inhalte, `### READ_RANGE: pfad:start-ende` für exakte Zeilenbereiche
+   - `### SEARCH` (literal), `### GREP` (Regex), `### GLOB` (Dateinamen) — Treffer mit `datei:zeile:spalte`
    - `### INSPECT` für read-only Shell-Diagnose (`rg`, `Get-Content`, `git diff`, ...)
    - `### FILE` / `### DELETE` für Änderungen
    - `### VERIFY` / `### RUN` für sichere Build-/Test-Kommandos
+   - `### WEB_SEARCH` / `### WEB_FETCH` für Doku-/Fehler-Recherche (Quellen → `.kratos/research.jsonl`)
    - `### DONE` erst nach echtem Erfolg
 3. Kratos gibt nach jedem Turn eine Observation zurück und der Coder reagiert auf das reale Ergebnis.
 4. Der Loop läuft bis alle Checklist-Punkte erledigt sind oder das Iterationslimit erreicht ist.
@@ -152,6 +154,21 @@ PROVEN_WORK bleibt streng:
 - Fehlt ein Test oder schlägt einer fehl → NEEDS_REVISION, auch wenn das Modell schon fertig klingt.
 
 UNSOLVABLE → kompletter Rollback der in dieser Runde geschriebenen Dateien.
+
+### Anti-Fake-Erfolg-Garantien (Real-File-Change-Gate + Reporter)
+
+Kratos kann nicht mehr „erfolgreich klingen", ohne gearbeitet zu haben:
+
+- Vor dem Verifier prüft `verify_files_changed()` per Hash-Vergleich (Snapshot ↔ Disk),
+  ob wirklich etwas geändert wurde. No-op-Rewrites zählen nicht.
+- Verlangt die Aufgabe Codeänderungen und `files_changed` ist real leer →
+  automatischer Rücksprung in die Implementierung; nach max Retries → **FAILED**
+  mit der Meldung „Keine echten Dateiänderungen erkannt".
+- Der Abschlussbericht (`kratos/reporter.py`) wird nur aus Evidenz gebaut:
+  Teststatus nur aus echten Exitcodes („Tests nicht ausgeführt" statt erfundener Erfolge),
+  Diff nur aus `git diff --stat` bzw. Hash-Abgleich — nie erfunden.
+
+Details: `docs/agent_architecture.md`, `docs/tools.md`, `docs/safety.md`, `docs/verification.md`.
 
 Wenn keine Tests auto-entdeckt werden:
 

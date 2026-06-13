@@ -21,6 +21,7 @@ _MODEL_MAX_CTX: dict[str, int] = {
     "huihui_ai/qwen3.5-abliterated:4B":     262144,  # tag alias
     "huihui_ai/qwen3-abliterated:4b":       40960,
     "huihui_ai/qwen2.5-coder-abliterate:7b": 32768,
+    "huihui_ai/qwen2.5-coder-abliterate:7b-instruct-q4_k_m": 32768,
     "qwen3:4b":                              262144,
     "kratos-planner":                        131072,
     "kratos-planner:latest":                 131072,

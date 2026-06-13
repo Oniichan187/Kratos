@@ -30,14 +30,14 @@ _KRATOS_INSTALL_DIR = Path(__file__).resolve().parents[1]
 # (RTX 4050 6 GB class, sequential loading only — never all in VRAM at once).
 # Each role uses the *best suitable* abliterated model for its job:
 #   Planner   : strong reasoning + CoT (8b class, 40k native)
-#   Coder     : huge context (262k) + solid coding, small enough for laptop
+#   Coder     : dedicated code model, abliterated — best coding quality (32k native)
 #   Verifier  : same strong reasoning as planner (strict PROVEN_WORK judge)
 #   Compressor: tiny but faithful summarizer/memory extractor (Phi-4-mini ablit)
 PLANNER_MODEL_NAME  = "huihui_ai/qwen3-abliterated:8b"
-CODER_MODEL_NAME    = "huihui_ai/qwen3.5-abliterated:4b"
+CODER_MODEL_NAME    = "huihui_ai/qwen2.5-coder-abliterate:7b-instruct-q4_K_M"
 VERIFIER_MODEL_NAME = "huihui_ai/qwen3-abliterated:8b"
 COMPRESSOR_MODEL    = "kratos-planner"         # Phi-4-mini-instruct-abliterated GGUF
-FALLBACK_CODER_MODEL = "huihui_ai/qwen2.5-coder-abliterate:7b"
+FALLBACK_CODER_MODEL = "huihui_ai/qwen3.5-abliterated:4b"
 ALT_PLANNER_MODEL   = "huihui_ai/qwen3-abliterated:8b"
 
 # GGUF for kratos-planner (Phi-4-mini-abliterated) — relative to install dir
@@ -86,7 +86,7 @@ class KratosConfig:
     # and for the coder/verifier to see complete plans + full file state + memory.
     # choose_num_ctx(..., force_max_context=True) implements this.
     planner_num_ctx:    int = 40960    # full max for huihui_ai/qwen3-abliterated:8b
-    coder_num_ctx:      int = 262144   # full max for huihui_ai/qwen3.5-abliterated:4b (huge-repo hero)
+    coder_num_ctx:      int = 32768    # full max for huihui_ai/qwen2.5-coder-abliterate:7b (verified)
     verifier_num_ctx:   int = 40960    # full max — same strong ablit model as planner
     compressor_num_ctx: int = 32768    # generous for kratos-planner (Phi-4-mini-abliterated). Use its real max when known
     relay_num_ctx:      int = 131072   # coder relay gets big window for giant inputs before planner sees them
@@ -131,15 +131,27 @@ class KratosConfig:
     require_proven_work:        bool = True
     require_test_for_verified:  bool = True
     verification_timeout_seconds: int = 120
+    # Repair-loop stall guard: after this many identical failure signatures the
+    # agent escalates the diagnosis instead of re-running the same dead end
+    # (motivated by the 94×-identical-pytest-failure session 2026-06-13).
+    repair_stall_threshold:     int = 2
+    # Restore pre-existing test files before the authoritative verification so a
+    # weak model cannot make tests pass by weakening them (it may still add new
+    # tests). A green result then means the ORIGINAL tests pass.
+    protect_existing_tests:     bool = True
 
     # ── Adaptive ReAct coder action-loop ─────────────────────────────────────
     # coder_loop: when True (default), the coder runs as an observe->act loop
     # (writes/reads/runs commands, ingests real results, iterates until a test
     # passes and it signals ### DONE) instead of the rigid per-step driver.
     # max_coder_iterations bounds that loop so a non-converging model still
-    # falls through to the existing verifier + outer retry.
+    # falls through to the existing verifier + outer retry. Set to <= 0 for
+    # an unbounded loop that ends only on ### DONE / cancel / outer abort.
     coder_loop:            bool = True
-    max_coder_iterations:  int = 6
+    max_coder_iterations:  int = 0
+    # Max model micro-turns per structured work-step checklist item before the
+    # driver moves on (the outer verify loop will retry unfinished items).
+    max_work_step_turns:   int = 4
 
     # ── Persistence ───────────────────────────────────────────────────────────
     # Prompts are loaded independently via kratos/prompts.py (same GLOBAL_DIR / _project_dir pattern).

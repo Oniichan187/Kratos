@@ -22,11 +22,20 @@ def _marker_pattern(marker: str) -> str:
     return rf"{escaped}\s*:?"
 
 
+# Between the "### FILE: <path>" line and the opening code fence, small local
+# models often emit 1-2 annotation lines such as "*(full file content ...)*".
+# The pattern tolerates up to 3 such non-fence, non-marker lines so those
+# implementations are not silently dropped (the exact failure seen in real
+# session logs). Lines starting a new ### marker are never skipped, so a
+# malformed FILE marker cannot swallow the next marker's code fence.
+_JUNK_LINES = r'(?:[ \t]*(?!```|###)[^\r\n]*\r?\n){0,3}?'
+
+
 def _get_file_change_re():
     pm = load_prompts()
     fm = _marker_pattern(pm.get_marker("file") or "### FILE:")
     return re.compile(
-        rf'^\s*{fm}\s*([^\r\n]+?)\s*\r?\n```(?:\w+)?[^\S\r\n]*\r?\n(.*?)^```\s*$',
+        rf'^\s*{fm}\s*([^\r\n]+?)[ \t]*\r?\n{_JUNK_LINES}[ \t]*```(?:\w+)?[^\S\r\n]*\r?\n(.*?)^[ \t]*```\s*$',
         re.S | re.M | re.I,
     )
 
@@ -39,22 +48,37 @@ def _get_file_delete_re():
 
 # Fallback module-level compiled (using defaults at import time)
 _FILE_CHANGE_RE = re.compile(
-    r'^\s*###\s+FILE\s*:?\s*([^\r\n]+?)\s*\r?\n```(?:\w+)?[^\S\r\n]*\r?\n(.*?)^```\s*$',
+    r'^\s*###\s+FILE\s*:?\s*([^\r\n]+?)[ \t]*\r?\n'
+    + _JUNK_LINES +
+    r'[ \t]*```(?:\w+)?[^\S\r\n]*\r?\n(.*?)^[ \t]*```\s*$',
     re.S | re.M | re.I,
 )
 _FILE_DELETE_RE = re.compile(r'^\s*###\s+DELETE\s*:?\s*(.+?)\s*$', re.M | re.I)
 
 
+def _clean_file_path(path: str) -> str:
+    """Strip markdown decoration models wrap around paths: backticks, bold
+    asterisks, trailing annotations like '(updated)'."""
+    path = path.strip().strip('`').strip()
+    # `**path**` bold markers — but never break a leading '**/' glob
+    if path.startswith("**") and not path.startswith("**/"):
+        path = path[2:]
+    if path.endswith("**") and not path.endswith("/**"):
+        path = path[:-2]
+    path = path.strip().strip('`').strip()
+    path = re.sub(r'\s+\((?:updated|modified|new)\)\s*$', '', path, flags=re.I)
+    path = re.sub(
+        r'(\.[A-Za-z0-9][A-Za-z0-9._-]*)\s+\([^/\r\n]*\)\s*$',
+        r'\1',
+        path,
+    )
+    return path.strip()
+
+
 def _parse_file_changes(text: str) -> list[tuple[str, str]]:
     changes: list[tuple[str, str]] = []
     for m in _get_file_change_re().finditer(text):
-        path = m.group(1).strip()
-        path = re.sub(r'\s+\((?:updated|modified|new)\)\s*$', '', path, flags=re.I)
-        path = re.sub(
-            r'(\.[A-Za-z0-9][A-Za-z0-9._-]*)\s+\([^/\r\n]*\)\s*$',
-            r'\1',
-            path,
-        )
+        path = _clean_file_path(m.group(1))
         if not path or any(ch in path for ch in "\r\n`<>"):
             continue
         changes.append((path, m.group(2)))
@@ -62,4 +86,4 @@ def _parse_file_changes(text: str) -> list[tuple[str, str]]:
 
 
 def _parse_file_deletions(text: str) -> list[str]:
-    return [m.group(1).strip() for m in _get_file_delete_re().finditer(text)]
+    return [_clean_file_path(m.group(1)) for m in _get_file_delete_re().finditer(text)]

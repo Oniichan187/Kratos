@@ -20,6 +20,10 @@ class VerificationCommand:
     purpose: str
     source: str
     is_test: bool
+    # Optional working directory RELATIVE to the project root. Needed for
+    # nested project layouts (e.g. the actual Python package lives in
+    # `starter_project/` below the folder Kratos was started in).
+    cwd: str | None = None
 
 
 @dataclass
@@ -101,9 +105,13 @@ def _compile_check_cmds(toolchains: set[str], root: Path) -> list[VerificationCo
 
 def _clean_command_line(line: str) -> str:
     s = line.strip()
+    # strip markdown decoration: `cmd`, **cmd**, *(comment)* suffixes
+    s = s.strip("`").strip()
+    if s.startswith("**") and s.endswith("**") and len(s) > 4:
+        s = s[2:-2].strip()
     s = re.sub(r"^(?:PS>|\$|>|#)\s*", "", s)
     s = s.split(" #", 1)[0].strip()
-    return s
+    return s.strip("`").strip()
 
 
 _CMD_PATH_TOKEN_RE = re.compile(r'[^\s"\']+[/\\][^\s"\']*\.[a-zA-Z][a-zA-Z0-9]{0,8}')
@@ -225,25 +233,44 @@ def _is_noise_path(path: Path) -> bool:
     return bool(parts & {".git", ".svn", ".hg", "node_modules", ".venv", "venv", "bin", "obj", "dist", "build", "target"})
 
 
+def _candidate_project_dirs(root: Path) -> list[Path]:
+    """Root plus its immediate non-noise subdirectories.
+
+    Real-world layouts often nest the actual project one level below the
+    folder the agent was started in (e.g. ``starter_project/pyproject.toml``).
+    Without this, command discovery finds nothing and no test ever runs.
+    """
+    dirs: list[Path] = [root]
+    try:
+        for child in sorted(root.iterdir()):
+            if child.is_dir() and not child.name.startswith(".") and not _is_noise_path(child):
+                dirs.append(child)
+    except OSError:
+        pass
+    return dirs
+
+
 def _detect_project_toolchains(root: Path) -> set[str]:
-    """Return the build/test toolchains actually present in the project root."""
+    """Return the build/test toolchains present in the project root or one
+    level below it (nested starter-project layouts)."""
     toolchains: set[str] = set()
-    if any((root / n).exists() for n in ("pyproject.toml", "setup.py", "setup.cfg", "pytest.ini")):
-        toolchains.add("python")
-    elif (root / "tests").is_dir() or any(root.glob("test_*.py")):
-        toolchains.add("python")
-    if any(root.glob("*.sln")) or any(root.rglob("*.csproj")):
-        toolchains.add("dotnet")
-    if (root / "package.json").exists():
-        toolchains.add("node")
-    if (root / "Cargo.toml").exists():
-        toolchains.add("cargo")
-    if (root / "go.mod").exists():
-        toolchains.add("go")
-    if (root / "pom.xml").exists():
-        toolchains.add("maven")
-    if (root / "build.gradle").exists() or (root / "build.gradle.kts").exists():
-        toolchains.add("gradle")
+    for d in _candidate_project_dirs(root):
+        if any((d / n).exists() for n in ("pyproject.toml", "setup.py", "setup.cfg", "pytest.ini")):
+            toolchains.add("python")
+        elif (d / "tests").is_dir() or any(d.glob("test_*.py")):
+            toolchains.add("python")
+        if any(d.glob("*.sln")) or (d is root and any(d.rglob("*.csproj"))):
+            toolchains.add("dotnet")
+        if (d / "package.json").exists():
+            toolchains.add("node")
+        if (d / "Cargo.toml").exists():
+            toolchains.add("cargo")
+        if (d / "go.mod").exists():
+            toolchains.add("go")
+        if (d / "pom.xml").exists():
+            toolchains.add("maven")
+        if (d / "build.gradle").exists() or (d / "build.gradle.kts").exists():
+            toolchains.add("gradle")
     return toolchains
 
 
@@ -271,10 +298,10 @@ def _command_toolchain(cmd: str) -> str | None:
 
 
 def _dedupe_verification_commands(commands: list[VerificationCommand]) -> list[VerificationCommand]:
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
     unique: list[VerificationCommand] = []
     for item in commands:
-        key = " ".join(item.cmd.split()).lower()
+        key = (" ".join(item.cmd.split()).lower(), (getattr(item, "cwd", None) or ""))
         if key in seen:
             continue
         seen.add(key)
@@ -339,6 +366,23 @@ def _infer_project_verification_commands(root: Path) -> list[VerificationCommand
     has_python_tests = (root / "tests").exists() or any(root.glob("test_*.py"))
     if has_python_project and has_python_tests:
         commands.append(VerificationCommand("python -m pytest tests", "python pytest verification", "python", True))
+    else:
+        # Nested layout: the actual Python project lives one level below the
+        # agent's working root (e.g. starter_project/pyproject.toml). Run
+        # pytest with that subdirectory as working directory so package
+        # imports resolve exactly like `cd <subdir>; python -m pytest`.
+        for d in _candidate_project_dirs(root):
+            if d == root:
+                continue
+            sub_proj = any((d / n).exists() for n in ("pyproject.toml", "setup.py", "setup.cfg", "pytest.ini"))
+            sub_tests = (d / "tests").exists() or any(d.glob("test_*.py"))
+            if sub_proj and sub_tests:
+                rel = d.relative_to(root).as_posix()
+                commands.append(VerificationCommand(
+                    "python -m pytest", f"python pytest verification (in {rel}/)",
+                    rel, True, cwd=rel,
+                ))
+                break
 
     if (root / "Cargo.toml").exists():
         commands.append(VerificationCommand("cargo test", "cargo test verification", "cargo", True))
@@ -406,9 +450,16 @@ def _format_proven_work_feedback(proof: ProvenWork, require_test: bool = True) -
     failed = [item for item in proof.commands if item.get("exit_code") != 0]
     if failed:
         item = failed[-1]
+        # Turn the raw traceback into an explicit, actionable instruction. Weak
+        # local models cannot reliably act on a bare traceback (the 94×-pytest
+        # session proved that) — a named diagnosis + required fix converges them.
+        from .execution.diagnostics import diagnose_command
+        diag = diagnose_command(item)
+        diag_block = f"\n\n{diag.as_feedback()}" if diag else ""
         return (
-            f"PROVEN_WORK failed: command `{item.get('cmd')}` exited with {item.get('exit_code')}.\n"
-            f"{str(item.get('output', ''))[-3000:]}"
+            f"PROVEN_WORK failed: command `{item.get('cmd')}` exited with {item.get('exit_code')}."
+            f"{diag_block}\n\n--- raw output (tail) ---\n"
+            f"{str(item.get('output', ''))[-2500:]}"
         )
     if require_test and not any(item.get("is_test") for item in proof.commands):
         return "PROVEN_WORK incomplete: build commands passed, but no test command actually ran."
@@ -459,6 +510,7 @@ def _extract_step_file_refs(step_text: str) -> list[str]:
         r'(?:File:|file:)\s*([^\s,\n`"\']+)',
         r'`([^`]+\.[a-zA-Z]{1,8})`',
         r'"([^"]+\.[a-zA-Z]{1,8})"',
+        r'(?<![A-Za-z0-9_])([A-Za-z0-9_.-]+(?:[/\\][A-Za-z0-9_.-]+)+\.[a-zA-Z]{1,8})',
     ]
     found: list[str] = []
     seen: set[str] = set()
@@ -608,6 +660,25 @@ class CommandRegistry:
 
     def test_commands(self) -> list[VerificationCommand]:
         return [c for c in self.commands if c.is_test]
+
+    def cwd_for(self, cmd: str) -> str | None:
+        """Working directory (relative to project root) for a coder-emitted or
+        auto-verify command in NESTED project layouts.
+
+        Root cause this fixes (real session 2026-06-12_20-27): the checklist
+        said `VERIFY: python -m pytest`, the runtime executed it in the parent
+        root instead of `starter_project/` → every run failed with
+        `ModuleNotFoundError: No module named 'mini_agent_check'` and the model
+        could never converge. Discovered commands carry the correct cwd —
+        reuse it for any command of the same toolchain.
+        """
+        tc = _command_toolchain(cmd)
+        if tc is None:
+            return None
+        for c in self.commands:
+            if getattr(c, "cwd", None) and _command_toolchain(c.cmd) == tc:
+                return c.cwd
+        return None
 
     def is_toolchain_mismatch(self, cmd: str) -> bool:
         if not self.toolchains:

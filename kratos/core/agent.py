@@ -106,6 +106,9 @@ from ..execution.parsing import (
 )
 from ..planning import parse_execution_plan
 from ..execution.repair import try_repair_known_probe
+from ..execution.diagnostics import diagnose_command, RepairTracker
+from ..execution.testguard import snapshot_test_files, restore_test_files
+from ..reporter import NO_REAL_CHANGES_MSG, build_final_report, verify_files_changed
 
 # ── token predict limits (now sourced from prompts at runtime for full configurability) ──
 # (kept as module fallbacks only for very early import paths; prefer get_predict)
@@ -158,6 +161,12 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
         self.pending_file_deletions: list[str] = []
         self._cancel_event = None
 
+        # Detects when the repair loop is stuck on the identical failure
+        # (the 94×-identical-pytest-failure pattern from session 2026-06-13).
+        self._repair_tracker = RepairTracker(
+            stall_threshold=int(getattr(config, "repair_stall_threshold", 2) or 2)
+        )
+
     # ── session usage ─────────────────────────────────────────────────────────
 
     @property
@@ -173,6 +182,24 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
         if self._knowledge is None:
             return 0
         return self._knowledge.rebuild(force=force)
+
+    def _knowledge_chunk_count(self) -> int:
+        if self._knowledge is None:
+            return 0
+        try:
+            status = self._knowledge.status()
+            return int(status.get("chunks", 0) or 0)
+        except Exception:
+            return 0
+
+    def _ensure_knowledge_bootstrap(self) -> int:
+        """Ensure the project knowledge base has content before retrieval."""
+        if self._knowledge is None:
+            return 0
+        chunks = self._knowledge_chunk_count()
+        if chunks > 0:
+            return chunks
+        return self.rebuild_knowledge(force=False)
 
     def _record_usage(self, usage_json: str) -> None:
         try:
@@ -194,6 +221,11 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
         """Full pipeline. Yields (source, content, kind) events."""
         self.pending_file_changes.clear()
         self.pending_file_deletions.clear()
+        self._repair_tracker.reset()
+        # Run-start timestamp so the final report only counts web sources that
+        # were ACTUALLY fetched during this run (never stale/old research notes).
+        from datetime import datetime, timezone
+        self._run_started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
         # Unconditional PromptManager so all pm.get_snippet / revising / proven_work paths
         # (including retries, legacy coder, early errors, and branches that only assign inside
@@ -219,6 +251,11 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
         retrieved_chunks: list[RetrievedChunk] = []
         if self._knowledge is not None:
             try:
+                current_chunks = self._knowledge_chunk_count()
+                if current_chunks <= 0:
+                    yield ("info", "project vector knowledge base is empty; rebuilding before retrieval…", "info")
+                    rebuilt = self._ensure_knowledge_bootstrap()
+                    yield ("tool", f"knowledge_rebuild(project) → {rebuilt} chunks", "tool")
                 yield ("info", "retrieving (task-level) from project vector knowledge base…", "info")
                 retrieved_chunks = self._knowledge.retrieve(
                     analysis.normalized or task,
@@ -324,11 +361,33 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
                 root = self._indexer.root
                 for rp, ct in chg:
                     try:
-                        (root / rp).parent.mkdir(parents=True, exist_ok=True)
-                        (root / rp).write_text(ct, encoding="utf-8")
+                        target = (root / rp).resolve()
+                        previous = target.read_text("utf-8") if target.exists() else None
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_text(ct, encoding="utf-8")
+                        actual = target.read_text("utf-8")
+                        ok = actual == ct
+                        yield ("log", json.dumps({
+                            "type": "file_write",
+                            "path": rp,
+                            "ok": ok,
+                            "content": ct,
+                            "previous_content": previous,
+                            "size_bytes": len(actual.encode("utf-8")),
+                            "sha256": hashlib.sha256(actual.encode("utf-8")).hexdigest(),
+                            "previous_sha256": hashlib.sha256(previous.encode("utf-8")).hexdigest() if previous is not None else None,
+                            "source": "CODER_ONLY",
+                        }, ensure_ascii=False), "log")
                         yield ("tool", f"apply_file({rp!r}) [from CODER_ONLY]", "tool")
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        yield ("log", json.dumps({
+                            "type": "file_write",
+                            "path": rp,
+                            "ok": False,
+                            "content": ct,
+                            "detail": str(exc),
+                            "source": "CODER_ONLY",
+                        }, ensure_ascii=False), "log")
             return
 
         # ── plan → code → verify loop ─────────────────────────────────────────
@@ -341,6 +400,22 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
         _accumulated_deletions: set[str] = set()
         # Snapshot of files before any writes (for rollback on UNSOLVABLE)
         _original_snapshots: dict[str, str | None] = {}
+
+        # ── final-report evidence tracking (anti fake-success) ────────────────
+        # Routes that reach this loop are coding routes: they REQUIRE real,
+        # verifiable file changes. A run that planned and talked but changed
+        # nothing must never end as a success.
+        _requires_changes = route in (Route.PLANNER_THEN_CODER, Route.DIAGNOSTIC_LOOP)
+        _verifier_accepted = False
+        _report_problems: list[str] = []
+        proof = ProvenWork(iteration=0)
+        project_root = self._indexer.root
+
+        # Snapshot pre-existing test files so the model cannot make tests pass by
+        # weakening them (it may still ADD new tests). Restored before every
+        # authoritative verification → a green result means the ORIGINAL tests pass.
+        _protect_tests = bool(getattr(self.config, "protect_existing_tests", True))
+        _test_snapshot = snapshot_test_files(project_root) if _protect_tests else {}
 
         for attempt in range(max_iter):
             is_retry   = attempt > 0
@@ -402,27 +477,29 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
             project_root = self._indexer.root
             proof = ProvenWork(iteration=attempt + 1)
 
-            use_coder_loop = (
+            # Structured per-todo work step mode (new default for planner-driven work).
+            # Replaces the free multi-iteration ReAct loop with autonomous, auditable
+            # work steps: Search (pattern + match count) → Read (line range in TUI) →
+            # Edit (file + +/- lines) → Verify (tests close the step).
+            use_structured_work = (
                 bool(getattr(self.config, "coder_loop", True))
                 and route in (Route.PLANNER_THEN_CODER, Route.DIAGNOSTIC_LOOP)
             )
             steps: list[str] = []
             use_stepwise = False
 
-            coder_full_for_verify = ""   # collect last coder output for the LLM verifier msg
+            coder_full_for_verify = ""
 
-            if use_coder_loop:
+            if use_structured_work:
+                from ..roles.coder import execute_structured_work_steps_for_plan
                 (
                     coder_full_for_verify,
                     _accumulated_changes,
                     _accumulated_deletions,
-                ) = yield from run_coder_loop(
+                ) = yield from execute_structured_work_steps_for_plan(
                     self,
                     task,
                     plan_state,
-                    analysis,
-                    intent,
-                    route,
                     coder_ctx,
                     _cmd_registry,
                     proof,
@@ -519,9 +596,10 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
                     # Command registry section injected into coder prompt
                     _cmd_block = _cmd_registry.format_for_prompt()
 
+                    _plan_label = pm.get_snippet('step_input_overall_plan_label') or 'OVERALL PLAN (for reference):\n'
                     step_input = forced_prefix + (
                         f"{pm.get_snippet('step_input_full_task_label') or 'Full task: '}{task}\n\n"
-                        f"{pm.get_snippet('step_input_overall_plan_label') or 'OVERALL PLAN (for reference):\\n'}{plan_text[:1500]}\n\n"
+                        f"{_plan_label}{plan_text[:1500]}\n\n"
                         + (f"{_cmd_block}\n\n" if _cmd_block else "")
                         + (f"PROJECT FILES (types, test contracts — match signatures exactly):\n{ctx_block}\n\n" if ctx_block else "")
                         + disk_section
@@ -560,30 +638,72 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
                         target = (project_root / rel_path).resolve()
                         try:
                             target.relative_to(project_root.resolve())
-                            if attempt == 0 and rel_path not in _original_snapshots:
+                            if rel_path not in _original_snapshots:
                                 _original_snapshots[rel_path] = target.read_text("utf-8") if target.exists() else None
+                            previous = _original_snapshots.get(rel_path)
                             target.parent.mkdir(parents=True, exist_ok=True)
                             target.write_text(content, encoding="utf-8")
                             file_bytes = target.stat().st_size
                             yield ("tool", f"write_file({rel_path!r}) -> {file_bytes} bytes [step {step_num}]", "tool")
+                            yield ("log", json.dumps({
+                                "type": "file_write",
+                                "path": rel_path,
+                                "ok": True,
+                                "content": content,
+                                "previous_content": previous,
+                                "size_bytes": file_bytes,
+                                "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                                "previous_sha256": hashlib.sha256(previous.encode("utf-8")).hexdigest() if previous is not None else None,
+                                "step": step_num,
+                                "source": "stepwise",
+                            }, ensure_ascii=False), "log")
                             proof.file_checks.append({"path": rel_path, "operation": "write", "ok": True, "bytes": file_bytes, "step": step_num})
                         except (ValueError, OSError) as exc:
                             proof.file_checks.append({"path": rel_path, "operation": "write", "ok": False, "error": str(exc), "step": step_num})
+                            yield ("log", json.dumps({
+                                "type": "file_write",
+                                "path": rel_path,
+                                "ok": False,
+                                "content": content,
+                                "detail": str(exc),
+                                "step": step_num,
+                                "source": "stepwise",
+                            }, ensure_ascii=False), "log")
                             yield ("error", f"File write failed for {rel_path}: {exc}", "error")
 
                     for rel_path in step_deletes:
                         target = (project_root / rel_path).resolve()
                         try:
                             target.relative_to(project_root.resolve())
-                            if attempt == 0 and rel_path not in _original_snapshots:
+                            if rel_path not in _original_snapshots:
                                 _original_snapshots[rel_path] = target.read_text("utf-8") if target.exists() else None
+                            previous = _original_snapshots.get(rel_path)
+                            existed = target.exists()
                             if target.exists():
                                 target.unlink()
                             ok = not target.exists()
                             yield ("tool", f"delete_file({rel_path!r}) -> {'ok' if ok else 'FAILED'} [step {step_num}]", "tool")
+                            yield ("log", json.dumps({
+                                "type": "file_delete",
+                                "path": rel_path,
+                                "ok": ok,
+                                "existed": existed,
+                                "previous_content": previous,
+                                "previous_sha256": hashlib.sha256(previous.encode("utf-8")).hexdigest() if previous is not None else None,
+                                "step": step_num,
+                                "source": "stepwise",
+                            }, ensure_ascii=False), "log")
                             proof.file_checks.append({"path": rel_path, "operation": "delete", "ok": ok, "step": step_num})
                         except (ValueError, OSError) as exc:
                             proof.file_checks.append({"path": rel_path, "operation": "delete", "ok": False, "error": str(exc), "step": step_num})
+                            yield ("log", json.dumps({
+                                "type": "file_delete",
+                                "path": rel_path,
+                                "ok": False,
+                                "detail": str(exc),
+                                "step": step_num,
+                                "source": "stepwise",
+                            }, ensure_ascii=False), "log")
                             yield ("error", f"File delete failed for {rel_path}: {exc}", "error")
 
                     # STEP_TEST: write temp test files, patch test runner, run, then delete.
@@ -667,13 +787,38 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
                                 "type": "build_test", "cmd": vcmd.cmd, "purpose": vcmd.purpose,
                                 "source": vcmd.source, "is_test": vcmd.is_test,
                                 "exit_code": res["exit_code"], "step": step_num,
-                                "duration_seconds": res["duration_seconds"], "output": res["output"][-2000:],
-                            }), "log")
+                                "duration_seconds": res["duration_seconds"],
+                                "output": res.get("output", ""),
+                                "stdout": res.get("stdout", ""),
+                                "stderr": res.get("stderr", ""),
+                                "cwd": res.get("cwd"),
+                                "shell": res.get("shell"),
+                                "timeout_seconds": res.get("timeout_seconds"),
+                                "timed_out": res.get("timed_out"),
+                                "blocked": res.get("blocked"),
+                                "block_reason": res.get("block_reason"),
+                                "result": res,
+                            }, ensure_ascii=False), "log")
                             if res["exit_code"] != 0:
                                 _tail = res.get("output", "")[-600:].strip()
+                                _diag = diagnose_command(res)
+                                _diag_block = ""
+                                if _diag is not None:
+                                    seen = self._repair_tracker.register(_diag.signature)
+                                    _diag_block = "\n" + _diag.as_feedback()
+                                    if self._repair_tracker.is_stalled(_diag.signature):
+                                        _diag_block += "\n" + self._repair_tracker.escalation_note(_diag.signature)
+                                        yield ("warn",
+                                               f"Repair stall detected ({_diag.category} ×{seen}) — escalating diagnosis.",
+                                               "warn")
+                                    yield ("log", json.dumps({
+                                        "type": "failure_diagnosis", "step": step_num,
+                                        "iteration": attempt + 1, "seen": seen,
+                                        **_diag.to_dict()}, ensure_ascii=False), "log")
                                 verify_feedback = (
                                     f"Step {step_num} verification failed: `{vcmd.cmd}`"
-                                    + (f"\nTest output:\n{_tail}" if _tail else "")
+                                    + _diag_block
+                                    + (f"\n\n--- output (tail) ---\n{_tail}" if _tail else "")
                                 )
                                 _step_failed = True
                                 break
@@ -745,42 +890,86 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
                     target = (project_root / rel_path).resolve()
                     try:
                         target.relative_to(project_root.resolve())
-                        if attempt == 0 and rel_path not in _original_snapshots:
+                        if rel_path not in _original_snapshots:
                             _original_snapshots[rel_path] = (
                                 target.read_text("utf-8") if target.exists() else None
                             )
+                        previous = _original_snapshots.get(rel_path)
                         size = len(content.encode("utf-8"))
                         yield ("tool", f"apply_file({rel_path!r}) -> write {size} bytes", "tool")
                         target.parent.mkdir(parents=True, exist_ok=True)
                         target.write_text(content, encoding="utf-8")
                         actual = target.read_text("utf-8")
-                        digest = hashlib.sha256(actual.encode("utf-8")).hexdigest()[:12]
+                        full_digest = hashlib.sha256(actual.encode("utf-8")).hexdigest()
+                        digest = full_digest[:12]
                         ok = actual == content
                         proof.file_checks.append({
                             "path": rel_path, "operation": "write", "ok": ok,
                             "bytes": len(actual.encode("utf-8")), "sha256": digest,
                         })
+                        yield ("log", json.dumps({
+                            "type": "file_write",
+                            "path": rel_path,
+                            "ok": ok,
+                            "content": content,
+                            "actual_content": actual,
+                            "previous_content": previous,
+                            "size_bytes": len(actual.encode("utf-8")),
+                            "sha256": full_digest,
+                            "previous_sha256": hashlib.sha256(previous.encode("utf-8")).hexdigest() if previous is not None else None,
+                            "source": "legacy_apply",
+                            "iteration": attempt + 1,
+                        }, ensure_ascii=False), "log")
                         yield ("tool", f"verify_file_write({rel_path!r}) -> {'ok' if ok else 'FAILED'} sha256={digest}", "tool")
                     except (ValueError, OSError) as exc:
                         proof.file_checks.append({"path": rel_path, "operation": "write", "ok": False, "error": str(exc)})
+                        yield ("log", json.dumps({
+                            "type": "file_write",
+                            "path": rel_path,
+                            "ok": False,
+                            "content": content,
+                            "detail": str(exc),
+                            "source": "legacy_apply",
+                            "iteration": attempt + 1,
+                        }, ensure_ascii=False), "log")
                         yield ("error", f"File write failed for {rel_path}: {exc}", "error")
 
                 for rel_path in self.pending_file_deletions:
                     target = (project_root / rel_path).resolve()
                     try:
                         target.relative_to(project_root.resolve())
-                        if attempt == 0 and rel_path not in _original_snapshots:
+                        if rel_path not in _original_snapshots:
                             _original_snapshots[rel_path] = (
                                 target.read_text("utf-8") if target.exists() else None
                             )
+                        previous = _original_snapshots.get(rel_path)
+                        existed = target.exists()
                         yield ("tool", f"delete_file({rel_path!r}) -> apply deletion", "tool")
                         if target.exists():
                             target.unlink()
                         ok = not target.exists()
                         proof.file_checks.append({"path": rel_path, "operation": "delete", "ok": ok})
+                        yield ("log", json.dumps({
+                            "type": "file_delete",
+                            "path": rel_path,
+                            "ok": ok,
+                            "existed": existed,
+                            "previous_content": previous,
+                            "previous_sha256": hashlib.sha256(previous.encode("utf-8")).hexdigest() if previous is not None else None,
+                            "source": "legacy_apply",
+                            "iteration": attempt + 1,
+                        }, ensure_ascii=False), "log")
                         yield ("tool", f"verify_file_delete({rel_path!r}) -> {'ok' if ok else 'FAILED'}", "tool")
                     except (ValueError, OSError) as exc:
                         proof.file_checks.append({"path": rel_path, "operation": "delete", "ok": False, "error": str(exc)})
+                        yield ("log", json.dumps({
+                            "type": "file_delete",
+                            "path": rel_path,
+                            "ok": False,
+                            "detail": str(exc),
+                            "source": "legacy_apply",
+                            "iteration": attempt + 1,
+                        }, ensure_ascii=False), "log")
                         yield ("error", f"File delete failed for {rel_path}: {exc}", "error")
 
             failed_file_checks = [item for item in proof.file_checks if not item.get("ok")]
@@ -796,6 +985,55 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
                     continue
                 yield ("warn", f"Safety cap ({max_iter} iterations) reached.", "warn")
                 break
+
+            # ── 4a-pre. REAL FILE-CHANGE GATE (anti fake-success) ─────────────
+            # Ground truth from disk: compare claimed files against their
+            # pre-run snapshots. No-op rewrites do not count. If the task
+            # requires code changes and nothing really changed, do NOT proceed
+            # to the verifier — jump straight back into implementation.
+            _claimed_files = list(dict.fromkeys([
+                *proof.files_changed,
+                *_accumulated_changes.keys(),
+                *_accumulated_deletions,
+            ]))
+            _change_evidence = verify_files_changed(project_root, _claimed_files, _original_snapshots)
+            _real_changes = [e for e in _change_evidence if e.is_real_change]
+            yield ("log", json.dumps({
+                "type": "file_change_evidence", "iteration": attempt + 1,
+                "claimed": _claimed_files,
+                "real_changes": [e.path for e in _real_changes],
+                "evidence": [{"path": e.path, "kind": e.kind,
+                              "before_hash": e.before_hash, "after_hash": e.after_hash}
+                             for e in _change_evidence],
+            }), "log")
+            if _requires_changes and not _real_changes:
+                verify_feedback = (
+                    f"{NO_REAL_CHANGES_MSG}: the task requires code changes, but no file on disk "
+                    "differs from its pre-run state. You MUST emit ### FILE: blocks with the full "
+                    "new file content (or ### DELETE:). Plans and descriptions change nothing."
+                )
+                _report_problems.append(f"Iteration {attempt + 1}: {NO_REAL_CHANGES_MSG}")
+                yield ("warn", verify_feedback, "warn")
+                yield ("log", json.dumps({"type": "verify_decision",
+                                          "decision": "NEEDS_REVISION",
+                                          "feedback": verify_feedback,
+                                          "iteration": attempt + 1}), "log")
+                if attempt < max_iter - 1:
+                    continue
+                yield ("warn", f"Safety cap ({max_iter} iterations) reached — no real file changes were made.", "warn")
+                break
+
+            # Restore any provided test file the model touched, so the authoritative
+            # test run below cannot be gamed by weakening a test (new tests are kept).
+            if _protect_tests and _test_snapshot:
+                _restored = restore_test_files(project_root, _test_snapshot)
+                if _restored:
+                    _report_problems.append(
+                        "Modell hat vorgegebene Test-Datei(en) verändert — vor der Verifikation "
+                        f"zurückgesetzt: {', '.join(_restored)}")
+                    yield ("warn",
+                           f"Protected tests were modified by the model and restored: {', '.join(_restored)}",
+                           "warn")
 
             # ── 4a. PROVEN_WORK command evidence (final sweep + per-step already recorded) ─
             # In stepwise the per-step tests are already in proof.commands.
@@ -829,7 +1067,16 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
                                               "source": verify_cmd.source, "is_test": verify_cmd.is_test,
                                               "exit_code": result["exit_code"],
                                               "duration_seconds": result["duration_seconds"],
-                                              "output": result["output"][-3000:]}), "log")
+                                              "output": result.get("output", ""),
+                                              "stdout": result.get("stdout", ""),
+                                              "stderr": result.get("stderr", ""),
+                                              "cwd": result.get("cwd"),
+                                              "shell": result.get("shell"),
+                                              "timeout_seconds": result.get("timeout_seconds"),
+                                              "timed_out": result.get("timed_out"),
+                                              "blocked": result.get("blocked"),
+                                              "block_reason": result.get("block_reason"),
+                                              "result": result}, ensure_ascii=False), "log")
                     if result["exit_code"] != 0:
                         break
             else:
@@ -842,7 +1089,25 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
             proof_required = self.config.require_proven_work
             require_test = self.config.require_test_for_verified
             if proof_required and not _proven_work_satisfied(proof, require_test=require_test):
-                repair_changes = try_repair_known_probe(project_root)
+                repair_changes = dict(try_repair_known_probe(project_root))
+                # Deterministic last resort: if a verification failure is a
+                # circular import (which weak models re-create endlessly — session
+                # 2026-06-13_15-43-37 did it 15× in a row), break the cycle without
+                # the model by deleting the provably-unused cross-import.
+                _failed_now = [c for c in proof.commands if c.get("exit_code") not in (0, None)]
+                _diag_now = diagnose_command(_failed_now[-1]) if _failed_now else None
+                if _diag_now is not None and _diag_now.category == "circular_import":
+                    try:
+                        from ..execution.circular import break_unused_circular_imports
+                        cyc = break_unused_circular_imports(project_root)
+                    except Exception:
+                        cyc = {}
+                    for rel, content in cyc.items():
+                        repair_changes.setdefault(rel, content)
+                    if cyc:
+                        yield ("info",
+                               f"Deterministic circular-import repair: removed unused cyclic import(s) in {', '.join(cyc)}.",
+                               "info")
                 repaired_files = list(repair_changes)
                 if repair_changes:
                     current_changes = dict(self.pending_file_changes)
@@ -854,26 +1119,50 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
                         target = (project_root / rel_path).resolve()
                         try:
                             target.relative_to(project_root.resolve())
-                            if attempt == 0 and rel_path not in _original_snapshots:
+                            if rel_path not in _original_snapshots:
                                 _original_snapshots[rel_path] = (
                                     target.read_text("utf-8") if target.exists() else None
                                 )
+                            previous = _original_snapshots.get(rel_path)
                             target.parent.mkdir(parents=True, exist_ok=True)
                             target.write_text(content, encoding="utf-8")
                             actual = target.read_text("utf-8")
-                            digest = hashlib.sha256(actual.encode("utf-8")).hexdigest()[:12]
+                            full_digest = hashlib.sha256(actual.encode("utf-8")).hexdigest()
+                            digest = full_digest[:12]
                             ok = actual == content
                             proof.file_checks.append({
                                 "path": rel_path, "operation": "write", "ok": ok,
                                 "bytes": len(actual.encode("utf-8")), "sha256": digest,
                                 "source": "built-in sandbox fallback",
                             })
+                            yield ("log", json.dumps({
+                                "type": "file_write",
+                                "path": rel_path,
+                                "ok": ok,
+                                "content": content,
+                                "actual_content": actual,
+                                "previous_content": previous,
+                                "size_bytes": len(actual.encode("utf-8")),
+                                "sha256": full_digest,
+                                "previous_sha256": hashlib.sha256(previous.encode("utf-8")).hexdigest() if previous is not None else None,
+                                "source": "built-in sandbox fallback",
+                                "iteration": attempt + 1,
+                            }, ensure_ascii=False), "log")
                             yield ("tool", f"repair_file({rel_path!r}) -> {'ok' if ok else 'FAILED'} sha256={digest}", "tool")
                         except (ValueError, OSError) as exc:
                             proof.file_checks.append({
                                 "path": rel_path, "operation": "write", "ok": False,
                                 "error": str(exc), "source": "built-in sandbox fallback",
                             })
+                            yield ("log", json.dumps({
+                                "type": "file_write",
+                                "path": rel_path,
+                                "ok": False,
+                                "content": content,
+                                "detail": str(exc),
+                                "source": "built-in sandbox fallback",
+                                "iteration": attempt + 1,
+                            }, ensure_ascii=False), "log")
                             yield ("error", f"Built-in sandbox repair failed for {rel_path}: {exc}", "error")
                     for verify_cmd in verification_commands:
                         yield ("tool", f"run_command({verify_cmd.cmd!r}) -> {verify_cmd.purpose} [repair]", "tool")
@@ -886,7 +1175,16 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
                                                   "source": verify_cmd.source, "is_test": verify_cmd.is_test,
                                                   "exit_code": result["exit_code"],
                                                   "duration_seconds": result["duration_seconds"],
-                                                  "output": result["output"][-3000:]}), "log")
+                                                  "output": result.get("output", ""),
+                                                  "stdout": result.get("stdout", ""),
+                                                  "stderr": result.get("stderr", ""),
+                                                  "cwd": result.get("cwd"),
+                                                  "shell": result.get("shell"),
+                                                  "timeout_seconds": result.get("timeout_seconds"),
+                                                  "timed_out": result.get("timed_out"),
+                                                  "blocked": result.get("blocked"),
+                                                  "block_reason": result.get("block_reason"),
+                                                  "result": result}, ensure_ascii=False), "log")
                         if result["exit_code"] != 0:
                             break
                     yield ("log", json.dumps({"type": "proven_work", **proof.to_dict()}), "log")
@@ -897,6 +1195,21 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
                         break
 
                 verify_feedback = _format_proven_work_feedback(proof, require_test=require_test)
+                # Stall detection across iterations: if the same failure keeps
+                # recurring, escalate instead of burning every iteration on it.
+                _failed_cmds = [c for c in proof.commands if c.get("exit_code") not in (0, None)]
+                if _failed_cmds:
+                    _diag = diagnose_command(_failed_cmds[-1])
+                    if _diag is not None:
+                        seen = self._repair_tracker.register(_diag.signature)
+                        yield ("log", json.dumps({
+                            "type": "failure_diagnosis", "iteration": attempt + 1,
+                            "seen": seen, **_diag.to_dict()}, ensure_ascii=False), "log")
+                        if self._repair_tracker.is_stalled(_diag.signature):
+                            verify_feedback += "\n\n" + self._repair_tracker.escalation_note(_diag.signature)
+                            yield ("warn",
+                                   f"Repair stall detected ({_diag.category} ×{seen}) — escalating diagnosis.",
+                                   "warn")
                 yield ("warn", verify_feedback[:500], "warn")
                 yield ("log", json.dumps({"type": "verify_decision",
                                           "decision": "NEEDS_REVISION",
@@ -921,6 +1234,7 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
 
             if "UNSOLVABLE" in vf_upper:
                 reason = verify_full.replace("UNSOLVABLE:", "").replace("UNSOLVABLE", "").strip()
+                _report_problems.append(f"Verifier: UNSOLVABLE — {reason[:200]}")
                 yield ("warn", f"Task cannot be solved — {reason[:300]}", "warn")
                 yield ("log", json.dumps({"type": "verify_decision", "decision": "UNSOLVABLE",
                                           "feedback": verify_full, "iteration": attempt + 1}), "log")
@@ -931,6 +1245,7 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
                 break
 
             if "VERIFIED" in vf_upper and "NEEDS_REVISION" not in vf_upper:
+                _verifier_accepted = True
                 yield ("log", json.dumps({"type": "verify_decision", "decision": "VERIFIED",
                                           "feedback": "", "iteration": attempt + 1}), "log")
                 self._record_solution([p for p, _ in self.pending_file_changes],
@@ -940,6 +1255,8 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
                     yield ("info", f"Verified after {attempt + 1} iteration(s).", "info")
 
                 # Final extra verification pass — verifier "really does the tests"
+                if _protect_tests and _test_snapshot:
+                    restore_test_files(project_root, _test_snapshot)
                 final_cmds = self._verification_commands(route)
                 if final_cmds:
                     yield ("info", "Final full verification sweep...", "info")
@@ -955,6 +1272,7 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
                             break
                     if not all_ok:
                         # demote to revision even if LLM said verified (strict)
+                        _verifier_accepted = False
                         verify_feedback = "Final verification sweep failed — one or more tests did not pass after VERIFIED."
                         yield ("warn", verify_feedback, "warn")
                         if attempt < max_iter - 1:
@@ -969,6 +1287,51 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
                 yield ("warn", f"Needs revision ({attempt + 1}/{max_iter}) — {verify_feedback[:200]}", "warn")
             else:
                 yield ("warn", f"Safety cap ({max_iter} iterations) reached — review manually.", "warn")
+
+        # ── FINAL REPORT — built ONLY from verified evidence ──────────────────
+        # The Reporter recomputes file-change reality from disk (snapshots vs
+        # current content) and derives the test status exclusively from the
+        # recorded command results. A run that changed nothing can never be
+        # reported as SUCCESS; tests that never ran are reported as such.
+        proof.files_changed = list(dict.fromkeys([
+            *proof.files_changed,
+            *_accumulated_changes.keys(),
+            *_accumulated_deletions,
+        ]))
+        _web_requested = bool(re.search(
+            r"\b(web[- ]?such|websuche|web[- ]?scrap|internet[- ]?recherche|recherche|"
+            r"web search|web scrap|research|http://|https://|url)\b",
+            task, re.I,
+        ))
+        # Real sources actually fetched this run (proven from research.jsonl) —
+        # never model-claimed. Empty list ⇒ report honestly says "Durchgeführt: Nein".
+        from ..web import collect_research_sources
+        try:
+            _web_sources = collect_research_sources(
+                project_root / ".kratos", since_iso=getattr(self, "_run_started_at", None)
+            )
+        except Exception:
+            _web_sources = []
+        final_report = build_final_report(
+            project_root=project_root,
+            proof=proof,
+            original_snapshots=_original_snapshots,
+            task_requires_changes=_requires_changes,
+            problems=_report_problems,
+            verifier_accepted=_verifier_accepted,
+            web_requested=_web_requested,
+            web_sources=_web_sources,
+        )
+        yield ("log", json.dumps({
+            "type": "final_report",
+            "status": final_report.status,
+            "files_changed": [e.path for e in final_report.changed_files if e.is_real_change],
+            "tests_ran": final_report.tests_ran,
+            "tests_passed": final_report.tests_passed,
+            "verifier_accepted": _verifier_accepted,
+            "diff_summary": final_report.diff_summary,
+        }), "log")
+        yield ("report", final_report.to_markdown(), "report")
 
     # ── public API ────────────────────────────────────────────────────────────
 

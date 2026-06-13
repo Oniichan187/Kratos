@@ -157,6 +157,7 @@ def status_bar(
     goal: str | None = None,
     user_label: str = "",
     hint: str = "",
+    plan_state: dict | None = None,  # compact live todo: {"label": "PLAN 3/8", "compact": "..."}
 ) -> Panel:
     """Build the persistent bottom status bar as a Rich Panel.
 
@@ -192,15 +193,28 @@ def status_bar(
                 parts.append(f"[dim]{role[0].upper()}:—[/]")
 
     if elapsed_s > 0:
-        parts.append(f"[bold white]⏱{elapsed_str(elapsed_s)}[/]")
+        # NOTE: the stopwatch emoji renders 2 cells wide in most terminals but
+        # Rich counts 1 — without the space the first digit gets overdrawn
+        # ("⏱12m" looked like "⏱2m"). Keep the explicit space.
+        parts.append(f"[bold white]⏱ {elapsed_str(elapsed_s)}[/]")
 
     parts.append(f"[dim italic]{_me(project_name)}[/]")
 
     bar2 = "  │  ".join(parts)
     if top_parts:
         bar1 = "  ·  ".join(top_parts)
-        body = Text.from_markup(f"{bar1}\n{bar2}")
+        body_lines = [bar1, bar2]
     else:
-        body = Text.from_markup(bar2)
+        body_lines = [bar2]
 
+    # Compact live plan/todo integrated with the bottom stats (next to ctx P/C/V "live stats").
+    # This is the persistent "live todo über dem userinput" the user wants in the CLI frame.
+    if plan_state:
+        plabel = plan_state.get("label") or ""
+        pcompact = plan_state.get("compact") or ""
+        if plabel or pcompact:
+            plan_line = f"[magenta]{plabel}[/magenta]" + (f"  [dim]{pcompact[:60]}[/dim]" if pcompact else "")
+            body_lines.insert(0, plan_line)
+
+    body = Text.from_markup("\n".join(body_lines))
     return Panel(body, box=box.ROUNDED, border_style="dim cyan", padding=(0, 1))

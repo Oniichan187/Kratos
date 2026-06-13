@@ -53,7 +53,8 @@ def _planner_retry_msg(
         parts.append(pm.get_snippet("current_file_state_header") or "Current file state (updated since last iteration):")
         for f in ctx.files:
             parts.append(f"--- {f.rel_path} ---\n{f.excerpt(800)}")
-    parts.append(f"{pm.get_snippet('previous_plan_label') or 'Previous plan:\\n'}{prev_plan[:600]}")
+    prev_plan_label = pm.get_snippet('previous_plan_label') or 'Previous plan:\n'
+    parts.append(f"{prev_plan_label}{prev_plan[:600]}")
     fb_intro = pm.get_snippet("verify_feedback_intro") or "Verifier / test feedback — what still needs to be fixed:\n"
     fb_action = pm.get_snippet("verify_feedback_action") or (
         "Produce a precise plan for what the coder must implement to fix all issues. "

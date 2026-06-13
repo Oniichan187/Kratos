@@ -18,6 +18,8 @@ Layout:
 
 from __future__ import annotations
 
+import ast
+import hashlib
 import io
 import threading
 import time
@@ -35,6 +37,8 @@ from textual.widgets import Static, TextArea
 from textual import events
 
 from ..llm.tokens import role_context_windows
+from ..planning import ExecutionPlan, parse_execution_plan, refresh_plan_status, render_checklist
+from ..verification import ProvenWork, _is_test_verification_command
 from kratos.ui import elapsed_str, _tok_short
 from .prompt_frame import _PlannerFilter
 from .slash import _SLASH_TREE, slash_completions
@@ -94,6 +98,25 @@ class _TuiCoderFilter:
             self._in_code = not self._in_code
         elif self._in_summary and not self._in_code and s:
             self._emit(f"  {s}", "dim")
+        else:
+            # Print coder action commands (### VERIFY / RUN / READ / INSPECT / DONE) visibly.
+            # Mirrors the CLI _CoderFilter change so "Befehle" the model emits are shown to the user.
+            try:
+                from kratos.prompts import get_marker
+                vm = (get_marker("verify") or "### VERIFY:").rstrip(":") + ":"
+                rm = (get_marker("run") or "### RUN:").rstrip(":") + ":"
+                im = (get_marker("inspect") or "### INSPECT:").rstrip(":") + ":"
+                rdm = (get_marker("read") or "### READ:").rstrip(":") + ":"
+                donem = (get_marker("done") or "### DONE").rstrip(":")
+            except Exception:
+                vm, rm, im, rdm, donem = "### VERIFY:", "### RUN:", "### INSPECT:", "### READ:", "### DONE"
+            low = s.lower()
+            if low.startswith(vm.lower()) or low.startswith(rm.lower()):
+                self._emit(f"  ↳ {s}", "cyan")
+            elif low.startswith(im.lower()) or low.startswith(rdm.lower()):
+                self._emit(f"  ↳ {s}", "dim cyan")
+            elif low.startswith(donem.lower()):
+                self._emit(f"  ↳ {s}", "green")
 
 
 # ── Custom Messages ───────────────────────────────────────────────────────────
@@ -238,6 +261,24 @@ class StatusFooter(Static):
     """
 
 
+class PlanBox(Static):
+    """Live planner todo box above the prompt."""
+
+    DEFAULT_CSS = """
+    PlanBox {
+        height: 5;
+        min-height: 5;
+        max-height: 5;
+        width: 100%;
+        color: $text-muted;
+        padding: 0 1;
+        background: $surface-darken-1;
+        border: tall $primary-darken-3;
+        overflow-y: auto;
+    }
+    """
+
+
 # ── Main App ──────────────────────────────────────────────────────────────────
 
 class KratosApp(App):
@@ -257,7 +298,7 @@ class KratosApp(App):
 
     #inputbar {
         height: auto;
-        max-height: 9;
+        max-height: 16;
         width: 100%;
         dock: bottom;
         background: $panel;
@@ -268,6 +309,13 @@ class KratosApp(App):
         height: 1;
         width: 100%;
         border-bottom: tall $primary-darken-3;
+    }
+
+    #plan_box_row {
+        height: 5;
+        min-height: 5;
+        max-height: 5;
+        width: 100%;
     }
 
     #input_row {
@@ -342,6 +390,11 @@ class KratosApp(App):
         self._planner_filter: _PlannerFilter | None = None
         self._planner_buf: str = ""
         self._coder_buf: str = ""
+        self._plan_state: ExecutionPlan | None = None
+        self._plan_proof = ProvenWork(iteration=0)
+        self._plan_done_at: dict[int, float] = {}
+        self._plan_last_status: dict[int, str] = {}
+        self._plan_source_text: str = ""
 
     # ── Layout ────────────────────────────────────────────────────────────────
 
@@ -350,13 +403,15 @@ class KratosApp(App):
         with Vertical(id="inputbar"):
             with Horizontal(id="status_footer_row"):
                 yield StatusFooter("", id="status_footer")
+            with Horizontal(id="plan_box_row"):
+                yield PlanBox("", id="plan_box")
             with Horizontal(id="input_row"):
                 yield Static("│  kratos ❯ ", id="prompt_label")
                 yield PromptInput(id="prompt_input")
 
     def on_mount(self) -> None:
         self._show_startup()
-        self.set_interval(1.0, self._refresh_footer)
+        self.set_interval(0.5, self._refresh_chrome)
         self.query_one("#prompt_input", PromptInput).focus()
 
     # ── Startup ───────────────────────────────────────────────────────────────
@@ -383,6 +438,124 @@ class KratosApp(App):
         if getattr(c, "always_max_ctx", True):
             d["max_policy"] = 1
         return d
+
+    def _reset_plan_box_state(self) -> None:
+        self._plan_state = None
+        self._plan_proof = ProvenWork(iteration=0)
+        self._plan_done_at.clear()
+        self._plan_last_status.clear()
+        self._plan_source_text = ""
+        self._refresh_plan_box()
+
+    def _record_plan_progress(self, *, touched_paths: list[str] | None = None, command: dict | None = None) -> None:
+        if self._plan_state is None:
+            return
+        if command and command.get("cmd"):
+            self._plan_proof.commands.append(dict(command))
+        refresh_plan_status(self._plan_state, self._plan_proof, touched_paths or [])
+        now = time.monotonic()
+        for item in self._plan_state.items:
+            prev = self._plan_last_status.get(item.index)
+            if item.status == "done" and prev != "done":
+                self._plan_done_at[item.index] = now
+            elif item.status != "done":
+                self._plan_done_at.pop(item.index, None)
+            self._plan_last_status[item.index] = item.status
+        self._refresh_plan_box()
+
+    def _plan_visible_items(self) -> list:
+        if self._plan_state is None:
+            return []
+        now = time.monotonic()
+        visible = []
+        for item in self._plan_state.items:
+            done_at = self._plan_done_at.get(item.index)
+            if item.status == "done" and done_at is not None and now - done_at >= 5.0:
+                continue
+            visible.append(item)
+        return visible
+
+    def _plan_box_text(self) -> RichText:
+        width = max(24, (self._term_width() or 120) - 4)
+        if self._plan_state is None or not self._plan_state.items:
+            text = RichText.from_markup("[dim]Planner todo will appear here after the next plan runs.[/dim]")
+            try:
+                text.truncate(width)
+            except Exception:
+                pass
+            return text
+
+        items = self._plan_visible_items()
+        done_count = sum(1 for item in self._plan_state.items if item.status == "done")
+        total_count = len(self._plan_state.items)
+        active_role = self._current_section if self._busy and self._current_section in self._ctx_live else ""
+        if active_role:
+            used, total = self._ctx_live.get(active_role, (0, 0))
+            active_bits = f"{active_role[0].upper()} {_tok_short(used)}/{_tok_short(total)}"
+        else:
+            active_bits = "idle"
+
+        lines: list[str] = [
+            f"[bold]PLAN[/bold] {done_count}/{total_count} done  [dim]•[/dim]  {elapsed_str(time.monotonic() - self._task_start) if self._busy and self._task_start else elapsed_str(self._last_task_s or 0)}  [dim]•[/dim]  {active_bits}",
+        ]
+
+        if not items and done_count == total_count and total_count > 0:
+            lines.append("[green]✓ all checklist items completed[/green]")
+        else:
+            if len(items) <= 4:
+                render_items = items
+                overflow = 0
+            else:
+                render_items = items[-3:]
+                overflow = len(items) - len(render_items)
+
+            for item in render_items:
+                status = item.status
+                mark = {"done": "✓", "in_progress": "◐", "failed": "×", "pending": "□"}.get(status, "□")
+                style = {"done": "green", "in_progress": "yellow", "failed": "red", "pending": "white"}.get(status, "white")
+                lines.append(f"[{style}]{mark} {item.title}[/]")
+
+            if overflow > 0:
+                lines.append(f"[dim]... {overflow} more items[/dim]")
+
+        text = RichText()
+        for idx, line in enumerate(lines[:5]):
+            if idx:
+                text.append("\n")
+            piece = RichText.from_markup(line)
+            try:
+                piece.truncate(width)
+            except Exception:
+                pass
+            text.append_text(piece)
+        return text
+
+    def _refresh_plan_box(self) -> None:
+        try:
+            self.query_one("#plan_box", PlanBox).update(self._plan_box_text())
+        except Exception:
+            pass
+
+    def _sync_plan_from_planner_buffer(self, *, final: bool = False) -> None:
+        text = self._planner_buf.strip()
+        if not text:
+            return
+        try:
+            parsed = parse_execution_plan(text)
+        except Exception:
+            return
+        if not parsed.items:
+            return
+        if final or self._plan_state is None or text != self._plan_source_text or len(parsed.items) != len(self._plan_state.items):
+            self._plan_state = parsed
+            self._plan_source_text = text
+            self._plan_done_at.clear()
+            self._plan_last_status = {item.index: item.status for item in self._plan_state.items}
+            self._refresh_plan_box()
+
+    def _refresh_chrome(self) -> None:
+        self._refresh_footer()
+        self._refresh_plan_box()
 
     # ── Input handling ────────────────────────────────────────────────────────
 
@@ -460,6 +633,7 @@ class KratosApp(App):
             self.exit()
         elif signal == "clear_history":
             self.kratos_agent.clear_history()
+            self._reset_plan_box_state()
             self._log_markup("  [green]✓[/green]  Conversation history cleared.")
         elif signal == "clear_screen":
             self.query_one("#log", VerticalScroll).remove_children()
@@ -487,6 +661,7 @@ class KratosApp(App):
         self._coder_buf = ""
         self._last_banner_section = ""
         self._planner_filter = None
+        self._reset_plan_box_state()
 
         turn = AssistantTurn()
         self._current_turn = turn
@@ -500,6 +675,7 @@ class KratosApp(App):
         logger = self.kratos_logger
         try:
             for source, content, kind in self.kratos_agent.process(task):
+                logger.log_agent_event(source, content, kind)
                 if self._cancel_event.is_set():
                     break
 
@@ -509,7 +685,7 @@ class KratosApp(App):
                         import json as _j
                         d = _j.loads(content)
                         et = d.pop("type", "unknown")
-                        logger._write(et, **d)
+                        logger.log_event(et, **d)
                     except Exception:
                         pass
                     continue
@@ -517,7 +693,7 @@ class KratosApp(App):
                     try:
                         import json as _j
                         d = _j.loads(content)
-                        logger._write("token_usage", **d)
+                        logger.log_event("token_usage", **d)
                     except Exception:
                         pass
                     continue
@@ -544,7 +720,18 @@ class KratosApp(App):
                     "warn", f"Write blocked (permission={perm}). Use /permission mid or high.", "warn"))
                 break
             if logger:
-                logger.log_file_write(rel_path, content)
+                target = (self.kratos_agent.indexer.root / rel_path).resolve()
+                try:
+                    previous = target.read_text("utf-8") if target.exists() else None
+                except OSError:
+                    previous = None
+                logger.log_file_write(
+                    rel_path,
+                    content,
+                    previous_content=previous,
+                    sha256=hashlib.sha256(content.encode("utf-8", "replace")).hexdigest(),
+                    source="pending_file_changes_summary",
+                )
 
         for rel_path in deletions:
             if not self.kratos_agent.config.can_delete():
@@ -552,7 +739,19 @@ class KratosApp(App):
                     "warn", f"Delete blocked (permission={perm}). Use /permission high.", "warn"))
                 break
             if logger:
-                logger.log_file_delete(rel_path)
+                target = (self.kratos_agent.indexer.root / rel_path).resolve()
+                try:
+                    previous = target.read_text("utf-8") if target.exists() else None
+                    existed = target.exists()
+                except OSError:
+                    previous = None
+                    existed = None
+                logger.log_file_delete(
+                    rel_path,
+                    previous_content=previous,
+                    existed=existed,
+                    source="pending_file_deletions_summary",
+                )
 
         usage = self.kratos_agent.session_usage
         tok   = (usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
@@ -579,9 +778,56 @@ class KratosApp(App):
                 pass
 
         elif src == "tool":
-            self._turn_markup(
-                f"  [dim blue]↳[/dim blue]  [dim]{_rich_escape(content)}[/dim]")
+            # Richer human-visible reporting for work steps: Search (INSPECT) → Read (lines X-Y) → Write (file + +/-) → Verify.
+            if content.startswith("write_file("):
+                self._turn_markup(f"  [bold green]↳ WRITE[/bold green]  {_rich_escape(content)}")
+            elif content.startswith("read_file("):
+                # Explicit "get" / read range display for the user (per work step: after search, the bot reads a section and we show the exact lines).
+                self._turn_markup(f"  [bold cyan]↳ GET / READ RANGE[/bold cyan]  {_rich_escape(content)}")
+            elif content.startswith("inspect_result("):
+                self._turn_markup(f"  [yellow]↳ INSPECT RESULT[/yellow]  {_rich_escape(content)}")
+            else:
+                self._turn_markup(
+                    f"  [dim blue]↳[/dim blue]  [dim]{_rich_escape(content)}[/dim]")
             self._log_tool(content)
+            if content.startswith("write_file(") or content.startswith("delete_file("):
+                try:
+                    path = content.split("(", 1)[1].split(")", 1)[0]
+                    path = ast.literal_eval(path)
+                except Exception:
+                    path = ""
+                if path:
+                    self._record_plan_progress(touched_paths=[str(path)])
+            elif content.startswith("verify_command(") and ("exit=" in content or "exit_code=" in content):
+                try:
+                    cmd_part = content.split("(", 1)[1].split(")", 1)[0]
+                    cmd = ast.literal_eval(cmd_part)
+                except Exception:
+                    cmd = ""
+                try:
+                    tail = content.rsplit("exit_code=", 1)[1] if "exit_code=" in content else content.rsplit("exit=", 1)[1]
+                    exit_code = int(tail.split()[0].strip("[]()"))
+                except Exception:
+                    exit_code = 1
+                if cmd:
+                    self._record_plan_progress(command={
+                        "cmd": cmd,
+                        "exit_code": exit_code,
+                        "is_test": _is_test_verification_command(str(cmd)),
+                    })
+
+        elif src == "command":
+            # Visible $ echo for commands the coder loop actually runs (from do_command / do_inspect).
+            self._turn_markup(f"  [bold cyan]$[/bold cyan] {_rich_escape(content)}")
+
+        elif src == "plan_status":
+            # Live plan/todo status emitted from inside run_coder_loop after every refresh_plan_status.
+            # Combined with the write/verify tool events that drive _record_plan_progress, this
+            # makes the top PlanBox (live todo) update reliably during coder iterations.
+            self._turn_markup("  [magenta]PLAN STATUS (live)[/magenta]")
+            for line in (content or "").splitlines():
+                self._turn_markup(f"  [dim]{_rich_escape(line)}[/dim]")
+            self._refresh_plan_box()
 
         elif src == "header":
             self._current_section = content
@@ -619,6 +865,7 @@ class KratosApp(App):
                 self._planner_buf += content
                 if self._planner_filter:
                     self._planner_filter.feed(content)
+                self._sync_plan_from_planner_buffer()
             self._scroll_log()
 
         elif src == "verify":
@@ -652,6 +899,10 @@ class KratosApp(App):
             self._turn_markup(f"  [dim]⏱ {elapsed_str(sec_elapsed)}[/dim]")
 
             if self._current_section == "planner" and self._planner_buf:
+                try:
+                    self._sync_plan_from_planner_buffer(final=True)
+                except Exception:
+                    pass
                 self.kratos_logger.log_model_output(
                     "planner", self.kratos_config.planner_model, self._planner_buf)
                 self._planner_buf = ""
@@ -691,6 +942,13 @@ class KratosApp(App):
         elif src == "question":
             self._turn_markup(f"  [cyan]Kratos:[/cyan] {_rich_escape(content)}")
 
+        elif src == "report":
+            # Evidence-based final report (Reporter output, verbatim).
+            self._turn_markup("")
+            for line in content.splitlines():
+                self._turn_markup(f"  {_rich_escape(line)}")
+            self.kratos_logger.log_info(f"final_report:\n{content}")
+
         elif src == "ctx_info":
             parts = content.split("|")
             if len(parts) == 3:
@@ -699,6 +957,7 @@ class KratosApp(App):
                     self._ctx_live[rn] = (us, ts)
                 except ValueError:
                     pass
+            self._refresh_plan_box()
 
     def on_agent_done(self, event: AgentDone) -> None:
         self._last_task_s = event.elapsed
