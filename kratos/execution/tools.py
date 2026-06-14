@@ -51,6 +51,7 @@ from ..verification import (
     _command_toolchain,
 )
 from .parsing import _parse_file_changes, _parse_file_deletions
+from .edits import parse_edit_blocks, apply_search_replace
 from .search import (
     extract_keywords,
     glob_files,
@@ -222,6 +223,7 @@ def parse_actions(text: str, pm) -> dict:
         "inspects":     _parse_inspect_markers(text, pm),
         "files":        _parse_file_changes(text),
         "deletes":      _parse_file_deletions(text),
+        "edits":        parse_edit_blocks(text),
         "commands":     _parse_command_markers(text, pm),
         "done":         _has_done_marker(text, pm),
     }
@@ -233,7 +235,8 @@ def has_any_action(actions: dict) -> bool:
         actions.get("reads"), actions.get("ranges"), actions.get("searches"),
         actions.get("greps"), actions.get("globs"), actions.get("web_fetches"),
         actions.get("web_searches"), actions.get("inspects"), actions.get("files"),
-        actions.get("deletes"), actions.get("commands"), actions.get("done"),
+        actions.get("deletes"), actions.get("edits"),
+        actions.get("commands"), actions.get("done"),
     ))
 
 
@@ -636,6 +639,86 @@ def do_delete(
         return {"kind": "delete", "path": rel_path, "ok": False, "detail": str(exc)}
 
 
+def do_edit(
+    project_root: Path, rel_path: str, search: str, replace: str,
+    proof: ProvenWork, attempt: int, original_snapshots: dict,
+) -> Generator[tuple, None, dict]:
+    """``### EDIT: <path>`` with a SEARCH/REPLACE block — a TARGETED change to an
+    existing file. Far safer for weak models than re-emitting the whole file
+    (full rewrites routinely regress code the previous turn fixed). The SEARCH
+    text must match the current on-disk content (exactly, or modulo trailing
+    whitespace / CRLF); otherwise the file is left untouched and the model is
+    told to re-READ instead of silently corrupting it."""
+    rel_path = _strip_md_decor(rel_path)
+    if not (project_root / rel_path).exists():
+        resolved, note = resolve_project_path(project_root, rel_path)
+        if resolved is not None and resolved != rel_path:
+            yield ("tool", f"path_resolve: {note}", "tool")
+            rel_path = resolved
+    target = (project_root / rel_path).resolve()
+    try:
+        target.relative_to(project_root.resolve())
+    except ValueError:
+        yield ("warn", f"edit_file({rel_path!r}) -> refused (escapes project root)", "warn")
+        return {"kind": "edit", "path": rel_path, "ok": False, "detail": "path escapes project root"}
+    if not target.is_file():
+        yield ("warn", f"edit_file({rel_path!r}) -> file does not exist (use ### FILE to create)", "warn")
+        return {"kind": "edit", "path": rel_path, "ok": False, "skipped": True,
+                "detail": "file does not exist — use ### FILE to create it"}
+    try:
+        before = target.read_text("utf-8", errors="replace")
+    except OSError as exc:
+        yield ("warn", f"edit_file({rel_path!r}) -> {exc}", "warn")
+        return {"kind": "edit", "path": rel_path, "ok": False, "detail": str(exc)}
+
+    new_content, status = apply_search_replace(before, search, replace)
+    if new_content == before and status in ("not_found", "empty_search", "ambiguous"):
+        detail = {
+            "not_found": ("SEARCH block not found verbatim — ### READ the file and copy the "
+                          "exact current text (with indentation) into the SEARCH block."),
+            "empty_search": "empty SEARCH block.",
+            "ambiguous": "SEARCH matched multiple places — add surrounding lines to make it unique.",
+        }[status]
+        yield ("warn", f"edit_file({rel_path!r}) -> {status}", "warn")
+        return {"kind": "edit", "path": rel_path, "ok": False, "skipped": True,
+                "detail": detail, "status": status}
+    if new_content == before:
+        yield ("tool", f"edit_file({rel_path!r}) -> no change (replacement already present)", "tool")
+        return {"kind": "edit", "path": rel_path, "ok": True, "status": "noop",
+                "detail": "no change (content already matched replacement)"}
+
+    if rel_path not in original_snapshots:
+        original_snapshots[rel_path] = before
+    try:
+        target.write_text(new_content, encoding="utf-8")
+    except OSError as exc:
+        yield ("error", f"edit_file({rel_path!r}) -> {exc}", "error")
+        return {"kind": "edit", "path": rel_path, "ok": False, "detail": str(exc)}
+
+    from .diffing import diff_stats
+    st = diff_stats(before, new_content)
+    if rel_path not in proof.files_changed:
+        proof.files_changed.append(rel_path)
+    file_bytes = target.stat().st_size
+    new_sha = hashlib.sha256(new_content.encode("utf-8", "replace")).hexdigest()
+    proof.file_checks.append({
+        "path": rel_path, "operation": "edit", "ok": True, "bytes": file_bytes,
+        "lines_added": st.added, "lines_removed": st.removed, "match": status,
+    })
+    if status == "ambiguous":
+        yield ("warn", f"edit_file({rel_path!r}) -> ambiguous; edited the FIRST occurrence", "warn")
+    yield ("tool", f"edit_file({rel_path!r}) -> {st.as_suffix()} lines [{status}]", "tool")
+    yield ("log", json.dumps({
+        "type": "file_write", "path": rel_path, "ok": True, "operation": "edit",
+        "content": new_content, "previous_content": before, "size_bytes": file_bytes,
+        "lines_added": st.added, "lines_removed": st.removed, "match": status,
+        "sha256": new_sha, "attempt": attempt,
+    }, ensure_ascii=False), "log")
+    return {"kind": "edit", "path": rel_path, "ok": True, "status": status,
+            "bytes": file_bytes, "content": new_content,
+            "lines_added": st.added, "lines_removed": st.removed}
+
+
 def do_command(
     agent, project_root: Path, cmd_registry: CommandRegistry, raw_cmd: str,
     proof: ProvenWork,
@@ -891,6 +974,11 @@ def format_observation(observations: list[dict], pm) -> str:
                     lines.append(f"    - {r.get('title')}\n      {r.get('url')}\n      {r.get('snippet')}")
             else:
                 lines.append(f"  WEB_SEARCH `{obs.get('query')}` failed: {obs.get('detail', '?')}")
+        elif kind == "edit":
+            if obs.get("ok"):
+                lines.append(f"  EDIT {obs.get('path')} -> +{obs.get('lines_added',0)}/-{obs.get('lines_removed',0)} [{obs.get('status')}]")
+            else:
+                lines.append(f"  EDIT {obs.get('path')} FAILED: {obs.get('detail','?')}")
         elif kind == "note":
             detail = obs.get("detail") or obs.get("output") or ""
             if detail:

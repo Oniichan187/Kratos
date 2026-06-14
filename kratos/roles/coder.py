@@ -14,6 +14,7 @@ from ..context import ContextPackage
 from ..execution.tools import (
     do_command,
     do_delete,
+    do_edit,
     do_glob,
     do_grep,
     do_inspect,
@@ -334,21 +335,40 @@ def _inject_failure_readback(
     on-disk content of the files it just wrote. In real runs the model never
     re-read its own broken file and could not converge — this closes that
     loop deterministically."""
-    failed = any(
-        o.get("kind") == "command" and not o.get("skipped") and not o.get("ok")
-        for o in observations
-    )
-    if not failed or not touched:
+    failed_cmds = [
+        o for o in observations
+        if o.get("kind") == "command" and not o.get("skipped") and not o.get("ok")
+    ]
+    if not failed_cmds:
         return
-    for rel in touched[:_FAIL_READBACK_MAX_FILES]:
+    # Files the failure DIAGNOSIS blames (e.g. the module named in the traceback)
+    # are often the ones that actually need the fix — not just what was touched.
+    diag_files: list[str] = []
+    try:
+        from ..execution.diagnostics import diagnose_command
+        diag = diagnose_command(failed_cmds[-1])
+        if diag is not None:
+            diag_files = [f for f in (diag.files or []) if f]
+    except Exception:
+        diag_files = []
+    seen: set[str] = set()
+    paths: list[str] = []
+    for rel in [*(touched or []), *diag_files]:
+        rel = (rel or "").replace("\\", "/")
+        if rel and rel not in seen:
+            seen.add(rel)
+            paths.append(rel)
+    if not paths:
+        return
+    for rel in paths[:_FAIL_READBACK_MAX_FILES]:
         excerpt = _read_disk_excerpt(project_root, rel)
         if excerpt is None:
             continue
         observations.append({
             "kind": "note",
             "detail": (
-                f"VERIFICATION FAILED. This is the CURRENT content of `{rel}` as you "
-                f"wrote it to disk — find the error reported above and rewrite the file:\n"
+                f"VERIFICATION FAILED. CURRENT on-disk content of `{rel}` — fix the error "
+                f"reported above with a TARGETED ### EDIT (do not rewrite the whole file):\n"
                 f"```\n{excerpt}\n```"
             ),
         })
@@ -500,6 +520,18 @@ def run_coder_loop(
                 accumulated_deletions.discard(rel_path)
                 touched_files.append(rel_path)
 
+        for rel_path, search, replace in actions.get("edits", []):
+            if not agent.config.can_write():
+                yield ("warn", f"edit_file({rel_path!r}) -> skipped (write permission disabled)", "warn")
+                observations.append({"kind": "edit", "path": rel_path, "ok": False,
+                                     "detail": "write permission disabled"})
+                continue
+            obs = yield from do_edit(project_root, rel_path, search, replace, proof, attempt, original_snapshots)
+            observations.append(obs)
+            if obs.get("ok") and obs.get("status") != "noop":
+                accumulated_changes[rel_path] = obs.get("content", accumulated_changes.get(rel_path, ""))
+                accumulated_deletions.discard(rel_path)
+                touched_files.append(rel_path)
         for rel_path in actions["deletes"]:
             if not agent.config.can_delete():
                 yield ("warn", f"delete_file({rel_path!r}) -> skipped (delete permission disabled)", "warn")
@@ -537,6 +569,7 @@ def run_coder_loop(
         for cmd in actions["commands"]:
             observations.append((yield from do_command(agent, project_root, cmd_registry, cmd, proof)))
 
+        _inject_failure_readback(project_root, touched_files, observations)
         refresh_plan_status(plan_state, proof, touched_files)
         plan_block = render_plan_status(plan_state.items)
         plan_compact = render_checklist(plan_state.items, compact=True)
@@ -737,6 +770,16 @@ def execute_structured_work_steps_for_plan(
                     accumulated_deletions.discard(rel)
                     touched.append(rel)
 
+            for rel, search, replace in actions.get("edits", []):
+                if not agent.config.can_write():
+                    yield ("warn", f"edit_file({rel!r}) -> skipped (permission)", "warn")
+                    continue
+                obs = yield from do_edit(project_root, rel, search, replace, proof, attempt, original_snapshots)
+                observations.append(obs)
+                if obs.get("ok") and obs.get("status") != "noop":
+                    accumulated_changes[rel] = obs.get("content", accumulated_changes.get(rel, ""))
+                    accumulated_deletions.discard(rel)
+                    touched.append(rel)
             for rel in actions["deletes"]:
                 if not agent.config.can_delete():
                     continue
