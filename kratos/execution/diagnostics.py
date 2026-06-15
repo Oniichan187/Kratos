@@ -97,6 +97,14 @@ _ARG_ERR_RE = re.compile(
     re.I,
 )
 _TYPE_ERROR_RE = re.compile(r"TypeError: (?P<msg>.+)", re.I)
+_NUMERIC_ON_STR_RE = re.compile(
+    r"unsupported operand type\(s\) for [-+*/%]+: '(?:int|float)' and 'str'"
+    r"|unsupported operand type\(s\) for [-+*/%]+: 'str' and '(?:int|float)'"
+    r"|'[<>]=?' not supported between instances of '(?:str|int|float)' and '(?:str|int|float)'"
+    r"|invalid literal for int\(\) with base 10",
+    re.I,
+)
+_DID_NOT_RAISE_RE = re.compile(r"DID NOT RAISE|Failed: DID NOT RAISE", re.I)
 _ASSERT_RE = re.compile(r"^E\s+(?:assert|AssertionError)\b.*", re.I | re.M)
 _PYTEST_SUMMARY_RE = re.compile(r"(?P<failed>\d+) failed", re.I)
 _COLLECT_ERROR_RE = re.compile(r"errors? during collection|ERROR collecting", re.I)
@@ -331,6 +339,23 @@ class FailureDiagnoser:
                 files=files,
             )
 
+        # ── 7b. numeric op on string values (CSV/JSON fields are str) ───────
+        if _NUMERIC_ON_STR_RE.search(text):
+            files = self._collect_py_files(text)
+            return Diagnosis(
+                category="numeric_on_string",
+                signature="numeric_on_string:" + (files[0] if files else "?"),
+                summary="Arithmetic/comparison on string values — CSV/text fields are str, not numbers.",
+                fix_instruction=(
+                    "You are doing math or a numeric comparison on STRING values (CSV/JSON "
+                    "fields arrive as str). Convert to numbers FIRST, e.g. "
+                    "`nums = [float(v) for v in values]`, then sum/min/max/compare the numbers. "
+                    "If a value cannot be converted, raise ValueError (the tests expect that). "
+                    "Never sum or order the raw strings."
+                ),
+                files=files,
+            )
+
         # ── 8. generic TypeError (runtime — ranked above assertion) ──────────
         m = _TYPE_ERROR_RE.search(text)
         if m:
@@ -343,6 +368,22 @@ class FailureDiagnoser:
                     "A value has the wrong type for how it is used (a common case: a parameter "
                     "annotated as Path but called with a str and used with str methods). Make the "
                     "declared type and the actual usage agree."
+                ),
+                files=files,
+            )
+
+        # ── 8b. expected exception not raised (pytest.raises) ───────────────
+        if _DID_NOT_RAISE_RE.search(text):
+            files = self._collect_py_files(text)
+            return Diagnosis(
+                category="missing_raise",
+                signature="missing_raise:" + (files[0] if files else "?"),
+                summary="A test expected an exception, but the code did not raise it.",
+                fix_instruction=(
+                    "The test uses `pytest.raises(...)`: your function MUST raise that exception "
+                    "for this input (e.g. a missing column, unknown operator, or non-numeric value "
+                    "must raise ValueError). Add the explicit validation/guard that raises it — do "
+                    "not silently return or use dict.get() defaults that hide the missing key."
                 ),
                 files=files,
             )

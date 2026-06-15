@@ -126,7 +126,14 @@ class KratosConfig:
     build_cmd:             str | None = None
     test_cmd:              str | None = None
     build_test_retries:    int = 3
-    max_verify_iterations: int = 10
+    # Verify-revision budget. <= 0 means UNBOUNDED: keep planning/coding/verifying
+    # until the real tests pass (Kratos is intentionally NOT capped by an iteration
+    # count — a converging run still finishes in a few iterations).
+    max_verify_iterations: int = 0
+    # Hard safety net for an UNBOUNDED loop: give up only when CLEARLY stuck —
+    # the *identical* failure signature has repeated this many times with no
+    # progress. 0 disables it (truly endless). Generous on purpose.
+    no_progress_abort:     int = 40
     auto_discover_verification: bool = True
     require_proven_work:        bool = True
     require_test_for_verified:  bool = True
@@ -193,6 +200,10 @@ class KratosConfig:
                 inst.relay_num_ctx = max(inst.relay_num_ctx, 65536)
             except Exception:
                 pass
+        # Legacy upgrade: the old hard cap of 10 becomes UNBOUNDED so existing
+        # saved configs also stop giving up early (set a positive value to re-cap).
+        if getattr(inst, "max_verify_iterations", 0) == 10:
+            inst.max_verify_iterations = 0
         return inst
 
     # ── Permission helpers ────────────────────────────────────────────────────

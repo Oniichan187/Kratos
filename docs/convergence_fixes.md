@@ -53,3 +53,36 @@ remaining non-convergence is the local model's own code quality. These changes
 reduce regressions and give the model the real code + a surgical tool, but a
 sufficiently weak model can still fail to fix a genuine logic bug — the verify
 gate then correctly reports PARTIAL/FAILED rather than a fake success.
+
+## 3. Run-until-solved (no iteration cap)  [2026-06-14]
+
+The verify-revise loop was hard-capped at `max_verify_iterations=10`, so Kratos
+gave up before a slow local model could converge. Now:
+
+- `max_verify_iterations <= 0` means **UNBOUNDED** (new default `0`); a legacy
+  saved value of `10` is auto-upgraded to unbounded on load.
+- `no_progress_abort` (default `40`, `0` = never): the only stop for an unbounded
+  run — it halts solely when the *identical* failure signature has repeated that
+  many times (genuinely stuck), then reports honestly. Not an iteration cap.
+- `max_coder_iterations` was already `0` (unbounded).
+
+## 4. Targeted diagnoses for the recurring weak-model bugs
+
+Added two specific, directive `Diagnosis` categories (from real csvstats runs):
+- **`numeric_on_string`** — `TypeError: unsupported operand … 'int' and 'str'`
+  / numeric comparison on str / `invalid literal for int()`: tells the model to
+  `float(v)` the CSV string values before arithmetic and to raise `ValueError`
+  on non-numeric input.
+- **`missing_raise`** — pytest `DID NOT RAISE`: tells the model its function must
+  actually `raise` (e.g. missing column / unknown op → `ValueError`) instead of
+  using `dict.get()` defaults that hide the error.
+
+Tests: `kratos/tests/test_convergence.py` (5). Full non-UI suite: **186 passed**.
+
+## Honest limit (unchanged)
+
+These give a weak local model more chances and far more precise guidance, but
+cannot make a 4B abliterated model write correct code it doesn't "know". On the
+csvstats probe the model still left 7/22 failing — the verify gate then correctly
+reports PARTIAL/FAILED. For reliably green runs on non-trivial tasks, a stronger
+coder model is the remaining lever.

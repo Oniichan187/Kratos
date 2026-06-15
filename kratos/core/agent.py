@@ -391,7 +391,12 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
             return
 
         # ── plan → code → verify loop ─────────────────────────────────────────
-        max_iter   = self.config.max_verify_iterations
+        _cfg_max_iter = int(self.config.max_verify_iterations)
+        _iter_unbounded = _cfg_max_iter <= 0
+        # <= 0 means run until the tests pass (or a no-progress wall). 1_000_000
+        # is an effectively-infinite ceiling; `range` is lazy so this is free.
+        max_iter   = _cfg_max_iter if _cfg_max_iter > 0 else 1_000_000
+        _no_progress_abort = int(getattr(self.config, "no_progress_abort", 0) or 0)
         plan_text  = ""
         plan_state = parse_execution_plan("")
         verify_feedback = ""
@@ -419,7 +424,8 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
 
         for attempt in range(max_iter):
             is_retry   = attempt > 0
-            iter_label = f"iteration {attempt + 1}/{max_iter}"
+            iter_label = (f"iteration {attempt + 1}" if _iter_unbounded
+                          else f"iteration {attempt + 1}/{max_iter}")
 
             if is_retry:
                 msg = pm.get_snippet("revising_iteration").format(current=attempt + 1, max=max_iter)
@@ -1210,6 +1216,13 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
                             yield ("warn",
                                    f"Repair stall detected ({_diag.category} ×{seen}) — escalating diagnosis.",
                                    "warn")
+                        if _no_progress_abort and seen >= _no_progress_abort:
+                            _report_problems.append(
+                                f"Abgebrochen: identischer Fehler {seen}x ohne Fortschritt ({_diag.category}).")
+                            yield ("warn",
+                                   f"No progress after {seen} identical failures ({_diag.category}) "
+                                   "- stopping the verify loop and reporting honestly.", "warn")
+                            break
                 yield ("warn", verify_feedback[:500], "warn")
                 yield ("log", json.dumps({"type": "verify_decision",
                                           "decision": "NEEDS_REVISION",
