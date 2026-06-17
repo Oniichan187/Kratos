@@ -140,6 +140,10 @@ def _stream_agent(
     # Live plan/todo state (compact) — updated from planner flush + change-aware coder events.
     # Mirrors the ctx_live pattern so the bottom status bar can show it next to the live P/C/V stats.
     plan_live: dict = {"done": 0, "total": 0, "compact": "", "label": ""}
+    # Tracks the last checklist we reprinted to the transcript so we refresh the
+    # visible todo list (□ -> ☑) when progress advances, without spamming on every
+    # micro-event. The one-time "PLAN CHECKLIST" box never updates by itself.
+    plan_render_cache: dict = {"done": 0, "text": ""}
 
     # Running completion-token estimate — Ollama only reports real counts at
     # the *end* of each model call (the "usage"/"ctx_info" events), so without
@@ -317,11 +321,13 @@ def _stream_agent(
                 logger.log_info(f"command: {content}")
 
             elif source == "plan_status":
-                # Compact live plan update (change-aware from coder loop or planner).
-                # We keep history clean — only a tiny note (or nothing). The real live view
-                # is in the bottom status bar (integrated with the ctx "live stats").
+                # Live plan update (change-aware from coder loop or planner). The
+                # bottom status bar shows the compact count; in addition we reprint
+                # the full checklist to the transcript whenever progress advances,
+                # so the visible todo list actually ticks □ -> ☑ (the one-time
+                # "PLAN CHECKLIST" box printed by the planner never updates itself).
                 if content:
-                    # Parse the compact form we now receive: "PLAN d/t | compact text"
+                    # Parse the compact form we now receive: "PLAN d/t | <checklist>"
                     try:
                         label, rest = content.split(" | ", 1)
                         plan_live["label"] = label.strip()
@@ -333,6 +339,15 @@ def _stream_agent(
                                 d, t = nums.split("/")
                                 plan_live["done"] = int(d)
                                 plan_live["total"] = int(t)
+                        # Reprint the checklist only when the done-count changed, so
+                        # the user watches it progress without per-micro-turn spam.
+                        if (plan_live["done"] != plan_render_cache["done"]
+                                and rest.strip() and rest.strip() != plan_render_cache["text"]):
+                            plan_render_cache["done"] = plan_live["done"]
+                            plan_render_cache["text"] = rest.strip()
+                            console.print(f"  [bold magenta]{plan_live['label']}[/bold magenta]")
+                            for _ln in rest.strip().splitlines():
+                                console.print(f"    {_ln}")
                     except Exception:
                         plan_live["compact"] = str(content)[:200]
                 # very quiet in transcript (no more full 20-item spam)

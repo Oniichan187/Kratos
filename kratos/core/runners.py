@@ -14,11 +14,35 @@ from datetime import datetime
 from pathlib import Path
 from typing import Generator
 
+import re as _re
+
 from ..llm.tokens import estimate, estimate_messages, fit_to_budget
 from ..prompts import get_system, load_prompts
 from ..roles import _needs_thinking
 from ..router import Route
 from ..context import ScopeType
+
+
+def _plan_from_thinking(thinking: str) -> str:
+    """Salvage a usable plan from a reasoning model's <think> stream.
+
+    DeepSeek-R1-style models emit their entire answer inside the thinking
+    channel and Ollama's ``think=False`` does not reliably suppress it. Their
+    reasoning, however, already contains a fully structured plan (Summary / Key
+    Changes / Files / Execution Order / Test Plan). Rather than letting the run
+    die with an empty plan, extract that: prefer the text from the first
+    markdown heading onward, else use the tail (where the conclusion/plan
+    normally sits). Always returns non-empty text when given non-empty input.
+    """
+    text = (thinking or "").strip()
+    if not text:
+        return ""
+    m = _re.search(r"(?m)^#{1,4}\s+\S", text)
+    if m:
+        text = text[m.start():].strip()
+    if len(text) > 6000:          # keep it bounded so it can't blow the next prompt
+        text = text[-6000:].strip()
+    return text or (thinking or "").strip()
 
 
 class _RoleRunnerMixin:
@@ -364,6 +388,17 @@ class _RoleRunnerMixin:
                         yield ("planner", token, kind)
             except Exception as exc:
                 yield ("error", f"Planner no-think retry failed: {exc}", "error")
+
+        # Robustness for reasoning models: if the model spent everything in the
+        # <think> channel and produced no final plan text, salvage the plan from
+        # the thinking instead of returning nothing (an empty plan kills the run).
+        if not full.strip() and thinking.strip():
+            full = _plan_from_thinking(thinking)
+            if full.strip():
+                yield ("warn",
+                       "Planner emitted only reasoning tokens — using the structured "
+                       "plan recovered from its thinking.", "warn")
+                yield ("planner", full, "text")
 
         if thinking:
             yield ("log", json.dumps({"type": "model_thinking", "role": "planner",

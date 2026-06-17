@@ -18,8 +18,10 @@ of quoting/injection surprises.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Literal
@@ -35,6 +37,28 @@ ShellType = Literal["powershell", "cmd", "bash", "auto"]
 
 def _cap(text: str) -> str:
     return text or ""
+
+
+def _normalize_windows_python(command: str, shell_name: str) -> str:
+    """Route leading ``python3`` through the active interpreter on Windows.
+
+    Windows often exposes ``python3.exe`` as a Microsoft Store app-execution
+    alias. That alias exits 1 and prints setup guidance instead of behaving like
+    Python. Kratos should execute with the interpreter that is already running
+    the agent.
+    """
+    if os.name != "nt":
+        return command
+    match = re.match(r"^(\s*)python3(?:\.exe)?(?=\s|$)(.*)$", command, re.I | re.S)
+    if not match:
+        return command
+    indent, rest = match.groups()
+    exe = sys.executable
+    if shell_name == "powershell":
+        escaped = exe.replace("'", "''")
+        return f"{indent}& '{escaped}'{rest}"
+    escaped = exe.replace('"', r'\"')
+    return f'{indent}"{escaped}"{rest}'
 
 
 class ShellRunner:
@@ -96,13 +120,6 @@ class ShellRunner:
             "cwd": str(workdir), "timeout_seconds": timeout,
         }
 
-        verdict = check_command(command)
-        if not verdict:
-            base.update(blocked=True, block_reason=verdict.reason,
-                        stderr=f"SafetyGuard: {verdict.reason}")
-            self._log(base)
-            return base
-
         resolved = self._resolve_shell(shell_type)
         if resolved is None:
             base.update(exit_code=127,
@@ -110,12 +127,29 @@ class ShellRunner:
             self._log(base)
             return base
         shell_name, argv_prefix = resolved
+        exec_command = _normalize_windows_python(command, shell_name)
+        base["cmd"] = exec_command
         base["shell"] = shell_name
 
+        verdict = check_command(exec_command)
+        if not verdict:
+            base.update(blocked=True, block_reason=verdict.reason,
+                        stderr=f"SafetyGuard: {verdict.reason}")
+            self._log(base)
+            return base
+
         started = time.monotonic()
+        run_command = exec_command
+        if shell_name == "powershell":
+            run_command = (
+                "$global:LASTEXITCODE = $null; "
+                f"{exec_command}; "
+                "if ($null -ne $global:LASTEXITCODE) { exit $global:LASTEXITCODE }; "
+                "if (-not $?) { exit 1 }"
+            )
         try:
             proc = subprocess.run(
-                [*argv_prefix, command],
+                [*argv_prefix, run_command],
                 capture_output=True, text=True,
                 encoding="utf-8", errors="replace",
                 timeout=timeout, cwd=str(workdir),

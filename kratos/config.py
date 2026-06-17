@@ -33,9 +33,9 @@ _KRATOS_INSTALL_DIR = Path(__file__).resolve().parents[1]
 #   Coder     : dedicated code model, abliterated — best coding quality (32k native)
 #   Verifier  : same strong reasoning as planner (strict PROVEN_WORK judge)
 #   Compressor: tiny but faithful summarizer/memory extractor (Phi-4-mini ablit)
-PLANNER_MODEL_NAME  = "huihui_ai/qwen3-abliterated:8b"
+PLANNER_MODEL_NAME  = "huihui_ai/deepseek-r1-abliterated:8b-0528-qwen3-q4_K_M"
 CODER_MODEL_NAME    = "huihui_ai/qwen2.5-coder-abliterate:7b-instruct-q4_K_M"
-VERIFIER_MODEL_NAME = "huihui_ai/qwen3-abliterated:8b"
+VERIFIER_MODEL_NAME = "huihui_ai/deepseek-r1-abliterated:8b-0528-qwen3-q4_K_M"
 COMPRESSOR_MODEL    = "kratos-planner"         # Phi-4-mini-instruct-abliterated GGUF
 FALLBACK_CODER_MODEL = "huihui_ai/qwen3.5-abliterated:4b"
 ALT_PLANNER_MODEL   = "huihui_ai/qwen3-abliterated:8b"
@@ -85,21 +85,35 @@ class KratosConfig:
     # This is required for huge projects that massively exceed "normal" ctx,
     # and for the coder/verifier to see complete plans + full file state + memory.
     # choose_num_ctx(..., force_max_context=True) implements this.
-    planner_num_ctx:    int = 40960    # full max for huihui_ai/qwen3-abliterated:8b
+    planner_num_ctx:    int = 131072   # full max for deepseek-r1-abliterated:8b-0528-qwen3 (Qwen3-8B base, 128k native)
     coder_num_ctx:      int = 32768    # full max for huihui_ai/qwen2.5-coder-abliterate:7b (verified)
-    verifier_num_ctx:   int = 40960    # full max — same strong ablit model as planner
+    verifier_num_ctx:   int = 131072   # full max — same R1 model as planner
     compressor_num_ctx: int = 32768    # generous for kratos-planner (Phi-4-mini-abliterated). Use its real max when known
     relay_num_ctx:      int = 131072   # coder relay gets big window for giant inputs before planner sees them
 
-    # VRAM ceiling: hard cap for all roles even if model advertises more.
-    # On 6 GB laptop keep conservative; raise on bigger cards.
-    # The "always max" policy still respects this.
-    vram_ctx_ceiling: int = 65536
+    # VRAM ceiling: hard cap on num_ctx for every role, even if the model
+    # advertises more. THIS IS THE SINGLE MOST IMPORTANT PERFORMANCE KNOB.
+    #
+    # Ollama allocates the FULL KV cache for num_ctx up front when the model
+    # loads — it does NOT "only materialize used pages". For an 8B model the
+    # KV cache costs ~0.14 MB/token, so:
+    #     8192 ctx  -> ~1.2 GB KV   (fits a 6 GB card next to ~4.9 GB weights)
+    #    65536 ctx  -> ~9.4 GB KV   (does NOT fit -> Ollama offloads to system
+    #                                RAM -> generation collapses to ~3 tok/s,
+    #                                i.e. the 10-minute planner stall).
+    # Keep this at 8192 on a 6 GB laptop (RTX 4050 class). Raise to 16384/32768
+    # only on bigger cards. Huge inputs are handled by the relay + compression
+    # layers, NOT by a giant window.
+    vram_ctx_ceiling: int = 8192
 
     # ── Temperatures ──────────────────────────────────────────────────────────
-    planner_temp:    float = 0.6
+    # DeepSeek-R1 reasoning models must run at LOW temperature (0.1).
+    # At 0.6 the model enters endlessly circular <think> chains and exhausts
+    # the full predict budget without ever writing a single plan line (~22 min
+    # observed on this hardware for a trivial task).  0.1 → focused, fast output.
+    planner_temp:    float = 0.1
     coder_temp:      float = 0.15
-    verifier_temp:   float = 0.15
+    verifier_temp:   float = 0.1
     compressor_temp: float = 0.3
 
     # ── Auto-compression ──────────────────────────────────────────────────────
@@ -137,6 +151,15 @@ class KratosConfig:
     auto_discover_verification: bool = True
     require_proven_work:        bool = True
     require_test_for_verified:  bool = True
+    # Deterministic verification: the pipeline ALREADY runs the real tests and
+    # gates on their exit code (PROVEN_WORK) before any LLM verifier call. When
+    # this is True, a satisfied PROVEN_WORK (real tests passed) is accepted
+    # directly and the redundant LLM-verifier model swap is skipped. This makes
+    # the loop a tight  planner -> coder -> run tests -> (pass? done : redo),
+    # which is both faster (no extra 8B reload per iteration) and more honest
+    # (the test exit code is the ground truth, not a second model's opinion).
+    # Set False to restore the old "LLM judges PROVEN_WORK" behavior.
+    deterministic_verify:       bool = True
     verification_timeout_seconds: int = 120
     # Repair-loop stall guard: after this many identical failure signatures the
     # agent escalates the diagnosis instead of re-running the same dead end
@@ -204,6 +227,30 @@ class KratosConfig:
         # saved configs also stop giving up early (set a positive value to re-cap).
         if getattr(inst, "max_verify_iterations", 0) == 10:
             inst.max_verify_iterations = 0
+
+        # ── Hardware safety net (prevents the 10-minute planner stall) ─────────
+        # A config saved by an earlier version may still carry vram_ctx_ceiling
+        # = 65536. On a 6-8 GB laptop that forces the 8B model's KV cache out of
+        # VRAM into system RAM and generation collapses to ~3 tok/s (the planner
+        # then "thinks" for 10+ minutes and never emits a plan). Clamp clearly
+        # impossible ceilings back to a value that actually fits. 8192-16384 are
+        # left untouched so users with bigger GPUs keep their explicit choice.
+        try:
+            if int(inst.vram_ctx_ceiling) > 16384:
+                inst.vram_ctx_ceiling = 8192
+        except (TypeError, ValueError):
+            inst.vram_ctx_ceiling = 8192
+
+        # DeepSeek-R1 / reasoning models spin in endless <think> loops at high
+        # temperature (0.6 -> ~22 min, no plan). Clamp a stale saved temperature
+        # so the planner/verifier stay focused and fast.
+        for _m_attr, _t_attr in (("planner_model", "planner_temp"),
+                                  ("verifier_model", "verifier_temp")):
+            try:
+                if "r1" in str(getattr(inst, _m_attr, "")).lower():
+                    setattr(inst, _t_attr, min(float(getattr(inst, _t_attr)), 0.3))
+            except (TypeError, ValueError):
+                pass
         return inst
 
     # ── Permission helpers ────────────────────────────────────────────────────

@@ -156,9 +156,11 @@ class TestEffectiveContextWindows(unittest.TestCase):
     def test_role_context_windows_show_real_model_call_limits(self):
         cfg = KratosConfig(coder_num_ctx=262144, vram_ctx_ceiling=65536)
         windows = role_context_windows(cfg)
-        self.assertEqual(windows["coder"], 65536)
-        self.assertEqual(windows["planner"], 40960)
-        self.assertEqual(windows["verifier"], 40960)
+        # coder model (qwen2.5-coder 7b) maxes at 32768 regardless of the 65536 cap;
+        # planner/verifier (deepseek-r1 8b, 128k native) are capped at 65536 here.
+        self.assertEqual(windows["coder"], 32768)
+        self.assertEqual(windows["planner"], 65536)
+        self.assertEqual(windows["verifier"], 65536)
 
 
 class TestPromptContextGuard(unittest.TestCase):
@@ -183,7 +185,7 @@ class TestPromptContextGuard(unittest.TestCase):
             huge_msg,
             1024,
         )
-        self.assertEqual(num_ctx, 65536)
+        self.assertEqual(num_ctx, 32768)
         self.assertLessEqual(prompt_tok, num_ctx)
         self.assertLess(len(stored_msg), len(huge_msg))
         self.assertTrue(any(ev[0] == "warn" for ev in events))
@@ -1100,6 +1102,76 @@ VALUE = 1
                 os.chdir(old_cwd)
 
 
+class TestStructuredWorkCompletion(unittest.TestCase):
+    """A passing test command must close the current checklist item even when the
+    plan was recovered from R1 thinking and parsed to bare titles (no file_refs /
+    verify_cmd). Otherwise every item burns all its turns and prints a misleading
+    'not verifiably finished' warning despite pytest exit=0 (observed 2026-06-17)."""
+
+    class FakeAgent:
+        def __init__(self, root, outputs, results, **cfg):
+            self.config = KratosConfig(always_max_ctx=False, **cfg)
+            self.pending_file_changes = []
+            self.pending_file_deletions = []
+            self._memory = MagicMock()
+            self._knowledge = None
+            self._outputs = list(outputs)
+            self.command_results = list(results)
+            self.prompts = []
+            self._indexer = types.SimpleNamespace(root=root)
+
+        def _is_cancelled(self):
+            return False
+
+        def _run_coder(self, msg):
+            self.prompts.append(msg)
+            out = self._outputs.pop(0) if self._outputs else "### VERIFY: python -m pytest test_mathx.py"
+            yield ("coder", out, "text")
+            return out
+
+        def _run_verification_command(self, command):
+            r = dict(self.command_results.pop(0)) if self.command_results else {
+                "exit_code": 0, "duration_seconds": 0.01, "output": "ok"}
+            r.update({"cmd": command.cmd, "purpose": command.purpose,
+                      "source": command.source, "is_test": command.is_test})
+            return r
+
+    def test_passing_test_completes_bare_item_in_one_turn(self):
+        from kratos.context import ContextPackage
+        from kratos.roles.coder import execute_structured_work_steps_for_plan
+        from kratos.planning import parse_execution_plan, plan_all_done
+
+        plan = parse_execution_plan(
+            "## Execution Order\n"
+            "1. Implement `mathx.add` function in mathx.py.\n"
+            "2. Run the test suite with `python -m pytest test_mathx.py`.\n"
+            "3. Delete legacy_helper.py.\n"
+        )
+        self.assertTrue(all(not it.file_refs for it in plan.items))  # the bug precondition
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "test_mathx.py").write_text("def test_add():\n    assert True\n", encoding="utf-8")
+            (root / "mathx.py").write_text("def add(a, b):\n    pass\n", encoding="utf-8")
+            reg = CommandRegistry(KratosConfig(always_max_ctx=False), root).discover()
+            outs = ["### FILE: mathx.py\n```python\ndef add(a, b):\n    return a + b\n```\n"
+                    "### VERIFY: python -m pytest test_mathx.py\n"] * 3
+            res = [{"exit_code": 0, "duration_seconds": 0.01, "output": "1 passed"}] * 3
+            agent = self.FakeAgent(root, outs, res, permission="high", max_work_step_turns=4)
+            proof = ProvenWork(iteration=1)
+            events, _ = drain_generator(execute_structured_work_steps_for_plan(
+                agent, "impl", plan,
+                ContextPackage(user_input="t", intent="refactor", route="planner_then_coder"),
+                reg, proof, 0, "", root, {},
+            ))
+
+            self.assertTrue(plan_all_done(plan))
+            self.assertEqual([it.index for it in plan.items if it.status == "done"], [1, 2, 3])
+            self.assertFalse(any("not verifiably finished" in str(c) for _, c, _ in events))
+            # one turn per item (3), not 4 turns x 3 items = 12
+            self.assertEqual(len(agent.prompts), 3)
+
+
 class TestProvenWork(unittest.TestCase):
     def test_safe_command_filter_rejects_shell_chains(self):
         self.assertTrue(_is_safe_verification_command("python -m pytest tests"))
@@ -1253,12 +1325,16 @@ class TestKratosConfig(unittest.TestCase):
     def test_defaults(self):
         cfg = KratosConfig()
         self.assertEqual(cfg.permission, "mid")
-        # New policy: defaults are the model maximums (max context window always)
-        self.assertEqual(cfg.planner_num_ctx,    40960)
-        self.assertEqual(cfg.coder_num_ctx,      262144)
-        self.assertEqual(cfg.verifier_num_ctx,   40960)
+        # Configured ceilings are the model maximums; the EFFECTIVE window per
+        # call is capped by vram_ctx_ceiling (see TestEffectiveContextWindows).
+        self.assertEqual(cfg.planner_num_ctx,    131072)
+        self.assertEqual(cfg.coder_num_ctx,      32768)
+        self.assertEqual(cfg.verifier_num_ctx,   131072)
         self.assertEqual(cfg.compressor_num_ctx, 32768)
+        # 6 GB-safe KV-cache ceiling — the knob that prevents the planner stall.
+        self.assertEqual(cfg.vram_ctx_ceiling,   8192)
         self.assertTrue(getattr(cfg, "always_max_ctx", True))
+        self.assertTrue(getattr(cfg, "deterministic_verify", True))
         self.assertEqual(cfg.verifier_model, cfg.planner_model)
         self.assertIsNotNone(cfg.compressor_model)
         self.assertTrue(cfg.require_proven_work)
@@ -1543,8 +1619,9 @@ class TestPromptManager(unittest.TestCase):
         self.assertEqual(s, "")
 
     def test_get_predict_defaults(self):
-        # predict.plan raised 2048→4096 (planner was truncating mid-plan; fix 2 of log-analysis)
-        self.assertEqual(self._pm.get_predict("plan"), 4096)
+        # predict.plan capped at 2048 to bound DeepSeek-R1 thinking; the planner's
+        # _plan_from_thinking fallback salvages a plan if the budget is hit.
+        self.assertEqual(self._pm.get_predict("plan"), 2048)
         self.assertEqual(self._pm.get_predict("code"), 16384)
         self.assertEqual(self._pm.get_predict("verify"), 512)
         self.assertEqual(self._pm.get_predict("relay"), 1200)

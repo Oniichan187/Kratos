@@ -1,335 +1,252 @@
-# Kratos — Local Abliterated Max-Context 4-Role CLI Agent
+# Kratos
 
-**Kratos** — fully local, all models **abliterated** (no safety filters).
+Kratos is a local Ollama-backed coding agent for Windows and WSL. It reads a
+project, classifies the request, builds a focused context, plans the work,
+edits files through explicit tool markers, runs real build/test commands, and
+finishes with an evidence-based report.
 
-4 roles that play perfectly together:
-- **Planner** — full max ctx (40k) every time, writes a detailed Markdown plan plus a short visible checklist
-- **Coder** — full 262k ctx, uses an adaptive OBSERVE -> ACT loop with `READ`, `INSPECT`, `FILE`, `DELETE`, `VERIFY`, `RUN`, `DONE`
-- **Verifier** — full max ctx, **really executes every test** and only accepts VERIFIED on solid PROVEN_WORK plus final goal fit
-- **Auto-Composer (Compressor)** — full ctx, **never destroys information**, feeds durable facts into `.kratos/memory.json` and Markdown compression artifacts under `.kratos/knowledge/compressions/`
+The project is optimized for local models that need strong scaffolding: command
+and file operations are gated, verification is derived from real command output,
+and final success is not taken from model text.
 
-Works for tiny tasks **and** for huge monorepos that massively exceed any ctx window (Large-Input Relay via coder + lossless compress + memory).
+## Current Defaults
 
-GitHub repo: https://github.com/Oniichan187/Kratos
+The checked-in defaults are conservative for a 6 GB VRAM laptop. Kratos requests
+the largest useful context window, then caps planner, coder, and verifier calls
+with `vram_ctx_ceiling`.
 
-All via Ollama, Windows native, sequential loading (laptop friendly, 4-8 GB VRAM).
+| Role | Default model | Configured role window |
+|---|---|---:|
+| Planner | `huihui_ai/deepseek-r1-abliterated:8b-0528-qwen3-q4_K_M` | 131072 |
+| Coder | `huihui_ai/qwen2.5-coder-abliterate:7b-instruct-q4_K_M` | 32768 |
+| Verifier | `huihui_ai/deepseek-r1-abliterated:8b-0528-qwen3-q4_K_M` | 131072 |
+| Compressor | `kratos-planner` | 32768 |
+| Relay | planner model | 131072 |
+| Embeddings | `nomic-embed-text` | model default |
 
----
+Important effective settings:
 
-## Schnellstart
+- `vram_ctx_ceiling`: `8192`
+- `always_max_ctx`: `true`
+- `deterministic_verify`: `true`
+- `max_verify_iterations`: `0` means unbounded until success, no progress, or a
+  hard safety stop.
+- `no_progress_abort`: `40`
+- `protect_existing_tests`: `true`
+
+With these defaults, planner/coder/verifier calls are capped at 8192 tokens even
+though the role and model maxima are larger. Compressor and relay windows use
+their configured values.
+
+## Install
+
+Run the Windows installer from an elevated shell:
+
+```powershell
+.\install.bat
+```
+
+The installer checks or installs WSL2 Ubuntu, checks NVIDIA CUDA visibility,
+installs Python requirements, provisions Ollama in WSL, pulls the configured
+models, and writes the local config.
+
+Manual setup is also available:
 
 ```powershell
 pip install -r requirements.txt
-python setup_models.py      # einmalig: Modelle einrichten
-kratos                      # aus beliebigem Projektverzeichnis starten
+python setup_models.py
 ```
 
----
+`setup_models.py` is idempotent. It starts Ollama when needed, ensures the
+planner/coder/verifier and embedding models exist, creates `kratos-planner` from
+a local GGUF when available, and saves the current configuration.
 
-## Modelle (alle abliterated — keine Safety-Filter)
+## Run
 
-Kratos nutzt bei **jedem** Aufruf das **maximale Kontextfenster** des jeweiligen Modells (innerhalb des VRAM-Ceilings). Keine "kleine Prompts = kleines Fenster".
-
-| Rolle | Modell (abliterated) | max ctx | Aufgabe |
-|---|---|---|---|
-| **Planner** | `huihui_ai/deepseek-r1-abliterated:8b-0528-qwen3-q4_K_M` | 65 536 (VRAM-cap; 128k nativ) | Analyse, detaillierter Plan mit verifizierbaren Schritten |
-| **Coder** | `huihui_ai/qwen2.5-coder-abliterate:7b-instruct-q4_K_M` | 32 768 | Implementiert **einen Plan-Schritt nach dem anderen**: nachdenken, Befehl anzeigen, umsetzen, Test → nächster Schritt |
-| **Verifier** | `huihui_ai/deepseek-r1-abliterated:8b-0528-qwen3-q4_K_M` | 65 536 (VRAM-cap; 128k nativ) | Führt wirklich alle Tests aus (pro Schritt + finaler Sweep), prüft PROVEN_WORK streng |
-| **Auto-Composer** (Compressor) | `kratos-planner` (Phi-4-mini-abliterated GGUF) | ~32k+ | Verlustfreie History-Kompression + Memory-Extraktion in `.kratos/memory.json` (keine Info wird zerstört) |
-
-Alle Modelle laufen **sequenziell** — nie gleichzeitig im VRAM. Optimiert für Laptops (RTX 4050 6 GB Klasse).
-
----
-
-## Pipeline (max-ctx + adaptive loop + lossless)
-
-```
-User Input
-  → Analyzer + Classifier (regel-basiert) → Router
-  → Context (mit Memory aus .kratos) + ggf. Large-Input Relay (Coder 262k vor Planner)
-
-  Planner (full 40k ctx) → detaillierter Markdown-Plan + sichtbare Checkliste
-
-  Coder (full 262k) — adaptive OBSERVE -> ACT loop:
-      - denkt "wie genau umsetzen + Risiken + welcher Befehl zum Testen/Inspektieren?"
-      - kann READ / INSPECT / FILE / DELETE / VERIFY / RUN / DONE einsetzen
-      - Kratos schreibt Datei(en) oder führt read-only Inspektionen aus
-      - Kratos führt den Verify-Befehl (Test) aus
-      → Beobachtung zurück an den Coder, dann nächster Turn
-
-  Nach allen Steps:
-      - finale Test-Sweep
-      - Verifier (full 40k) bekommt ALLE per-step PROVEN_WORK Beweise
-      - nur bei echten exit=0 auf allen relevanten Tests + LLM "VERIFIED" → akzeptiert
-
-  Auto-Compress (Compressor full ctx) + Memory-Extraktion
-      → .kratos/memory.json (project) + global
-      → niemals Infos vernichten (exhaustive + verbatim quotes)
-```
-
-### Routen
-
-| Route | Wann |
-|---|---|
-| `direct_answer` | Datei-/Code-Suche (kein LLM) |
-| `planner_only` | Fragen, Erklärungen, Analyse |
-| `coder_only` | `mach weiter`, Git-Befehle |
-| `planner_then_coder` | Alle Coding-Aufgaben |
-| `diagnostic_loop` | Build/Test-Fehler + Retry |
-| `ask_clarification` | Unklare Eingabe |
-
----
-
-## Dynamisches Reasoning
-
-Der Planner aktiviert Chain-of-Thought (`think`) nur wenn der Task es wirklich braucht:
-- Retry (vorherige Iteration fehlgeschlagen)
-- Architecture/Diagnostic-Scope
-- Viele relevante Dateien (>5)
-- Langer Task (>40 Wörter)
-- Diagnostic-Route
-
-Für einfache Aufgaben: direkte Ausgabe, kein CoT → spart VRAM-Zeit.
-
----
-
-## Auto-Composer (Compressor) — verlustfrei + .kratos Memory
-
-Immer mit **maximalem Kontextfenster**. Prompts erzwingen Vollständigkeit (exhaustive + wörtliche Zitate kritischer Fakten).
-
-- History-Kompression: alte Turns werden durch dichte, aber **informations-erhaltende** Records ersetzt.
-- Jede Auto-Compression schreibt zusätzlich ein Markdown-Artefakt nach `.kratos/knowledge/compressions/` und ingestiert es dynamisch in den Knowledge-Index.
-- Nach jedem Task: Memory-Extraktion (decisions, conventions, file_roles, error_cause, solution) → `.kratos/memory.json` (project) + global.
-- Der Planner schreibt seine Plan-Artefakte als Markdown nach `.kratos/plans/`.
-- Wird in jeden relevanten Prompt eingespeist, aber dynamisch statt blind.
-- Nie Infos vernichten — das ist eine Kernanforderung.
-
-`/memory list | clear ...` verwaltet es.
-
----
-
-## Large-Input Relay (für Kontexte die jedes Fenster sprengen)
-
-Wenn der Planner-Input > ~80% von planner_num_ctx:
-1. Der **Coder** (mit 262k full ctx) bekommt den riesigen rohen Kontext zuerst.
-2. Erzeugt einen verlustarmen, strukturierten Extrakt (auch hier: max-ctx + strenger Prompt).
-3. Der Extrakt (viel kleiner) geht an den Planner.
-
-Zusammen mit Memory + Auto-Composer + ContextBuilder (der alle Datei-Pfade immer zeigt) kann Kratos an **riesigen** Repos arbeiten, die das Kontextfenster bei weitem übersteigen.
-
----
-
-## Token-Budget — Maximum Context Policy
-
-- **Immer Maximum**: `choose_num_ctx(..., force_max_context=True)` → jedes Modell bekommt bei jedem Aufruf sein volles Fenster (capped nur durch `vram_ctx_ceiling`).
-- Defaults jetzt direkt auf den Modell-Maxima (Planner 40960, Coder 262144, Verifier 40960, Compressor 32k+, Relay 128k).
-- `always_max_ctx: true` in config (auch alte Configs werden beim Laden hochgezogen).
-- VRAM-Ceiling weiterhin respektierend (laptop-sicher), aber so hoch wie möglich.
-- `/tokens` zeigt realen Verbrauch (von Ollama).
-
-Das ermöglicht kleine schnelle Tasks **und** die Monster-Repos.
-
----
-
-## Adaptive Coder Action Loop (der Kern)
-
-Coder arbeitet in einem echten OBSERVE -> ACT Loop:
-
-1. Planner liefert einen ausführlichen Markdown-Plan plus die sichtbare Checkliste.
-2. Der Coder kann pro Turn mehrere Marker kombinieren:
-   - `### READ` für on-disk Inhalte, `### READ_RANGE: pfad:start-ende` für exakte Zeilenbereiche
-   - `### SEARCH` (literal), `### GREP` (Regex), `### GLOB` (Dateinamen) — Treffer mit `datei:zeile:spalte`
-   - `### INSPECT` für read-only Shell-Diagnose (`rg`, `Get-Content`, `git diff`, ...)
-   - `### FILE` / `### DELETE` für Änderungen
-   - `### VERIFY` / `### RUN` für sichere Build-/Test-Kommandos
-   - `### WEB_SEARCH` / `### WEB_FETCH` für Doku-/Fehler-Recherche (Quellen → `.kratos/research.jsonl`)
-   - `### DONE` erst nach echtem Erfolg
-3. Kratos gibt nach jedem Turn eine Observation zurück und der Coder reagiert auf das reale Ergebnis.
-4. Der Loop läuft bis alle Checklist-Punkte erledigt sind oder das Iterationslimit erreicht ist.
-5. Verifier prüft danach nochmals die Checkliste, die Tests und die eigentliche Nutzerabsicht.
-
-PROVEN_WORK bleibt streng:
-- Dateiänderungen, Deletes, Reads, Inspects und Commands werden einzeln protokolliert.
-- Finaler Sweep nach dem Coder-Loop läuft zusätzlich.
-- Fehlt ein Test oder schlägt einer fehl → NEEDS_REVISION, auch wenn das Modell schon fertig klingt.
-
-UNSOLVABLE → kompletter Rollback der in dieser Runde geschriebenen Dateien.
-
-### Anti-Fake-Erfolg-Garantien (Real-File-Change-Gate + Reporter)
-
-Kratos kann nicht mehr „erfolgreich klingen", ohne gearbeitet zu haben:
-
-- Vor dem Verifier prüft `verify_files_changed()` per Hash-Vergleich (Snapshot ↔ Disk),
-  ob wirklich etwas geändert wurde. No-op-Rewrites zählen nicht.
-- Verlangt die Aufgabe Codeänderungen und `files_changed` ist real leer →
-  automatischer Rücksprung in die Implementierung; nach max Retries → **FAILED**
-  mit der Meldung „Keine echten Dateiänderungen erkannt".
-- Der Abschlussbericht (`kratos/reporter.py`) wird nur aus Evidenz gebaut:
-  Teststatus nur aus echten Exitcodes („Tests nicht ausgeführt" statt erfundener Erfolge),
-  Diff nur aus `git diff HEAD --stat` (staged + unstaged) bzw. echtem `difflib`-Vergleich — nie erfunden.
-
-- `files_changed` kommt technisch aus Write/Delete + Hash-Abgleich plus einer
-  modellfreien `git_changed_files()`-Querprüfung — nie aus Modelltext.
-- Ausgeführte Befehle stammen nur aus echten `CommandResult`-Logs (Exitcode,
-  getrenntes stdout/stderr, Timeout → 124, blockiert → 126).
-
-Echte Diff-Erkennung: `kratos/execution/diffing.py`. Generischer Repair-Loop:
-`kratos/execution/repair_loop.py` (analysiert echte Testfehler, fixt gezielt,
-testet erneut; Erfolg nur bei echtem `exit_code == 0`). Importsicher:
-`import kratos.app` bricht nie mehr mit `sys.exit` ab.
-
-Details: `docs/analysis_rebuild_plan.md`, `docs/hardening_changes.md`,
-`docs/agent_architecture.md`, `docs/verification.md`, `docs/tools.md`, `docs/safety.md`.
-
-Wenn keine Tests auto-entdeckt werden:
+From the Kratos checkout:
 
 ```powershell
-/test python -m pytest tests -q --tb=line
+python kratos.py
+python kratos.py --tui
+python kratos.py --setup
 ```
 
----
+After `install.bat`, the `kratos.bat` launcher can be used from the install
+location.
 
-## Permissions
+When Kratos starts, the classic CLI checks Ollama, checks the configured models,
+loads config and prompt JSON, then opens a REPL. The TUI uses the same agent
+pipeline with a Textual interface.
 
-```
-/permission low    → nur lesen
-/permission mid    → lesen + schreiben  (default)
-/permission high   → lesen + schreiben + löschen
-```
+## Request Flow
 
----
+Kratos is not a single prompt wrapper. A normal coding request moves through
+these stages:
 
-## Logging
+1. `analyzer.py`, `classifier.py`, and `router.py` classify the request.
+2. `context/builder.py` indexes the repository and builds a token-aware context.
+3. `memory.py` and `knowledge/base.py` add relevant prior notes and optional
+   vector-search chunks.
+4. The planner creates a checklist for multi-step work.
+5. The coder executes each work step through explicit markers such as
+   `### READ`, `### EDIT`, and `### VERIFY`.
+6. Build and test commands are discovered from user commands, README snippets,
+   and project toolchain inference.
+7. Deterministic verification accepts only real passing command output by
+   default. The LLM verifier is used only when deterministic verification is
+   disabled or additional judgment is required.
+8. `reporter.py` writes a final report from structured evidence: changed files,
+   command results, test status, diagnostics, diff stats, and real web sources.
 
-```
-/logging on     → startet Session-Log  →  .kratos/session_YYYY-MM-DD_HH-MM-SS.jsonl
-/logging off    → beendet Logging
-```
+Common routes:
 
----
-
-## Slash-Commands
-
-| Befehl | Beschreibung |
+| Route | Used for |
 |---|---|
-| `/permission [low\|mid\|high]` | Coder-Berechtigungen |
-| `/tokens` | Session Token-Verbrauch anzeigen |
-| `/logging [on\|off]` | Session-Logging |
-| `/index` | Projektdateien anzeigen |
-| `/index rebuild` | Index neu aufbauen |
-| `/memory list` | Memory-Einträge anzeigen |
-| `/memory clear [session\|project\|all]` | Memory löschen |
-| `/build [cmd]` | Build-Befehl setzen |
-| `/test [cmd]` | Test-Befehl setzen |
-| `/models [planner\|coder\|verifier\|compressor <name>]` | Modelle wechseln (bleiben abliterated + max-ctx) |
-| `/goal [text]` | Ziel setzen |
-| `/scope [global\|project]` | Config-Scope wechseln |
-| `/history clear` | Konversation zurücksetzen |
-| `/status` | Status-Bar anzeigen |
-| `/help` | Alle Befehle |
-| `/exit` | Beenden |
+| `direct_answer` | File/code search or explanation that does not need edits |
+| `ask_clarification` | Requests too ambiguous to act safely |
+| `planner_only` | Planning, explanation, or non-editing analysis |
+| `coder_only` | Direct shell/file follow-up work |
+| `planner_then_coder` | Normal feature, bugfix, refactor, docs, config, and dependency work |
+| `diagnostic_loop` | Build/test failures and repair requests |
 
----
+## Slash Commands
 
-## Prompt Customization (JSON — der Schlüssel zum "besten Agenten")
+Inside the CLI:
 
-Alle System-Prompts + Snippets (Labels, Forced-Instructions, Marker, Predict-Limits) liegen in JSON. 
-Der **gesamte Prompt-Flow** (Zusammenbau, bedingte Sections, Memory/Proof/Context-Injection, Stepwise-per-Plan-Item, Relay für Huge-Repos, PROVEN_WORK etc.) bleibt **vollständig ausprogrammiert** (dynamisch in Python).
+| Command | Purpose |
+|---|---|
+| `/help` | Show built-in command help |
+| `/exit`, `/quit`, `/q` | Leave the REPL |
+| `/clear` | Clear the terminal |
+| `/goal [clear|text]` | Set or clear the session goal |
+| `/scope [info|global|project]` | Show or change memory scope |
+| `/permission [low|mid|high]` | Change command permission profile |
+| `/models [planner|coder|verifier|compressor <name>]` | Show or change model names |
+| `/prompts [list|reload|dump [path]]` | Inspect or reload prompt JSON |
+| `/status` | Show config, model, memory, and verification status |
+| `/history clear` | Clear session history |
+| `/setup` | Run model setup |
+| `/index [rebuild]` | Build or rebuild the project index |
+| `/knowledge [status|rebuild [force]]` | Manage the optional knowledge index |
+| `/memory [list|clear session|project|all]` | Inspect or clear memory |
+| `/build [clear|cmd]` | Set or clear the build command |
+| `/test [clear|cmd]` | Set or clear the test command |
+| `/logging [status|on|off]` | Manage session payload logging |
+| `/tokens` | Show context and token budget information |
 
-- Defaults sind im Package (kratos/prompts.py).
-- Overrides (Merge, partial OK):
-  - `~/.kratos/prompts.json` (global)
-  - `.kratos/prompts.json` (project, gewinnt)
-- Einfach editierbar für Tuning der "besten" Verhaltensregeln (step-by-step Discipline, lossless Memory etc.), ohne Python zu ändern.
+## Tool Markers
 
-Beispiel `.kratos/prompts.json` (nur was du ändern willst):
+The coder never receives direct filesystem or shell access. It emits markers
+that `kratos/execution/tools.py` parses and executes:
+
+| Marker | Purpose |
+|---|---|
+| `### READ: path` | Read a file |
+| `### READ_RANGE: path:start-end` | Read exact line range |
+| `### SEARCH: text [:: glob]` | Smart literal/regex/keyword search |
+| `### GREP: regex [:: glob]` | Regex search with smart fallback |
+| `### GLOB: pattern` | List matching files |
+| `### INSPECT: command` | Run read-only inspection command |
+| `### FILE: path` | Create or replace a small file |
+| `### EDIT: path` | Apply Aider-style search/replace edits |
+| `### DELETE: path` | Delete a file inside the project |
+| `### VERIFY` / `### RUN: command` | Run a guarded verification command |
+| `### WEB_FETCH: url` | Fetch an HTTP(S) page with SSRF and size guards |
+| `### WEB_SEARCH: query` | Run DuckDuckGo HTML search and record sources |
+| `### DONE` | Mark the work step complete |
+
+For existing files, `### EDIT` is preferred over whole-file rewrites. A failed
+search block leaves the file untouched and tells the model to re-read the file.
+
+## Verification
+
+Kratos uses a hard evidence gate:
+
+- No success when a code-changing task produced no real file changes.
+- No success when tests failed.
+- No "tests passed" claim when no test command actually ran.
+- No fabricated web sources. Only sources recorded in `.kratos/research.jsonl`
+  during the current run can appear in the report.
+- Pre-existing tests are snapshotted and restored before authoritative
+  verification when `protect_existing_tests` is enabled.
+
+Verification commands can come from:
+
+- `/build` and `/test`
+- explicit commands in the user request
+- README command snippets
+- inferred toolchains for Python, Node, .NET, Cargo, Go, Maven, and Gradle
+
+Shell commands still pass through the central `SafetyGuard` before execution.
+
+## Memory And Knowledge
+
+Kratos keeps several local, project-scoped stores:
+
+| Store | Path |
+|---|---|
+| Session logs and payloads | `.kratos/session_*.jsonl` |
+| Planner artifacts | `.kratos/plans/` |
+| Project memory | `.kratos/memory.json` |
+| Global memory | `~/.kratos/memory.json` |
+| Knowledge index | `.kratos/knowledge/` |
+| Compression artifacts | `.kratos/knowledge/compressions/` |
+| Web research evidence | `.kratos/research.jsonl` |
+
+The knowledge index uses LanceDB when installed. If LanceDB is unavailable,
+Kratos falls back to a JSON index and still runs.
+
+## Safety
+
+All command and file-write surfaces call `kratos/safety.py`. The guard blocks
+destructive disk operations, recursive forced deletion patterns, registry and
+scheduled-task changes, credential scraping, hidden elevation, encoded commands,
+download-and-execute chains, and writes outside the project root. Git internals
+such as `.git/objects`, `.git/refs`, and `.git/HEAD` are protected.
+
+Permission profiles tune how much shell work Kratos may attempt, but the hard
+blocklist still applies in every profile.
+
+## Configuration
+
+The config is stored under the local Kratos config path and loaded by
+`kratos/config.py`. The current default shape is:
+
 ```json
 {
-  "coder_system": "You are Kratos Coder. ... (deine angepasste Version mit extra rules) ...",
-  "snippets": {
-    "test_files_header": "TEST FILES — EXACT SIGNATURES REQUIRED:",
-    "coder_step_forced_prefix": "CRITICAL: ONLY THIS STEP. Begin with ### FILE: ..."
-  }
-}
-```
-
-Befehle:
-- `/prompts list` — Übersicht (Rollen + Snippets)
-- `/prompts reload` — nach Edit neu laden (nächste Calls nutzen es)
-- `/prompts dump .kratos/prompts.json` — Defaults rausschreiben zum Start-Edit
-
-Damit ist Kratos extrem anpassbar, während die starke programmierte Logik (jeden Plan-Schritt denken+Cmd zeigen+umsetzen+sofort testen, Verifier führt Tests wirklich aus, Compressor zerstört keine Info, .kratos Memory, max-ctx, huge+small Projekte) erhalten bleibt.
-
-## Konfiguration
-
-### `.kratos/config.json`
-
-```json
-{
-  "planner_model":     "huihui_ai/qwen3-abliterated:8b",
-  "coder_model":       "huihui_ai/qwen3.5-abliterated:4b",
-  "verifier_model":    "huihui_ai/qwen3-abliterated:8b",
-  "compressor_model":  "kratos-planner",
-  "planner_num_ctx":   40960,
-  "coder_num_ctx":     262144,
-  "verifier_num_ctx":  40960,
+  "planner_model": "huihui_ai/deepseek-r1-abliterated:8b-0528-qwen3-q4_K_M",
+  "coder_model": "huihui_ai/qwen2.5-coder-abliterate:7b-instruct-q4_K_M",
+  "verifier_model": "huihui_ai/deepseek-r1-abliterated:8b-0528-qwen3-q4_K_M",
+  "compressor_model": "kratos-planner",
+  "embed_model": "nomic-embed-text",
+  "planner_num_ctx": 131072,
+  "coder_num_ctx": 32768,
+  "verifier_num_ctx": 131072,
   "compressor_num_ctx": 32768,
-  "relay_num_ctx":     131072,
-  "vram_ctx_ceiling":  65536,
-  "always_max_ctx":    true,
-  "coder_loop":        true,
-  "max_coder_iterations": 6,
-  "compress_threshold": 0.75,
-  "relay_threshold":   0.80,
-  "max_history_pairs": 8,
-  "auto_compress":     true,
-  "permission":        "mid",
-  "max_verify_iterations": 10,
+  "relay_num_ctx": 131072,
+  "vram_ctx_ceiling": 8192,
+  "always_max_ctx": true,
+  "deterministic_verify": true,
+  "coder_loop": true,
+  "max_coder_iterations": 0,
+  "max_work_step_turns": 4,
+  "max_verify_iterations": 0,
+  "no_progress_abort": 40,
   "auto_discover_verification": true,
-  "require_proven_work": true,
-  "require_test_for_verified": true,
-  "verification_timeout_seconds": 120
+  "protect_existing_tests": true,
+  "permission": "mid"
 }
 ```
 
----
+Legacy configs with `max_verify_iterations: 10` are upgraded to unbounded
+verification on load. Legacy VRAM ceilings above 16384 are clamped to 8192.
 
-## Architektur
+## Documentation
 
-```
-C:\Tools\Kratos\
-├── kratos.py              ← REPL, _stream_agent, _show_file_ops
-├── kratos.bat             ← Globaler Launcher
-├── requirements.txt
-├── setup_models.py        ← Modell-Setup-Wizard (idempotent)
-├── setup_wsl.sh           ← WSL + CUDA Setup (einmalig)
-├── docs/                  ← Architektur, Verifikation, Tools, Safety, Hardening
-├── tests/                 ← test_core, test_agent_tools, test_godmode, test_run_regressions
-└── kratos/
-    ├── safety.py          ← SafetyGuard: Command-/Path-Gate (blockiert destruktiv/exfil)
-    ├── reporter.py        ← Anti-Fake-Erfolg-Gate (Status nur aus Evidenz)
-    ├── verification.py    ← Command-Discovery + ProvenWork-Evidenz
-    ├── web.py             ← HTTP-Fetch/HTML-Scrape/Web-Search (ehrliche Fehler, SSRF-Guard)
-    ├── app/               ← CLI + Textual TUI (lazy imports, kein sys.exit beim Import)
-    ├── core/              ← agent.py (Loop), runners, retry, buildtest (Command-Runner)
-    ├── execution/         ← tools, shell (ShellRunner), search, diffing (NEU),
-    │                         repair_loop (NEU), diagnostics, parsing, testguard, ...
-    ├── llm/               ← bridge (OllamaBridge), tokens (max-ctx Policy)
-    ├── roles/             ← planner, coder, verifier
-    ├── context/, knowledge/, ui/
-    └── compress.py, memory.py, config.py, planning.py, ...
-```
-
----
-
-## Hardware & Voraussetzungen
-
-| Komponente | Anforderung |
-|---|---|
-| GPU | NVIDIA CUDA, mind. 4 GB VRAM |
-| RAM | mind. 16 GB |
-| OS | Windows 10/11 |
-| Python | 3.10+ |
-| Ollama | nativ auf Windows |
-
-Planner, Coder und Compressor werden **sequenziell** geladen — nie gleichzeitig im VRAM.
+- [Agent architecture](docs/agent_architecture.md)
+- [Tools](docs/tools.md)
+- [Verification](docs/verification.md)
+- [Safety](docs/safety.md)
+- [Convergence safeguards](docs/convergence_fixes.md)
+- [Hardening notes](docs/hardening_changes.md)
+- [Analysis and rebuild notes](docs/analysis_rebuild_plan.md)

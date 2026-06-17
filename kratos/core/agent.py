@@ -1233,7 +1233,53 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
                 yield ("warn", f"Safety cap ({max_iter} iterations) reached.", "warn")
                 break
 
-            # ── 4b. LLM verifier, gated by PROVEN_WORK (now sees per-step evidence) ─
+            # ── 4b. Deterministic verification (default) ──────────────────────
+            # The real tests already ran and satisfied the PROVEN_WORK gate above.
+            # Treat that as ground truth and skip the redundant LLM-verifier pass
+            # (on a laptop that pass means reloading the 8B model again for every
+            # iteration). This is exactly the tight  plan -> code -> run tests ->
+            # done  loop the design wants; the test exit code is the judge.
+            if getattr(self.config, "deterministic_verify", True) and _proven_work_satisfied(
+                proof, require_test=self.config.require_test_for_verified
+            ):
+                _verifier_accepted = True
+                yield ("info",
+                       "Verified deterministically — real tests passed (LLM verifier skipped).",
+                       "info")
+                yield ("log", json.dumps({"type": "verify_decision", "decision": "VERIFIED",
+                                          "feedback": "deterministic: proven tests passed",
+                                          "iteration": attempt + 1}), "log")
+                self._record_solution([p for p, _ in self.pending_file_changes],
+                                      attempt + 1, task, plan_text,
+                                      coder_full_for_verify or plan_text, proof)
+                # Final authoritative full sweep on the ORIGINAL (unweakened) tests.
+                if _protect_tests and _test_snapshot:
+                    restore_test_files(project_root, _test_snapshot)
+                final_cmds = self._verification_commands(route)
+                all_ok = True
+                for fcmd in final_cmds:
+                    yield ("tool", f"run_command({fcmd.cmd!r}) -> final full check", "tool")
+                    fres = self._run_verification_command(fcmd)
+                    proof.commands.append(fres)
+                    st = "ok" if fres["exit_code"] == 0 else "FAILED"
+                    yield ("tool", f"verify_command({fcmd.cmd!r}) -> {st} (final)", "tool")
+                    if fres["exit_code"] != 0:
+                        all_ok = False
+                        break
+                if all_ok:
+                    if attempt > 0:
+                        yield ("info", f"Verified after {attempt + 1} iteration(s).", "info")
+                    break
+                # Full sweep regressed → fall back into the revision loop.
+                _verifier_accepted = False
+                verify_feedback = ("Final verification sweep failed — a test that passed "
+                                   "per-step did not pass in the full suite.")
+                yield ("warn", verify_feedback, "warn")
+                if attempt < max_iter - 1:
+                    continue
+                break
+
+            # ── 4c. LLM verifier (only when deterministic_verify is disabled) ──
             yield ("header", "verify", "header")
             verify_full = yield from self._run_verifier(
                 _verify_msg(task, plan_text, coder_full_for_verify or plan_text, proof, plan_state.items)

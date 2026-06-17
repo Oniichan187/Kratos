@@ -584,8 +584,12 @@ def run_coder_loop(
             yield ("plan_status", f"PLAN {sum(1 for i in plan_state.items if i.status=='done')}/{len(plan_state.items)} | {plan_compact}", "plan")
 
         if actions["done"]:
-            if _last_test_passed(proof) and plan_all_done(plan_state):
-                # Final (only if it would be new)
+            # The real test exit code is the ground truth: once a test command has
+            # actually passed, ### DONE converges. The plan checklist is guidance,
+            # not a second gate — phantom/unmatched checklist items must not keep
+            # an already-green run spinning until it runs out of turns. The outer
+            # verify loop re-runs the full suite as a backstop for missed work.
+            if _last_test_passed(proof):
                 refresh_plan_status(plan_state, proof, touched_files)
                 final_compact = render_checklist(plan_state.items, compact=True)
                 if final_compact != last_plan_compact:
@@ -595,7 +599,7 @@ def run_coder_loop(
             observations.append({
                 "kind": "done",
                 "ok": False,
-                "detail": "plan items remain unfinished" if not plan_all_done(plan_state) else "no passing test command yet",
+                "detail": "no passing test command yet — keep going until a real test passes",
             })
 
         if not has_any_action(actions):
@@ -735,6 +739,10 @@ def execute_structured_work_steps_for_plan(
 
         no_action_turns = 0
         item_done = False
+        # Number of recorded verification commands BEFORE this item starts, so we
+        # can tell which test results belong to THIS item's turns (deterministic
+        # per-item completion below).
+        _cmds_before_item = len(getattr(proof, "commands", []) or [])
         recent_lookup_sigs: list[str] = []   # window of recent lookup-only turns
         repeated_lookups = 0
         consecutive_lookup_turns = 0  # flail guard: any lookup-only turns, varied or not
@@ -886,6 +894,21 @@ def execute_structured_work_steps_for_plan(
             # Update plan progress for this item + push the LIVE status to the
             # UI (CLI bottom bar / TUI plan box). Change-aware to avoid spam.
             refresh_plan_status(plan_state, proof, touched)
+            # Deterministic per-item completion (test exit code = truth): if a real
+            # test command passed during THIS item's turns, the item is finished —
+            # even when the parser gave it no file_refs/verify_cmd (plans recovered
+            # from R1 thinking parse to bare titles, so refresh_plan_status has no
+            # evidence to match). Without this every item burns all its turns and
+            # prints a misleading "not verifiably finished" warning despite exit=0.
+            _item_cmds = list(getattr(proof, "commands", []) or [])[_cmds_before_item:]
+            if any(c.get("is_test") and int(c.get("exit_code", 1)) == 0 for c in _item_cmds):
+                for _it in plan_state.items:
+                    if _it.index == item.index and _it.status != "done":
+                        _it.status = "done"
+                        _matched = next((str(c.get("cmd", "")) for c in _item_cmds
+                                         if c.get("is_test") and int(c.get("exit_code", 1)) == 0), "")
+                        if _matched and _matched not in _it.evidence:
+                            _it.evidence.append(_matched)
             plan_block = render_plan_status(plan_state.items)
             plan_compact = render_checklist(plan_state.items, compact=True)
             if plan_compact != last_plan_compact:

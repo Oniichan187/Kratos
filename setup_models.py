@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""Kratos model setup wizard — idempotent.
+"""Kratos model setup — idempotent. Usually invoked by install.bat after the
+WSL provisioning step; safe to run again any time.
 
-Sets up all FOUR abliterated models (max-context, play perfectly together):
+Verifies / installs all FOUR abliterated models (no safety filters). The exact
+names come from kratos/config.py so this never drifts out of sync:
 
-  Planner    : huihui_ai/qwen3-abliterated:8b    (reasoning + plans, 40K full ctx)
-  Coder      : huihui_ai/qwen3.5-abliterated:4b  (implementation, 262K full ctx — giant repo capable)
-  Verifier   : huihui_ai/qwen3-abliterated:8b    (strict step-by-step PROVEN_WORK judge)
-  Compressor : kratos-planner                    (Phi-4-mini-abliterated GGUF) — LOSSLESS .kratos memory + history
+  Planner    : deepseek-r1-abliterated:8b-0528-qwen3   (reasoning + plans)
+  Coder      : qwen2.5-coder-abliterate:7b-instruct     (implementation)
+  Verifier   : same model as planner                    (only used if
+                                                         deterministic_verify is off)
+  Compressor : kratos-planner                           (built here from the
+                                                         bundled Phi-4-mini GGUF)
+  + nomic-embed-text for the vector knowledge base (pulled in setup_wsl.sh).
 
-All models are abliterated (no safety filters).
-Kratos forces MAXIMUM context window on every single call to every model.
-Hardware: laptop (RTX 4050 6 GB class) — roles load sequentially, never simultaneous.
+Context windows are RIGHT-SIZED per call and hard-capped by config.vram_ctx_ceiling
+(8192 on a 6 GB laptop) so the KV cache fits in VRAM — see config.py. Roles load
+sequentially, never simultaneously.
 """
 
 from __future__ import annotations
@@ -147,12 +152,12 @@ def setup() -> None:
     console.print(Panel.fit(
         "[bold green]✓  Setup complete![/bold green]\n\n"
         "Start Kratos:  [cyan]kratos[/cyan]  (or [cyan]python kratos.py[/cyan])\n\n"
-        f"  Planner    : [cyan]{PLANNER_MODEL_NAME}[/cyan]   (full 40K ctx every call)\n"
-        f"  Coder      : [green]{CODER_MODEL_NAME}[/green]   (full 262K — stepwise per plan item + test)\n"
-        f"  Verifier   : [yellow]{VERIFIER_MODEL_NAME}[/yellow]   (full 40K — every test + step proven)\n"
-        f"  Compressor : [magenta]{cfg.compressor_model}[/magenta] (lossless .kratos memory, max ctx)\n\n"
-        "All models abliterated. Prompts live in JSON (edit .kratos/prompts.json or ~/.kratos/prompts.json).\n"
-        "Every call uses MAX context window. The prompt *flow* is fully programmed.",
+        f"  Planner    : [cyan]{PLANNER_MODEL_NAME}[/cyan]\n"
+        f"  Coder      : [green]{CODER_MODEL_NAME}[/green]   (stepwise per plan item + real test)\n"
+        f"  Verifier   : [yellow]{VERIFIER_MODEL_NAME}[/yellow]   (deterministic: real test exit code is the judge)\n"
+        f"  Compressor : [magenta]{cfg.compressor_model}[/magenta] (lossless .kratos memory)\n\n"
+        f"Context windows are right-sized and capped at {cfg.vram_ctx_ceiling} tokens to fit your VRAM.\n"
+        "All models abliterated. Prompts live in JSON (edit .kratos/prompts.json or ~/.kratos/prompts.json).",
         box=box.ROUNDED, border_style="green",
     ))
 

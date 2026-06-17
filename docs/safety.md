@@ -1,37 +1,79 @@
-# Kratos Safety-Modell
+# Safety
 
-## Grundsätze
+Kratos is allowed to edit and test local projects, so command and path safety
+are centralized in `kratos/safety.py`.
 
-1. Dateioperationen nur innerhalb des Projektverzeichnisses (Resolve + `relative_to`-Check).
-2. Git-Interna (`.git/objects`, `.git/refs`, `.git/HEAD`) sind schreibgeschützt.
-3. Shell-Befehle laufen durch zwei Schichten:
-   - **Allowlist** (`_is_safe_verification_command` / `_is_safe_inspect_command`):
-     nur bekannte Build/Test/Diagnose-Präfixe werden überhaupt ausgeführt.
-   - **Blocklist** (`safety.check_command`): zusätzlich werden destruktive Muster
-     hart blockiert — auch falls die Allowlist je erweitert wird (Defense in Depth).
-4. Löschungen nur mit `permission high`; jede Löschung wird geloggt.
-5. Secrets: Kratos sucht nicht nach Tokens/Passwörtern; Secret-Dateien
-   (`.env`, `secrets.*`, `*.pem`, `*.key`, `*.pfx`, `*.p12`) sind vom Index ausgeschlossen
-   und werden nie in Prompts oder Logs geladen.
+Every shell execution path and every file-writing path must call the guard.
+This includes normal verification commands, inspect commands, and coder file
+operations.
 
-## Blockierte Befehlsklassen (Auszug)
+## Permission Profiles
 
-- Laufwerk/Datenträger: `format`, `mkfs`, `diskpart`, `dd of=/dev/...`
-- Rekursives Löschen: `del /s /q`, `rd /s`, `rm -rf`, `Remove-Item -Recurse/-Force`
-- Systemzustand: `shutdown`, `Restart-Computer`, `reg add/delete`, `schtasks`,
-  `net user/localgroup`, `bcdedit`, `vssadmin delete`
-- Download-and-Execute: `Invoke-Expression`/`iex`, `DownloadString(`,
-  `curl/wget/iwr ... | sh/bash/powershell/iex`, `-EncodedCommand`, `FromBase64String`
-- Credentials/Exfiltration: `mimikatz`, `lsass`, `Get-Credential`, `cmdkey /list`,
-  Zugriff auf `$env:*TOKEN/SECRET/PASSWORD/API_KEY*`
-- Privilegien: `takeown`, `icacls ... grant`, `sudo rm`, `chmod 777 /`
+The CLI exposes `/permission low|mid|high`. Permission profiles influence how
+ambitious shell work may be, but they do not disable the hard safety blocklist.
 
-Blockierte Befehle werden **nie ausgeführt**; das Ergebnis ist ein `CommandResult`
-mit `blocked=True`, Exitcode 126 und dem Grund in `stderr` — sichtbar im Log und
-in der Observation des Modells.
+Even in a permissive profile, commands blocked by `SafetyGuard` are not run.
 
-## Web
+## Blocked Command Classes
 
-- Nur `http`/`https`; private/Loopback-Literale (localhost, 127.0.0.1, RFC-1918) werden verweigert.
-- Antworten sind Daten, werden nie ausgeführt; 2-MB-Cap; Content-Type-Prüfung.
-- Kein Shell-Kommando lädt jemals Webseiten (kein curl/wget für Inhalte).
+The command guard is Windows-first but also covers common POSIX patterns.
+
+Blocked categories include:
+
+- disk formatting and raw disk writes, such as `format`, `mkfs`, `dd`, and
+  `diskpart`;
+- recursive forced deletion patterns, such as `rm -rf`, `rd /s`, `rmdir /s`,
+  `del /s /q`, and unsafe `Remove-Item -Recurse/-Force`;
+- shutdown, reboot, and power-state changes;
+- registry writes and deletes;
+- scheduled task creation or modification;
+- user and group administration through commands such as `net user`;
+- boot and shadow-copy modification commands;
+- download-and-execute chains;
+- `Invoke-Expression`, `iex`, encoded commands, and Base64 command execution;
+- hidden elevation and hidden `Start-Process` usage;
+- credential scraping or LSASS access patterns;
+- direct access to token, secret, password, or API-key environment values;
+- broad ACL or ownership changes such as `takeown` and unsafe `icacls` grants;
+- obvious shell bombs and equivalent destructive patterns.
+
+Blocked commands return a structured result with `blocked: true`, a block
+reason, and exit code `126`.
+
+## Path Guard
+
+`check_path` enforces project-root confinement for writes and deletes:
+
+- relative escapes such as `../../outside.txt` are blocked;
+- absolute paths outside the project are blocked;
+- `.git/objects`, `.git/refs`, and `.git/HEAD` are blocked.
+
+The search and read layers also ignore heavy/generated directories and skip
+binary or oversized files.
+
+## Web Guard
+
+The web layer uses direct HTTP helpers, not shell download commands.
+
+Rules:
+
+- only `http` and `https` URLs are accepted;
+- private, local, and loopback literal hosts are rejected;
+- responses are size-capped;
+- requests time out;
+- content is treated as data;
+- successful fetch/search actions are logged as research evidence.
+
+## Defense In Depth
+
+Safety is applied in multiple places:
+
+- `execution/tools.py` checks file paths before writes/deletes.
+- `execution/shell.py` checks commands before running them.
+- `core/buildtest.py` checks verification commands again before execution.
+- `verification.py` keeps an allowlist-style view of expected build/test
+  command prefixes.
+
+The result is intentionally conservative. When Kratos cannot prove that a
+command is safe enough for the current profile, it should refuse or report a
+partial result instead of forcing execution.

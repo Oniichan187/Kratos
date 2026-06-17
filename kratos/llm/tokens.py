@@ -16,12 +16,19 @@ from __future__ import annotations
 # Verified via /api/show on the actual installed models (2026-06-05).
 # All other models default to 32768 (conservative).
 _MODEL_MAX_CTX: dict[str, int] = {
+    # DeepSeek-R1-0528-Qwen3-8B abliterated — planner + verifier (128k native, VRAM-capped to 65536)
+    "huihui_ai/deepseek-r1-abliterated:8b-0528-qwen3-q4_k_m": 131072,
+    "huihui_ai/deepseek-r1-abliterated:8b-0528-qwen3":         131072,
+    # Qwen3 abliterated (fallback ALT_PLANNER)
     "huihui_ai/qwen3-abliterated:8b":       40960,
-    "huihui_ai/qwen3.5-abliterated:4b":     262144,
-    "huihui_ai/qwen3.5-abliterated:4B":     262144,  # tag alias
     "huihui_ai/qwen3-abliterated:4b":       40960,
+    # Qwen3.5 abliterated (fallback coder)
+    "huihui_ai/qwen3.5-abliterated:4b":     262144,
+    "huihui_ai/qwen3.5-abliterated:4B":     262144,
+    # Qwen2.5-Coder abliterated — primary coder
     "huihui_ai/qwen2.5-coder-abliterate:7b": 32768,
     "huihui_ai/qwen2.5-coder-abliterate:7b-instruct-q4_k_m": 32768,
+    # General
     "qwen3:4b":                              262144,
     "kratos-planner":                        131072,
     "kratos-planner:latest":                 131072,

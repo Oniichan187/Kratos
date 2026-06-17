@@ -81,9 +81,9 @@
     "proven_work_missing_command": "PROVEN_WORK missing: no safe build/test command was configured, found in README, or inferred from project files."
   },
   "predict": {
-    "plan": 4096,
-    "plan_heavy": 5120,
-    "plan_retry": 6144,
+    "plan": 2048,
+    "plan_heavy": 2560,
+    "plan_retry": 3072,
     "code": 16384,
     "verify": 512,
     "relay": 1200,

@@ -1,57 +1,124 @@
-# Kratos Verifikation — wie Erfolg bewiesen wird
+# Verification
 
-## Der Plan-Verify-Loop
+Kratos treats verification as an evidence problem. A final answer can only
+claim success when the recorded work supports that claim.
 
-```
-PLAN → READ → IMPLEMENT → VERIFY → (REPAIR → VERIFY)* → FINAL REPORT
-```
+## Evidence Model
 
-Pro Iteration (`max_verify_iterations`, Default 10) gilt:
+`kratos/verification.py` defines `ProvenWork`. During a run, tool handlers and
+verification helpers add:
 
-1. **File-Application-Gate** — fehlgeschlagene Writes ⇒ sofortiger Retry.
-2. **Real-File-Change-Gate** — `verify_files_changed()` vergleicht jede behauptete
-   Datei per SHA-256 mit ihrem Vor-Lauf-Snapshot:
-   - `created` / `modified` / `deleted` = echte Änderung
-   - `unchanged` (No-op-Rewrite) und `missing` zählen **nicht**
-   - Route verlangt Codeänderungen + keine echte Änderung ⇒ `NEEDS_REVISION`
-     mit Feedback „Keine echten Dateiänderungen erkannt“ → zurück in die Implementierung.
-     Nach Ausschöpfen der Retries ⇒ FAILED.
-3. **ProvenWork-Gate** — Befehls-Evidenz: mindestens ein echter Testbefehl mit
-   Exitcode 0 (konfigurierbar über `require_proven_work`, `require_test_for_verified`).
-4. **LLM-Verifier** — strenge VERIFIED/NEEDS_REVISION/UNSOLVABLE-Entscheidung,
-   gated durch die Gates davor.
-5. **Final-Sweep** — nach VERIFIED laufen alle Verify-Befehle noch einmal komplett;
-   ein Fehlschlag degradiert zurück zu NEEDS_REVISION.
+- files read;
+- files written or deleted;
+- file hashes before and after writes;
+- real command results;
+- verification command metadata;
+- test/build flags;
+- diagnostics;
+- touched file lists.
 
-## Der Final-Report (Reporter)
+`kratos/reporter.py` receives this evidence and the original file snapshots. It
+does not trust free-form model text for facts.
 
-Der Report wird ausschließlich aus strukturierter Evidenz gebaut
-(`ProvenWork` + Snapshot-Abgleich + `git diff --stat`):
+## Status Gate
 
-- **Status SUCCESS** nur wenn: echte Dateiänderungen ∧ Testbefehl real gelaufen ∧
-  Exitcode 0 ∧ Verifier hat akzeptiert.
-- **Keine Dateien geändert** ⇒ Status FAILED (bei Code-Aufgaben) und die Meldung
-  „Keine echten Dateiänderungen erkannt".
-- **Tests nicht ausgeführt** ⇒ niemals „Tests bestanden", sondern
-  „Tests nicht ausgeführt" mit Grund.
-- **Diff** stammt aus `git diff --stat` oder dem Hash-Vergleich — ohne echte
-  Änderungen steht dort „Kein Diff vorhanden." Ein Diff wird nie erfunden.
+For code-changing work, the final report applies these rules:
 
-## Auto-Verify (Runtime beweist Edits selbst)
+- If no real file changed, status cannot be `SUCCESS`.
+- If no test command ran, status cannot honestly say tests passed.
+- If the last test command failed, status cannot be `SUCCESS`.
+- If deterministic verification is enabled and real tests pass, Kratos accepts
+  the result without asking the LLM verifier to re-judge it.
+- If deterministic verification is disabled, the LLM verifier may participate,
+  but the report still uses real command and file evidence.
 
-Wenn das Modell Dateien schreibt, aber kein `### VERIFY` ausgibt (häufigster
-Schwach-Modell-Fehler), führt der Work-Step-Driver selbst eine Verifikation aus:
-zuerst das `VERIFY:`-Kommando des Checklist-Items (falls sicher), sonst den
-ersten Test-Befehl der CommandRegistry. Ergebnis fließt als Evidenz in
-ProvenWork und als Observation zurück ans Modell.
+No-op writes do not count as changes. `verify_files_changed` compares snapshots
+with current disk contents and classifies files as created, modified, deleted,
+or unchanged.
 
-Befehls-Discovery unterstützt verschachtelte Layouts: liegt `pyproject.toml`
-einen Ordner tiefer (z. B. `starter_project/`), wird `python -m pytest` mit
-diesem Unterordner als Working Directory ausgeführt (`VerificationCommand.cwd`).
+## Command Discovery
 
-## Endlosschleifen-Schutz
+Verification commands can be supplied by the user or inferred by Kratos.
 
-- `max_verify_iterations` (äußerer Loop), `max_coder_iterations` (ReAct-Loop),
-  `max_work_step_turns` (Micro-Turns pro Checklist-Item, Default 4),
-  2-Strikes-Regel für marker-lose Turns.
-- Danach: ehrlicher Abbruch mit Diagnose im Report — niemals stilles "Erfolg".
+Sources:
+
+- `/build <cmd>`
+- `/test <cmd>`
+- explicit commands in the request;
+- command snippets found in README content;
+- project toolchain inference.
+
+Supported inference includes:
+
+- Python: pytest, unittest, compile checks;
+- Node: package scripts, TypeScript compile checks;
+- .NET: build and test;
+- Rust/Cargo;
+- Go;
+- Maven;
+- Gradle.
+
+`core/buildtest.py` normalizes common Windows and Python shims, handles nested
+project working directories, and passes all commands through the safety gate.
+
+## Test Protection
+
+When `protect_existing_tests` is enabled, `kratos/execution/testguard.py`
+snapshots pre-existing tests before the agent edits. Before authoritative
+verification, changed or deleted original tests are restored.
+
+New tests created by the agent are not removed by this guard. The intent is to
+prevent a model from making the existing suite easier while still allowing it to
+add coverage.
+
+## Diagnostics
+
+`kratos/execution/diagnostics.py` turns failing command output into structured
+diagnoses. Categories include:
+
+- circular imports;
+- import and module-not-found errors;
+- syntax and indentation errors;
+- `NotImplementedError`;
+- `NameError`;
+- parse-returned-`None` bugs;
+- attribute errors;
+- signature mismatch;
+- numeric operations on strings;
+- missing expected raises;
+- `TypeError`;
+- assertions;
+- pytest collection errors;
+- timeouts;
+- blocked commands;
+- unknown failures.
+
+`RepairTracker` tracks repeated failure signatures. If the same signature
+repeats too many times, Kratos escalates the feedback instead of blindly
+rerunning the same command forever.
+
+## Deterministic Repairs
+
+The main loop is model-driven, but Kratos has deterministic fallbacks for a few
+well-defined failure patterns. The most important is removal of provably unused
+cross-imports that create intra-package circular imports. The repair only
+removes an import when all bound names are unused in that file.
+
+These repairs still flow through the normal snapshot and verification machinery.
+
+## Final Report
+
+The report includes:
+
+- result status;
+- changed files with real line stats;
+- found problems;
+- executed commands;
+- test status and reason;
+- last failure diagnosis when relevant;
+- web research status and sources;
+- diff summary;
+- remaining limitations.
+
+Diff information comes from git when available and from snapshot comparison
+otherwise. Empty or unavailable diffs are reported honestly.
