@@ -1543,7 +1543,8 @@ class TestPromptManager(unittest.TestCase):
         self.assertEqual(s, "")
 
     def test_get_predict_defaults(self):
-        self.assertEqual(self._pm.get_predict("plan"), 2048)
+        # predict.plan raised 2048→4096 (planner was truncating mid-plan; fix 2 of log-analysis)
+        self.assertEqual(self._pm.get_predict("plan"), 4096)
         self.assertEqual(self._pm.get_predict("code"), 16384)
         self.assertEqual(self._pm.get_predict("verify"), 512)
         self.assertEqual(self._pm.get_predict("relay"), 1200)

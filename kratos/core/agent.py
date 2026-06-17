@@ -113,8 +113,8 @@ from ..reporter import NO_REAL_CHANGES_MSG, build_final_report, verify_files_cha
 # ── token predict limits (now sourced from prompts at runtime for full configurability) ──
 # (kept as module fallbacks only for very early import paths; prefer get_predict)
 
-_PLAN_PREDICT        = 2048
-_PLAN_PREDICT_HEAVY  = 3072
+_PLAN_PREDICT        = 4096
+_PLAN_PREDICT_HEAVY  = 5120
 _PLAN_PREDICT_RETRY  = 6144
 _CODE_PREDICT        = 16384
 _VERIFY_PREDICT      = 512

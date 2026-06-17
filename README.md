@@ -32,9 +32,9 @@ Kratos nutzt bei **jedem** Aufruf das **maximale Kontextfenster** des jeweiligen
 
 | Rolle | Modell (abliterated) | max ctx | Aufgabe |
 |---|---|---|---|
-| **Planner** | `huihui_ai/qwen3-abliterated:8b` | 40 960 | Analyse, detaillierter Plan mit verifizierbaren Schritten |
-| **Coder** | `huihui_ai/qwen3.5-abliterated:4b` | 262 144 | Implementiert **einen Plan-Schritt nach dem anderen**: nachdenken, Befehl anzeigen, umsetzen, Test → nächster Schritt |
-| **Verifier** | `huihui_ai/qwen3-abliterated:8b` | 40 960 | Führt wirklich alle Tests aus (pro Schritt + finaler Sweep), prüft PROVEN_WORK streng |
+| **Planner** | `huihui_ai/deepseek-r1-abliterated:8b-0528-qwen3-q4_K_M` | 65 536 (VRAM-cap; 128k nativ) | Analyse, detaillierter Plan mit verifizierbaren Schritten |
+| **Coder** | `huihui_ai/qwen2.5-coder-abliterate:7b-instruct-q4_K_M` | 32 768 | Implementiert **einen Plan-Schritt nach dem anderen**: nachdenken, Befehl anzeigen, umsetzen, Test → nächster Schritt |
+| **Verifier** | `huihui_ai/deepseek-r1-abliterated:8b-0528-qwen3-q4_K_M` | 65 536 (VRAM-cap; 128k nativ) | Führt wirklich alle Tests aus (pro Schritt + finaler Sweep), prüft PROVEN_WORK streng |
 | **Auto-Composer** (Compressor) | `kratos-planner` (Phi-4-mini-abliterated GGUF) | ~32k+ | Verlustfreie History-Kompression + Memory-Extraktion in `.kratos/memory.json` (keine Info wird zerstört) |
 
 Alle Modelle laufen **sequenziell** — nie gleichzeitig im VRAM. Optimiert für Laptops (RTX 4050 6 GB Klasse).

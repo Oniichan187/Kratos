@@ -76,6 +76,26 @@ def test_glob_files_bare_and_path_patterns(project: Path):
     assert set(glob_files(project, "*.py")) == {"src/app.py", "src/util.py"}
     assert glob_files(project, "src/*.py")
     assert glob_files(project, "missing_*.xyz") == []
+    # **/*.py must match nested files — the common coder-prompt pattern
+    assert set(glob_files(project, "**/*.py")) == {"src/app.py", "src/util.py"}
+
+
+def test_glob_doublestar_matches_flat_project(tmp_path: Path):
+    """**/*.py must find top-level .py files — the root cause of the 2026-06-17
+    full-check session failure where glob returned 0 results for a flat project
+    (mathx.py, test_mathx.py, legacy_helper.py) making the coder loop endlessly."""
+    (tmp_path / "mathx.py").write_text("def add(a, b): pass\n", encoding="utf-8")
+    (tmp_path / "test_mathx.py").write_text("from mathx import add\n", encoding="utf-8")
+    (tmp_path / "legacy_helper.py").write_text("# obsolete\n", encoding="utf-8")
+    result = set(glob_files(tmp_path, "**/*.py"))
+    assert result == {"mathx.py", "test_mathx.py", "legacy_helper.py"}, (
+        f"**/*.py must match top-level .py files; got {result!r}"
+    )
+    # Also verify that src/**/*.py finds nested files too
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "util.py").write_text("", encoding="utf-8")
+    nested = glob_files(tmp_path, "src/**/*.py")
+    assert "src/util.py" in nested
 
 
 # ── 2. read_file_range ────────────────────────────────────────────────────────

@@ -737,6 +737,7 @@ def execute_structured_work_steps_for_plan(
         item_done = False
         recent_lookup_sigs: list[str] = []   # window of recent lookup-only turns
         repeated_lookups = 0
+        consecutive_lookup_turns = 0  # flail guard: any lookup-only turns, varied or not
 
         for turn_idx in range(max_turns_per_item):
             if agent._is_cancelled():
@@ -816,12 +817,20 @@ def execute_structured_work_steps_for_plan(
                     else:
                         last_failure = f"`{o.get('cmd')}` -> exit={o.get('exit_code')}\n{o.get('output', '')}"
 
-            # LOOP DETECTION: identical lookup-only turns (read/search the same
-            # thing again without ever editing) get a hard edit demand. Real
-            # runs alternate A,B,A,B — so compare against a WINDOW of recent
-            # signatures, not only the directly preceding turn.
-            is_lookup_only = not (actions["files"] or actions["deletes"]
-                                  or actions["commands"] or actions["done"])
+            # LOOP DETECTION: lookup-only turns without any write/delete/command.
+            # Two layers of detection:
+            #   1. Identical-signature guard — the model ran the exact same lookups
+            #      again without editing (A,B,A,B pattern).
+            #   2. Consecutive-lookup guard — even when the model varies its searches
+            #      (e.g. mathx.add() → mathx.py → **/*.py → web → is_prime), any
+            #      2+ consecutive lookup-only turns without a write means it is
+            #      "flailing" and needs a hard directive to write the code now.
+            # Note: edits (### EDIT) count as writes — include them in the "not
+            # lookup-only" check so an EDIT turn correctly resets the counters.
+            is_lookup_only = not (
+                actions["files"] or actions.get("edits", []) or actions["deletes"]
+                or actions["commands"] or actions["done"]
+            )
             sig = _lookup_signature(actions) if is_lookup_only else ""
             if is_lookup_only and sig and sig in recent_lookup_sigs:
                 repeated_lookups += 1
@@ -834,8 +843,22 @@ def execute_structured_work_steps_for_plan(
                         "Do not search or read again."
                     ),
                 })
-            elif not is_lookup_only:
+            if is_lookup_only:
+                consecutive_lookup_turns += 1
+                if consecutive_lookup_turns >= 2:
+                    observations.append({
+                        "kind": "note",
+                        "detail": (
+                            f"LOOKUP FLAIL: {consecutive_lookup_turns} consecutive turns of "
+                            "searching/reading without writing. The file content is already "
+                            "shown above. You MUST now emit ### FILE: <path> with the COMPLETE "
+                            "corrected content. Do NOT search, read, or use ### WEB_SEARCH "
+                            "again — write the implementation now."
+                        ),
+                    })
+            else:
                 repeated_lookups = 0
+                consecutive_lookup_turns = 0
                 recent_lookup_sigs.clear()
             if is_lookup_only and sig:
                 recent_lookup_sigs.append(sig)

@@ -4,10 +4,10 @@
 ALL models are abliterated (no safety filters).
 
 Roles (each uses the best abliterated model for a laptop + its job):
-  Planner    : huihui_ai/qwen3-abliterated:8b   — plans + CoT, FULL 40K ctx every call
-  Coder      : huihui_ai/qwen3.5-abliterated:4b — implements, FULL 262K ctx (huge repos)
-  Verifier   : huihui_ai/qwen3-abliterated:8b   — strict PROVEN_WORK + step checks, FULL ctx
-  Auto-Composer (Compressor): kratos-planner (Phi-4-mini-abliterated) — .kratos memory + history
+  Planner    : huihui_ai/deepseek-r1-abliterated:8b-0528-qwen3-q4_K_M  — plans + CoT, FULL 64K ctx (VRAM-capped)
+  Coder      : huihui_ai/qwen2.5-coder-abliterate:7b-instruct-q4_K_M   — implements, FULL 32K ctx (code-optimised)
+  Verifier   : huihui_ai/deepseek-r1-abliterated:8b-0528-qwen3-q4_K_M  — strict PROVEN_WORK, FULL ctx
+  Auto-Composer (Compressor): kratos-planner (Phi-4-mini-abliterated GGUF) — .kratos memory + history
                               NEVER destroys information, always max ctx.
 
 Pipeline guarantees:

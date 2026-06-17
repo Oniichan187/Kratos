@@ -141,20 +141,76 @@ def list_files(root: Path, ignore_patterns: frozenset[str] | None = None,
     return out
 
 
+def _glob_to_regex(pattern: str) -> "re.Pattern[str]":
+    """Translate a glob pattern to a regex with correct path-aware semantics.
+
+    ``**`` handling (the part fnmatch gets wrong):
+      - ``**/``  → zero-or-more directory components  e.g. ``**/*.py`` matches
+                   top-level ``mathx.py`` AND nested ``src/util/mathx.py``
+      - ``**``   → any sequence including path separators (catch-all)
+    Single-component wildcards:
+      - ``*``  → any sequence that does NOT contain ``/``
+      - ``?``  → any single character that is not ``/``
+    All other characters are matched literally (regex-escaped).
+    Matching is case-insensitive and anchored to the full string.
+    """
+    i = 0
+    parts: list[str] = []
+    n = len(pattern)
+    while i < n:
+        c = pattern[i]
+        if c == "*" and i + 1 < n and pattern[i + 1] == "*":
+            if i + 2 < n and pattern[i + 2] == "/":
+                # "**/" → zero-or-more directory segments (each ends with /)
+                parts.append("(?:[^/]+/)*")
+                i += 3
+            else:
+                # "**" at end or before non-slash → match anything
+                parts.append(".*")
+                i += 2
+        elif c == "*":
+            parts.append("[^/]*")
+            i += 1
+        elif c == "?":
+            parts.append("[^/]")
+            i += 1
+        else:
+            parts.append(re.escape(c))
+            i += 1
+    return re.compile("".join(parts) + r"\Z", re.IGNORECASE)
+
+
 def glob_files(root: Path, pattern: str, max_results: int = 200) -> list[str]:
     """Glob filename search. Accepts ``*.py``, ``**/*.test.ts``,
-    ``src/**/util*`` — both separators are normalized."""
+    ``src/**/util*`` — both separators are normalized.
+
+    Bare patterns (no ``/``) match the file basename anywhere in the tree.
+    Path patterns (containing ``/`` or ``**``) are matched against the full
+    relative posix path using :func:`_glob_to_regex` so that ``**/*.py``
+    correctly finds top-level files such as ``mathx.py`` as well as nested
+    ones like ``src/util/mathx.py``.  Previously ``fnmatch`` was used for
+    path patterns which silently treated ``**`` as a literal double-star and
+    never matched top-level files — the root cause of the coder loop finding
+    0 results on flat projects and spinning forever.
+    """
     pattern = (pattern or "").strip().replace("\\", "/")
     if not pattern:
         return []
-    bare = "/" not in pattern  # bare name pattern -> match basename anywhere
+    bare = "/" not in pattern and "**" not in pattern  # bare → match basename only
     matches: list[str] = []
-    for rel in list_files(root):
-        candidate = rel.split("/")[-1] if bare else rel
-        if fnmatch.fnmatch(candidate, pattern):
-            matches.append(rel)
-            if len(matches) >= max_results:
-                break
+    if bare:
+        for rel in list_files(root):
+            if fnmatch.fnmatch(rel.split("/")[-1], pattern):
+                matches.append(rel)
+                if len(matches) >= max_results:
+                    break
+    else:
+        regex = _glob_to_regex(pattern)
+        for rel in list_files(root):
+            if regex.match(rel):
+                matches.append(rel)
+                if len(matches) >= max_results:
+                    break
     return matches
 
 
