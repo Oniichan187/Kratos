@@ -260,7 +260,7 @@ def test_web_search_parses_results_without_network(tmp_path: Path):
 
     results, error = web_search(
         "python docs", project_dir=tmp_path,
-        _fetch=lambda url, timeout_seconds=20, project_dir=None: _Page(),
+        _fetch=lambda url, timeout_seconds=20, project_dir=None, **_kw: _Page(),
     )
     assert error == ""
     assert results[0].url == "https://docs.python.org/3/"

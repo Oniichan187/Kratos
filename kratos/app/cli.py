@@ -380,6 +380,12 @@ def _stream_agent(
                 logger.log_info(f"final_report:\n{content}")
 
     except KeyboardInterrupt:
+        # Stop the Live render FIRST so console.print() below is not re-entering
+        # the rich Live context, which causes a secondary crash on Ctrl+C.
+        try:
+            live.stop()
+        except Exception:
+            pass
         console.print()
         console.print("[yellow]⚠[/yellow]  Interrupted.")
     finally:
@@ -390,7 +396,12 @@ def _stream_agent(
         # (the info line with the live stats, above the input) can show it.
         if _plan_state is not None:
             _plan_state.update(plan_live)
-        live.stop()
+        # Idempotent — already stopped in the KeyboardInterrupt handler above;
+        # a second stop() is harmless but kept here for the non-interrupt path.
+        try:
+            live.stop()
+        except Exception:
+            pass
 
     _show_file_ops(agent, logger)
     console.print()

@@ -43,7 +43,7 @@ def test_web_search_unknown_provider_is_honest():
 
 
 def test_web_search_failed_fetch_returns_error_not_results():
-    def _broken_fetch(url, timeout_seconds=20, project_dir=None):
+    def _broken_fetch(url, timeout_seconds=20, project_dir=None, **_kw):
         return FetchResult(url=url, ok=False, error="network error: unreachable")
 
     results, error = web_search("python dataclass", _fetch=_broken_fetch)
@@ -58,7 +58,7 @@ def test_web_search_parses_when_fetch_succeeds():
         '<a class="result__snippet">official documentation</a>'
     )
 
-    def _ok_fetch(url, timeout_seconds=20, project_dir=None):
+    def _ok_fetch(url, timeout_seconds=20, project_dir=None, **_kw):
         return FetchResult(url=url, ok=True, status=200,
                            content_type="text/html", text=sample)
 

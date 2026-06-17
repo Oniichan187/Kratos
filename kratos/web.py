@@ -37,6 +37,13 @@ from pathlib import Path
 __all__ = ["FetchResult", "SearchResult", "web_fetch", "scrape_text_from_html", "web_search", "record_research_note", "collect_research_sources"]
 
 _USER_AGENT = "KratosAgent/1.0 (+local coding agent; research fetch)"
+# DuckDuckGo's HTML endpoint blocks GET requests with non-browser UAs and returns a 202
+# interstitial instead of results.  POST with a desktop browser UA works reliably.
+_DDG_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 _MAX_BYTES = 2_000_000          # 2 MB response cap
 _MAX_REDIRECTS = 5
 _ALLOWED_SCHEMES = {"http", "https"}
@@ -149,24 +156,43 @@ def collect_research_sources(project_dir: Path | None = None,
     return sources
 
 
-def build_request(url: str, timeout_seconds: int = 20) -> urllib.request.Request:
-    """Build the GET request (separate function so tests can verify headers
-    without any network access)."""
-    return urllib.request.Request(url, headers={
+def build_request(
+    url: str,
+    timeout_seconds: int = 20,
+    data: bytes | None = None,
+    extra_headers: dict | None = None,
+) -> urllib.request.Request:
+    """Build an HTTP GET (or POST when *data* is provided) request.
+
+    ``extra_headers`` are merged on top of the default headers, allowing
+    callers (e.g. the DuckDuckGo search path) to override the User-Agent
+    with a browser UA so the endpoint does not serve a 202 interstitial.
+    Kept as a separate function so tests can verify headers without network access.
+    """
+    headers: dict[str, str] = {
         "User-Agent": _USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.5",
         "Accept-Language": "en;q=0.9,de;q=0.8",
-    }, method="GET")
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    method = "POST" if data is not None else "GET"
+    return urllib.request.Request(url, data=data, headers=headers, method=method)
 
 
 def web_fetch(url: str, timeout_seconds: int = 20,
               max_bytes: int = _MAX_BYTES,
               project_dir: Path | None = None,
+              data: bytes | None = None,
+              extra_headers: dict | None = None,
               _opener=None) -> FetchResult:
-    """HTTP(S) GET with timeout, UA, status/content-type checks and size cap.
+    """HTTP(S) GET (or POST when *data* is provided) with timeout, UA, status/
+    content-type checks and size cap.
 
-    Never raises; always returns a FetchResult. ``_opener`` is injectable for
-    tests (an object with ``open(request, timeout=...)``).
+    ``data``         — raw POST body; when set the request is a POST.
+    ``extra_headers``— merged on top of default headers (e.g. to override UA).
+    ``_opener``      — injectable for tests (object with ``open(req, timeout=…)``).
+    Never raises; always returns a FetchResult.
     """
     result = FetchResult(url=url, ok=False, fetched_at=_now(), final_url=url)
     parsed = urllib.parse.urlparse(url)
@@ -183,7 +209,7 @@ def web_fetch(url: str, timeout_seconds: int = 20,
     opener = _opener or urllib.request.build_opener(
         urllib.request.HTTPRedirectHandler  # default handler caps redirects (10); fine
     )
-    request = build_request(url, timeout_seconds)
+    request = build_request(url, timeout_seconds, data=data, extra_headers=extra_headers)
     try:
         with opener.open(request, timeout=timeout_seconds) as resp:
             status = getattr(resp, "status", None) or resp.getcode() or 0
@@ -333,8 +359,19 @@ def web_search(query: str, max_results: int = 5, timeout_seconds: int = 20,
         return [], f"Web search provider {provider!r} not configured"
 
     fetch = _fetch or web_fetch
-    url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote_plus(query)
-    page = fetch(url, timeout_seconds=timeout_seconds, project_dir=project_dir)
+    # POST to DuckDuckGo's HTML endpoint with a browser User-Agent.
+    # GET requests with the KratosAgent UA now receive a 202 anti-bot interstitial
+    # (no search results); POST + desktop-browser UA returns a proper 200 result page.
+    ddg_url = "https://html.duckduckgo.com/html/"
+    post_body = urllib.parse.urlencode({"q": query}).encode("utf-8")
+    ddg_headers = {
+        "User-Agent": _DDG_BROWSER_UA,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.5",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    page = fetch(ddg_url, timeout_seconds=timeout_seconds, project_dir=project_dir,
+                 data=post_body, extra_headers=ddg_headers)
     if not page.ok:
         err = f"web search unavailable: {page.error or 'fetch failed'}"
         record_research_note("web_search", {"query": query, "ok": False, "error": err}, project_dir)

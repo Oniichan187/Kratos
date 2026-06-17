@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -60,6 +61,44 @@ _SAFE_VERIFY_PREFIXES_FALLBACK: tuple[str, ...] = (
     "mvn test", "gradle test", "./gradlew test",
     "npx tsc", "tsc --noEmit",
 )
+
+
+def _normalize_runner_command(cmd: str) -> str:
+    """Rewrite bare runner shims to their ``python -m`` equivalents.
+
+    On many Windows setups the console-script shim (e.g. ``pytest.exe``) is
+    not on PATH even though the package is installed, while ``python -m pytest``
+    works perfectly. This normalisation is applied centrally in
+    ``_run_verification_command`` so it covers every invocation path (coder-
+    emitted ``### VERIFY``, auto-verify, README-discovered, inferred).
+
+    Transformations:
+      ``pytest …``      → ``python -m pytest …``
+      ``py -m pytest …`` → left alone (already correct)
+      ``pip …``         → ``python -m pip …``
+      Everything else   → unchanged
+    """
+    stripped = " ".join(cmd.strip().split())
+    lower = stripped.lower()
+
+    # Already in module form — don't double-wrap.
+    if lower.startswith(("python -m ", "py -m ")):
+        return stripped
+
+    # pytest shim (bare `pytest` or `pytest.exe`)
+    if re.match(r"^pytest(?:\.exe)?(?:\s|$)", lower):
+        rest = stripped[stripped.lower().index("pytest") + len("pytest"):].lstrip()
+        # Strip stray .exe suffix if present on the bare shim token
+        rest = re.sub(r"^\.exe\s*", "", rest, flags=re.I)
+        return f"python -m pytest {rest}".strip()
+
+    # pip shim
+    if re.match(r"^pip(?:\.exe)?(?:\s|$)", lower):
+        rest = stripped[stripped.lower().index("pip") + len("pip"):].lstrip()
+        rest = re.sub(r"^\.exe\s*", "", rest, flags=re.I)
+        return f"python -m pip {rest}".strip()
+
+    return stripped
 
 
 def _compile_check_cmds(toolchains: set[str], root: Path) -> list[VerificationCommand]:

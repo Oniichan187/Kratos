@@ -22,6 +22,7 @@ from ..verification import (
     _is_test_verification_command,
     _extract_readme_verification_commands,
     _infer_project_verification_commands,
+    _normalize_runner_command,
 )
 
 
@@ -75,13 +76,18 @@ class _VerificationRunnerMixin:
             except ValueError:
                 pass
 
+        # Normalize bare runner shims (e.g. `pytest` → `python -m pytest`) so
+        # that commands work even when the console-script .exe is not on PATH.
+        # Applied BEFORE the SafetyGuard so the guard sees the canonical form.
+        exec_cmd = _normalize_runner_command(command.cmd)
+
         # Defense in depth: even allowlisted build/test commands pass the
         # SafetyGuard blocklist before execution.
         from ..safety import check_command
-        verdict = check_command(command.cmd)
+        verdict = check_command(exec_cmd)
         if not verdict:
             return {
-                "cmd": command.cmd, "purpose": command.purpose,
+                "cmd": exec_cmd, "purpose": command.purpose,
                 "source": command.source, "is_test": command.is_test,
                 "exit_code": 126, "duration_seconds": 0.0,
                 "output": f"SafetyGuard: {verdict.reason}",
@@ -92,7 +98,7 @@ class _VerificationRunnerMixin:
             }
         try:
             result = subprocess.run(
-                command.cmd,
+                exec_cmd,
                 shell=True,
                 capture_output=True,
                 text=True,
@@ -124,7 +130,7 @@ class _VerificationRunnerMixin:
             timed_out = False
 
         return {
-            "cmd": command.cmd,
+            "cmd": exec_cmd,
             "purpose": command.purpose,
             "source": command.source,
             "is_test": command.is_test,
