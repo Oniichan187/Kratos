@@ -149,7 +149,14 @@ _COMPILED: list[tuple[Intent, list[re.Pattern]]] = [
 
 class IntentClassifier:
     def classify(self, analysis: InputAnalysis) -> Intent:
-        if analysis.is_followup:
+        text  = analysis.normalized
+        words = len(text.split())
+
+        # Follow-up markers such as "continue" or German "wiederholen" are
+        # useful for short conversational continuations, but long pasted task
+        # briefs often contain reset/retry prose. Do not let one incidental
+        # follow-up word bypass the normal coding/bugfix rules and the planner.
+        if analysis.is_followup and words <= 20 and not analysis.has_code_block:
             return Intent.FOLLOWUP
 
         if analysis.has_stacktrace:
@@ -158,11 +165,8 @@ class IntentClassifier:
         if analysis.has_log and analysis.error_lines:
             return Intent.LOG_ANALYSIS
 
-        if analysis.has_git_cmd:
+        if analysis.has_git_cmd and words <= 30 and not analysis.has_code_block:
             return Intent.SHELL_GIT
-
-        text  = analysis.normalized
-        words = len(text.split())
 
         # For short inputs (≤ 30 words): check FILE_SEARCH/CODE_SEARCH BEFORE
         # QUESTION, because "wo ist die config.py" starts with "wo" which would

@@ -1407,6 +1407,24 @@ class TestClassifierRouter(unittest.TestCase):
     def test_followup(self):
         self.assertEqual(self._classify("continue"), Intent.FOLLOWUP)
 
+    def test_long_task_with_reset_word_still_uses_planner(self):
+        text = """
+TASK: Complete and clean up the toolkit in the fullcheck directory so the
+whole test suite passes.
+
+```
+Implement slugify, is_palindrome, median, gcd and fix the mean bug.
+Do not modify tests.
+```
+
+Reset: to repeat this full check, restore the starter files and run it again.
+German note: um den Full-Check zu wiederholen, stelle die Dateien wieder her,
+for example with git checkout.
+"""
+        self.assertNotEqual(self._classify(text), Intent.FOLLOWUP)
+        self.assertNotEqual(self._classify(text), Intent.SHELL_GIT)
+        self.assertEqual(self._route(text), Route.PLANNER_THEN_CODER)
+
     def test_routing_coding(self):
         self.assertEqual(self._route("implement a REST API"), Route.PLANNER_THEN_CODER)
 
