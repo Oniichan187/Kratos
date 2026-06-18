@@ -110,14 +110,29 @@ def resolve_project_path(root: Path, rel: str) -> tuple[str | None, str]:
         return None, "path escapes project root"
     if direct.exists():
         return cleaned, ""
-    # suffix match: every project file whose relative path ends with the
-    # requested path (component-aligned)
+    all_files = list_files(root)
+    # forward suffix match: an existing file's path ENDS WITH the requested path
+    # (model emitted a subproject-relative path; the real file lives deeper).
     suffix = "/" + cleaned
-    matches = [f for f in list_files(root) if f == cleaned or f.endswith(suffix)]
+    matches = [f for f in all_files if f == cleaned or f.endswith(suffix)]
     if len(matches) == 1:
         return matches[0], f"resolved {rel!r} -> {matches[0]!r} (suffix match)"
     if len(matches) > 1:
         return None, f"ambiguous path {rel!r}: matches {', '.join(matches[:4])}"
+    # reverse match: the requested path ENDS WITH an existing file's path — the
+    # model emitted EXTRA leading directories, most often repeating the project
+    # root folder name (e.g. 'fullcheck/textutils.py' while the run cwd is ALREADY
+    # .../fullcheck, so the real file is just 'textutils.py'). Writing the literal
+    # path creates a stray nested copy (.../fullcheck/fullcheck/textutils.py) that
+    # no test imports — the exact cause of a 6.6 h non-converging run. Map to the
+    # most-specific existing file the requested path ends with.
+    tail = [f for f in all_files if cleaned.endswith("/" + f)]
+    if tail:
+        depth = max(f.count("/") for f in tail)
+        best = [f for f in tail if f.count("/") == depth]
+        if len(best) == 1:
+            return best[0], f"resolved {rel!r} -> {best[0]!r} (parent-dir trim)"
+        return None, f"ambiguous trim for {rel!r}: {', '.join(best[:4])}"
     return None, "file does not exist"
 
 

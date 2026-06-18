@@ -597,7 +597,17 @@ def do_delete(
     project_root: Path, rel_path: str,
     proof: ProvenWork, attempt: int, original_snapshots: dict,
 ) -> Generator[tuple, None, dict]:
-    """``### DELETE: <path>`` — gated by ``config.can_delete()`` at the call site."""
+    """``### DELETE: <path>`` — gated by ``config.can_delete()`` at the call site.
+
+    Uses the same path resolution as ``do_write`` so a model that emits an
+    extra leading directory (e.g. the repeated project-root name) still deletes
+    the real file instead of silently no-op'ing on a non-existent nested path."""
+    rel_path = _strip_md_decor(rel_path)
+    if not (project_root / rel_path).exists():
+        resolved, note = resolve_project_path(project_root, rel_path)
+        if resolved is not None and resolved != rel_path:
+            yield ("tool", f"path_resolve: {note}", "tool")
+            rel_path = resolved
     target = (project_root / rel_path).resolve()
     try:
         target.relative_to(project_root.resolve())
