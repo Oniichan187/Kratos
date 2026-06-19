@@ -210,6 +210,25 @@ def render_checklist(items: list[PlanItem], *, compact: bool = True) -> str:
     return "\n".join(lines)
 
 
+def active_checklist_line(compact: str) -> str:
+    """From a compact checklist string, return the single *active* item — the
+    first item that is not yet done.
+
+    The live bottom bar shows only this one line (the item currently being
+    worked on) instead of the whole truncated list, and it advances on its own
+    as items complete. Done ``☑`` and failed ``☒`` items are skipped; the first
+    pending ``□`` or in-progress ``☐`` line is returned. Returns ``""`` when
+    every item is done (caller renders an "all done" hint)."""
+    for raw in (compact or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line[:1] in ("☑", "☒"):   # done / failed → not the active item
+            continue
+        return line                  # first □ (pending) or ☐ (in-progress)
+    return ""
+
+
 def render_plan_status(items: list[PlanItem]) -> str:
     if not items:
         return "PLAN STATUS: no checklist items parsed."

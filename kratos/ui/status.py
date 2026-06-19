@@ -207,13 +207,18 @@ def status_bar(
     else:
         body_lines = [bar2]
 
-    # Compact live plan/todo integrated with the bottom stats (next to ctx P/C/V "live stats").
+    # Live plan/todo integrated with the bottom stats (next to ctx P/C/V "live stats").
     # This is the persistent "live todo über dem userinput" the user wants in the CLI frame.
+    # Show ONLY the single active item (the one currently being worked on) — not the whole
+    # truncated checklist — so the line stays one item tall and advances live as items finish.
     if plan_state:
         plabel = plan_state.get("label") or ""
-        pcompact = plan_state.get("compact") or ""
-        if plabel or pcompact:
-            plan_line = f"[magenta]{plabel}[/magenta]" + (f"  [dim]{pcompact[:60]}[/dim]" if pcompact else "")
+        pactive = plan_state.get("active") or ""
+        if plabel or pactive:
+            if pactive:
+                plan_line = f"[magenta]{plabel}[/magenta]  [white]{_me(pactive[:72])}[/white]"
+            else:
+                plan_line = f"[magenta]{plabel}[/magenta]  [green]✓ all items done[/green]"
             body_lines.insert(0, plan_line)
 
     body = Text.from_markup("\n".join(body_lines))

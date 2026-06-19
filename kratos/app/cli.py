@@ -139,7 +139,7 @@ def _stream_agent(
 
     # Live plan/todo state (compact) — updated from planner flush + change-aware coder events.
     # Mirrors the ctx_live pattern so the bottom status bar can show it next to the live P/C/V stats.
-    plan_live: dict = {"done": 0, "total": 0, "compact": "", "label": ""}
+    plan_live: dict = {"done": 0, "total": 0, "compact": "", "label": "", "active": ""}
     # Tracks the last checklist we reprinted to the transcript so we refresh the
     # visible todo list (□ -> ☑) when progress advances, without spamming on every
     # micro-event. The one-time "PLAN CHECKLIST" box never updates by itself.
@@ -278,7 +278,7 @@ def _stream_agent(
                     planner_filter.flush()
                     # Feed the live plan state for the bottom bar right after the (one-time) checklist print.
                     try:
-                        from kratos.planning import parse_execution_plan, render_checklist
+                        from kratos.planning import parse_execution_plan, render_checklist, active_checklist_line
                         p = parse_execution_plan(planner_buf or "")
                         if p.items:
                             done = sum(1 for it in p.items if it.status == "done")
@@ -286,6 +286,7 @@ def _stream_agent(
                             plan_live["total"] = len(p.items)
                             plan_live["compact"] = render_checklist(p.items, compact=True)
                             plan_live["label"] = f"PLAN {done}/{len(p.items)}"
+                            plan_live["active"] = active_checklist_line(plan_live["compact"])
                     except Exception:
                         pass
                 elif current_section == "verify":
@@ -332,6 +333,8 @@ def _stream_agent(
                         label, rest = content.split(" | ", 1)
                         plan_live["label"] = label.strip()
                         plan_live["compact"] = rest.strip()
+                        from kratos.planning import active_checklist_line
+                        plan_live["active"] = active_checklist_line(rest.strip())
                         # crude done/total from the label if present
                         if "/" in label:
                             nums = label.split()[-1]

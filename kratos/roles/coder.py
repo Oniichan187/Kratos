@@ -51,17 +51,22 @@ from .prompts import _coder_context_block
 # Additional lookup/research markers available to the coder loop (runtime-side
 # docs so even a user-customized prompts JSON keeps these tools discoverable).
 _EXTRA_MARKERS_DOC = (
-    "ADDITIONAL LOOKUP ACTIONS (read-only, instant):\n"
-    "  ### SEARCH: <pattern> [:: <glob>]   - smart search: literal text, a|b alternation,\n"
+    "ADDITIONAL LOOKUP ACTIONS (read-only, instant — like ripgrep / Get-ChildItem / Get-Content):\n"
+    "  ### SEARCH: <pattern> [:: <glob[, glob...]>]  - smart search: literal text, a|b alternation,\n"
     "                                        regex, all case-insensitive. Returns file:line:col hits.\n"
-    "                                        Example: ### SEARCH: Feldkirch|weather-card :: **/*.html\n"
-    "  ### GREP: <regex> [:: <glob>]       - regex-first search across project files\n"
-    "  ### GLOB: <pattern>                 - find files by name, e.g. ### GLOB: **/*.test.ts\n"
+    "                                        Scope to one or more file globs after '::'.\n"
+    "                                        Example: ### SEARCH: Feldkirch|weather-card :: **/*.html, *.jsx\n"
+    "  ### GREP: <regex> [:: <glob[, glob...]>]  - regex-first search (rg-style `-n \"pat\" path` also works)\n"
+    "  ### GLOB: <pattern[, pattern...]>   - find files by name; OR several globs with commas,\n"
+    "                                        e.g. ### GLOB: **/*.py, *.md, README*   (codex `-g a -g b` style)\n"
+    "  ### READ: <path>                    - read a whole file (Get-Content)\n"
     "  ### READ_RANGE: <path>:<start>-<end> - read exact line range, e.g. ### READ_RANGE: src/app.py:40-90\n"
     "  ### WEB_SEARCH: <query>             - web search (docs/API/error research); cite sources\n"
     "  ### WEB_FETCH: <url>                - fetch one documentation page as text\n"
-    "SEARCH wants a concrete pattern, NOT a sentence describing what you want to find.\n"
-    "Use SEARCH/GREP before editing unfamiliar files. Use WEB_* only for documentation or error research."
+    "SEARCH wants a concrete pattern (token, identifier, regex, or a|b set), NOT a sentence.\n"
+    "Use SEARCH/GREP/GLOB before editing unfamiliar files. A search that already returned 0 hits\n"
+    "will be auto-skipped if you repeat it verbatim — read the file directly or change the term.\n"
+    "Use WEB_* only for documentation or error research."
 )
 
 # When the task explicitly asks for web research/scraping, weak/abliterated
@@ -404,6 +409,55 @@ def _run_lookup_actions(
         observations.append((yield from do_web_search(project_root, query)))
 
 
+# ── dead-search guard (persists across turns AND items) ───────────────────────
+# A SEARCH/GREP that already returned 0 results is pure waste when repeated
+# verbatim. Real runs showed `### SEARCH: re.sub :: numstats.py` fired 5+ times,
+# 0 hits each, burning the per-item turn budget while the file was never touched.
+# The per-item flail guard reset every item and so never caught it. These helpers
+# remember zero-result queries for the WHOLE loop and skip them on sight.
+
+def _search_id(kind: str, pattern: str | None, glob: str | None) -> str:
+    return f"{kind}:{' '.join((pattern or '').split()).lower()}::{(glob or '').lower()}"
+
+
+def _dead_arg_key(kind: str, arg: str) -> str:
+    try:
+        from ..execution.tools import _normalize_grep_arg
+        pattern, glob = _normalize_grep_arg(arg)
+    except Exception:
+        pattern, glob = arg, None
+    return _search_id(kind, pattern, glob)
+
+
+def _filter_dead_searches(actions: dict, dead: set[str], observations: list[dict]) -> None:
+    """Drop SEARCH/GREP lookups already known to return nothing; leave a note."""
+    for kind, mk in (("search", "searches"), ("grep", "greps")):
+        if not actions.get(mk):
+            continue
+        kept: list[str] = []
+        for arg in actions.get(mk, []):
+            if _dead_arg_key(kind, arg) in dead:
+                observations.append({
+                    "kind": "note",
+                    "detail": (
+                        f"SKIPPED repeated search {arg!r}: it already returned 0 results earlier "
+                        "and nothing has changed since. Do NOT search it again — read the target "
+                        "file directly with ### READ / ### READ_RANGE, or search a different, "
+                        "concrete token."
+                    ),
+                })
+            else:
+                kept.append(arg)
+        actions[mk] = kept
+
+
+def _record_dead_searches(observations: list[dict], dead: set[str]) -> None:
+    """Remember SEARCH/GREP queries that just found nothing."""
+    for o in observations:
+        if o.get("kind") in ("search", "grep") and o.get("ok") and not o.get("count"):
+            dead.add(_search_id(o.get("kind"), o.get("query"), o.get("glob")))
+
+
 def run_coder_loop(
     agent,
     task: str,
@@ -439,6 +493,7 @@ def run_coder_loop(
     plan_text = plan_state.markdown
 
     last_plan_compact: str = ""  # for change-aware de-spam of UI events
+    dead_searches: set[str] = set()  # SEARCH/GREP args already proven to find nothing
 
     ctx_block = _coder_context_block(ctx, pm, step_mode=False)
     cmd_block = cmd_registry.format_for_prompt()
@@ -500,7 +555,9 @@ def run_coder_loop(
         observations: list[dict] = []
         touched_files: list[str] = []
 
+        _filter_dead_searches(actions, dead_searches, observations)
         yield from _run_lookup_actions(project_root, actions, observations)
+        _record_dead_searches(observations, dead_searches)
 
         for cmd in actions["inspects"]:
             observations.append((yield from do_inspect(agent, project_root, cmd)))
@@ -701,6 +758,10 @@ def execute_structured_work_steps_for_plan(
     # Live plan rendering for the UI (change-aware, like run_coder_loop) —
     # without this the TUI plan box stays frozen at "PLAN 0/N" forever.
     last_plan_compact: str = ""
+    # Dead-search memo persists across ALL items (the per-item flail guard below
+    # resets every item, so it never caught the cross-item `re.sub :: numstats.py`
+    # repeat that burned a whole run).
+    dead_searches: set[str] = set()
 
     for item in plan_state.items:
         if item.status == "done":
@@ -763,7 +824,9 @@ def execute_structured_work_steps_for_plan(
             observations: list[dict] = []
             touched: list[str] = []
 
+            _filter_dead_searches(actions, dead_searches, observations)
             yield from _run_lookup_actions(project_root, actions, observations)
+            _record_dead_searches(observations, dead_searches)
 
             for cmd in actions["inspects"]:
                 observations.append((yield from do_inspect(agent, project_root, cmd)))

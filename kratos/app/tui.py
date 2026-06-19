@@ -78,16 +78,17 @@ class _TuiCoderFilter:
             fm, dm, sm = "### FILE:", "### DELETE:", "### SUMMARY"
 
         if s.startswith(fm):
+            # Do NOT echo the file marker here. The authoritative line is the
+            # actual do_write tool event ("write_file('x') -> N bytes (+a/-r lines)"),
+            # rendered once the write lands. Echoing the marker too produced a
+            # duplicate write_file line. Keep only the suppression state.
             path = s[len(fm):].strip()
-            if path and path not in self._seen:
+            if path:
                 self._seen.add(path)
-                self._emit(f"  ↳ write_file({path!r})", "dim blue")
             self._in_summary = False
             self._in_code = False
         elif s.startswith(dm):
-            path = s[len(dm):].strip()
-            if path:
-                self._emit(f"  ↳ delete_file({path!r})", "dim blue")
+            # The do_delete tool event is the single authoritative line.
             self._in_summary = False
             self._in_code = False
         elif s.startswith(sm):

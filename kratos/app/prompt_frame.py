@@ -356,16 +356,21 @@ class _CoderFilter:
             fm, dm, sm = "### FILE:", "### DELETE:", "### SUMMARY"
 
         if s.startswith(fm):
+            # Do NOT echo the file marker here. The authoritative line is the
+            # actual do_write tool event ("write_file('x') -> N bytes (+a/-r lines)")
+            # which the stream prints once the write lands on disk. Echoing the
+            # marker too produced the duplicate the user reported:
+            #   ↳ write_file('numstats.py')
+            #   ↳ WRITE  write_file('numstats.py') -> 404 bytes (-5 +0 lines)
+            # Keep only the state updates so the following code body stays hidden.
             path = s[len(fm):].strip()
-            if path and path not in self._seen:
+            if path:
                 self._seen.add(path)
-                console.print(f"  [dim blue]↳[/dim blue] write_file([dim]{path!r}[/dim])")
             self._in_summary = False
             self._in_code = False
         elif s.startswith(dm):
-            path = s[len(dm):].strip()
-            if path:
-                console.print(f"  [dim blue]↳[/dim blue] delete_file([dim]{path!r}[/dim])")
+            # Same as above — the do_delete tool event ("delete_file('x') -> ok")
+            # is the single authoritative line; don't pre-echo the marker.
             self._in_summary = False
             self._in_code = False
         elif s.startswith(sm):

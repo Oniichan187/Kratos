@@ -13,9 +13,9 @@ search result becomes structured evidence or a structured observation.
 |---|---|---|
 | `### READ` | `### READ: src/app.py` | Reads one file. |
 | `### READ_RANGE` | `### READ_RANGE: src/app.py:20-80` | Reads exact 1-based line range. |
-| `### SEARCH` | `### SEARCH: render_user :: **/*.py` | Smart literal/regex/keyword search, optional glob. |
-| `### GREP` | `### GREP: class\s+User :: **/*.py` | Regex search with smart fallback. |
-| `### GLOB` | `### GLOB: src/**/*.py` | Lists matching files. |
+| `### SEARCH` | `### SEARCH: render_user :: **/*.py, *.jsx` | Smart literal / `a\|b` / regex / keyword search; optional multi-glob scope after `::`. |
+| `### GREP` | `### GREP: class\s+User :: **/*.py` | Regex search with smart fallback; rg-style `-n "pat" path` is also accepted. |
+| `### GLOB` | `### GLOB: **/*.py, *.md, README*` | Lists files by name; comma/pipe-separated patterns are OR-ed. |
 | `### INSPECT` | `### INSPECT: python -m pytest --collect-only` | Runs read-only inspection commands. |
 | `### FILE` | `### FILE: docs/new.md` | Creates or replaces a file with the following fenced body. |
 | `### EDIT` | `### EDIT: src/app.py` | Applies one or more search/replace blocks. |
@@ -41,6 +41,11 @@ search result becomes structured evidence or a structured observation.
 The search layer ignores heavy and generated directories, including `.git`,
 `.kratos`, `.claude`, `node_modules`, virtualenvs, build output, cache folders,
 and model directories. It skips binary files and very large files.
+
+`glob_files` accepts a single glob or several OR-ed patterns separated by commas
+or pipes, mirroring ripgrep's repeated `-g` filters and PowerShell's
+`Get-ChildItem -Include *.py,*.md`. The same multi-pattern form scopes `### SEARCH`
+and `### GREP` after `::`. Matches are de-duplicated and order-preserving.
 
 `smart_search` tries practical fallbacks before giving up:
 

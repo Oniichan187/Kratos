@@ -211,6 +211,24 @@ def glob_files(root: Path, pattern: str, max_results: int = 200) -> list[str]:
     pattern = (pattern or "").strip().replace("\\", "/")
     if not pattern:
         return []
+    # Multi-pattern: comma- or pipe-separated globs are OR-ed together, the way
+    # codex/ripgrep takes repeated `-g <glob>` filters and PowerShell takes
+    # `Get-ChildItem -Include *.py,*.md`. e.g. `*.py, *.md, README*` lists files
+    # matching ANY of the three. Results are de-duplicated, order-preserving.
+    if "," in pattern or "|" in pattern:
+        seen: set[str] = set()
+        merged: list[str] = []
+        for sub in re.split(r"[,|]", pattern):
+            sub = sub.strip()
+            if not sub:
+                continue
+            for rel in glob_files(root, sub, max_results=max_results):
+                if rel not in seen:
+                    seen.add(rel)
+                    merged.append(rel)
+                    if len(merged) >= max_results:
+                        return merged
+        return merged
     bare = "/" not in pattern and "**" not in pattern  # bare → match basename only
     matches: list[str] = []
     if bare:

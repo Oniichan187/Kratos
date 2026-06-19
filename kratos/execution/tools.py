@@ -526,6 +526,37 @@ def do_write(
                 old_text = None
         old_lines = len(old_text.splitlines()) if old_text else 0
 
+        # Duplicate / no-op write guard. If the file already holds byte-identical
+        # content there is nothing to write — re-writing it wastes a loop turn and
+        # prints a second, misleading "write_file(...) -> N bytes" line. Real runs
+        # showed the same file (numstats.py) written twice in a row with an identical
+        # sha256. Report it honestly as "no change" so the model stops re-writing and
+        # moves on to verifying / the next item. Note: we compare against the CURRENT
+        # on-disk content, not the original snapshot, so a legitimate first edit still
+        # goes through.
+        current_disk = target.read_text("utf-8") if target.exists() else None
+        if current_disk is not None and current_disk == content:
+            file_bytes = target.stat().st_size
+            yield ("tool",
+                   f"write_file({rel_path!r}) -> no change (identical content already on disk)",
+                   "tool")
+            yield ("log", json.dumps({
+                "type": "file_write", "path": rel_path, "ok": True, "noop": True,
+                "content": content, "previous_content": current_disk,
+                "size_bytes": file_bytes,
+                "detail": "identical content already on disk — write skipped",
+                "attempt": attempt,
+            }, ensure_ascii=False), "log")
+            return {
+                "kind": "file", "path": rel_path, "ok": True, "noop": True,
+                "bytes": file_bytes,
+                "old_line_count": len(content.splitlines()),
+                "new_line_count": len(content.splitlines()),
+                "lines_added": 0, "lines_removed": 0,
+                "detail": ("no change — this file already contains exactly this content. "
+                           "Do not write it again; run the verify command or move to the next item."),
+            }
+
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         file_bytes = target.stat().st_size

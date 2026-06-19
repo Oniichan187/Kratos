@@ -78,6 +78,13 @@ When Kratos starts, the classic CLI checks Ollama, checks the configured models,
 loads config and prompt JSON, then opens a REPL. The TUI uses the same agent
 pipeline with a Textual interface.
 
+A live status bar is pinned to the bottom of the CLI. It shows the active role's
+context window, elapsed time, and a single-line **live todo**: the plan label
+(`PLAN 3/8`) plus only the one checklist item currently being worked on — the
+first not-yet-done item — which advances on its own as items complete. File
+operations are printed once, from the authoritative tool event with byte and
+line deltas (for example `write_file('app.py') -> 590 bytes (+6 -0 lines)`).
+
 ## Request Flow
 
 Kratos is not a single prompt wrapper. A normal coding request moves through
@@ -143,9 +150,9 @@ that `kratos/execution/tools.py` parses and executes:
 |---|---|
 | `### READ: path` | Read a file |
 | `### READ_RANGE: path:start-end` | Read exact line range |
-| `### SEARCH: text [:: glob]` | Smart literal/regex/keyword search |
-| `### GREP: regex [:: glob]` | Regex search with smart fallback |
-| `### GLOB: pattern` | List matching files |
+| `### SEARCH: text [:: glob[, glob…]]` | Smart literal / `a\|b` / regex / keyword search, optional multi-glob scope |
+| `### GREP: regex [:: glob[, glob…]]` | Regex search (rg-style `-n "pat" path` accepted) with smart fallback |
+| `### GLOB: pattern[, pattern…]` | List files by name; comma/pipe-separated patterns are OR-ed (`rg -g a -g b` / `Get-ChildItem -Include *.py,*.md` style) |
 | `### INSPECT: command` | Run read-only inspection command |
 | `### FILE: path` | Create or replace a small file |
 | `### EDIT: path` | Apply Aider-style search/replace edits |
