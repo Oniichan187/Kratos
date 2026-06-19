@@ -262,6 +262,42 @@ class KratosAgent(_RoleRunnerMixin, _RetryMixin, _VerificationRunnerMixin):
                     top_k=getattr(self.config, "retrieval_top_k", 16),
                 )
                 yield ("tool", f"knowledge_get(task) → {len(retrieved_chunks)} chunks (vector+hybrid)", "tool")
+                # Surface WHICH knowledge sources were retrieved. Previously only the
+                # count was emitted, so the pre-planner vector-DB step showed/logged
+                # nothing about the actual chunks even though they exist. Now we (a)
+                # write a full structured `knowledge_get` record to the session jsonl
+                # and (b) print a compact, de-duplicated source list to the CLI/TUI,
+                # symmetric to the read_file lines right below it.
+                if retrieved_chunks:
+                    yield ("log", json.dumps({
+                        "type": "knowledge_get",
+                        "query": (analysis.normalized or task)[:300],
+                        "count": len(retrieved_chunks),
+                        "chunks": [
+                            {
+                                "rel_path": c.rel_path,
+                                "symbol": c.symbol,
+                                "kind": c.kind,
+                                "start_line": c.start_line,
+                                "end_line": c.end_line,
+                                "score": round(c.score, 4),
+                                "vector_score": round(c.vector_score, 4),
+                                "symbol_score": round(c.symbol_score, 4),
+                                "keyword_score": round(c.keyword_score, 4),
+                                "snippet": (c.summary or c.text or "")[:300],
+                            }
+                            for c in retrieved_chunks
+                        ],
+                    }, ensure_ascii=False), "log")
+                    _src_counts: dict[str, int] = {}
+                    for c in retrieved_chunks:
+                        _src_counts[c.rel_path] = _src_counts.get(c.rel_path, 0) + 1
+                    _src_list = ", ".join(
+                        f"{p}{f' ×{n}' if n > 1 else ''}"
+                        for p, n in list(_src_counts.items())[:12]
+                    )
+                    _more = "" if len(_src_counts) <= 12 else f", +{len(_src_counts) - 12} more"
+                    yield ("tool", f"knowledge_get sources → {_src_list}{_more}", "tool")
             except Exception as exc:
                 yield ("warn", f"knowledge retrieval failed (falling back): {exc}", "warn")
 

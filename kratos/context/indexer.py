@@ -13,6 +13,12 @@ from pathlib import Path
 from ..llm.tokens import fit_excerpt
 
 _MAX_FILE_BYTES = 80_000    # raw read cap per file (bytes) — ~20K tokens
+# NOTE: there is deliberately NO file-size limit on what may be INDEXED. The
+# vector knowledge base exists precisely so projects of any size can be handled:
+# indexing is path-only and cheap, every reader below caps how many bytes it
+# actually pulls (ContextBuilder truncates to _MAX_FILE_BYTES; the knowledge
+# builder seek-samples huge files), so a multi-GB .jsonl is listed and
+# retrievable without ever being loaded whole into memory.
 
 # (priority, pattern) matched against relative path or filename
 _PRIORITY_RULES: list[tuple[int, re.Pattern]] = [
@@ -92,8 +98,8 @@ class ProjectIndexer:
                     size = path.stat().st_size
                 except OSError:
                     continue
-                if size > _MAX_FILE_BYTES * 4:
-                    continue
+                # No size cap: any recognized file is indexed regardless of size.
+                # Content is only ever read in bounded amounts downstream.
                 try:
                     rel = str(path.relative_to(self.root)).replace("\\", "/")
                 except ValueError:
@@ -121,7 +127,10 @@ class ProjectIndexer:
         pat = re.compile(re.escape(keyword), re.I)
         for entry in self.index:
             try:
-                content = entry.path.read_text(encoding="utf-8", errors="replace")
+                # Bounded read: the index may now contain very large files, so we
+                # never pull a whole multi-MB/GB file into memory for a keyword scan.
+                with entry.path.open("r", encoding="utf-8", errors="replace") as _fh:
+                    content = _fh.read(_MAX_FILE_BYTES)
             except OSError:
                 continue
             for i, line in enumerate(content.splitlines(), 1):

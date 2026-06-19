@@ -84,15 +84,22 @@ for that item, such as a successful targeted verification command.
 
 `kratos/context/indexer.py` lists files while ignoring heavy or unsafe folders
 such as `.git`, `.kratos`, `.claude`, `node_modules`, virtualenvs, build output,
-and model directories.
+and model directories. There is deliberately **no file-size limit** on what gets
+indexed — indexing is path-only and cheap, so a multi-GB data file is listed like
+any other. Memory stays bounded because every reader pulls only a capped number
+of bytes (see below).
 
 `kratos/context/builder.py` builds a token-aware prompt context:
 
 - all known files are listed up to a practical cap;
 - likely relevant files are prioritized;
-- content excerpts are capped by token budget;
+- content is read in a bounded way (at most `_MAX_FILE_BYTES` per file, streamed —
+  a large file is never loaded whole) and excerpts are capped by token budget;
 - secret-looking files are skipped;
 - nested project paths are handled.
+
+`ProjectIndexer.search_content` also reads at most `_MAX_FILE_BYTES` per file, so
+keyword scans never pull a large file fully into memory.
 
 ## Memory
 
@@ -121,8 +128,30 @@ Storage behavior:
   compression artifacts.
 - Empty indexes are rebuilt automatically when useful.
 
+Ingestion has **no file-size limit** — handling a project of any size is the whole
+point of the vector store. It stays memory-safe by reading proportionally, not by
+excluding files:
+
+- files up to `_FULL_READ_BYTES` (4 MB) are read whole and chunked normally
+  (symbol-centric plus fallback windows);
+- larger files are **seek-sampled** by `_sampled_big_file_chunks`: only a small
+  window is read at each of ~80 evenly-spaced byte offsets, so a file of any size
+  is represented across its whole length while peak memory stays at roughly
+  `chunks × window` (e.g. a 30 MB `.jsonl` ingests with well under 1 MB of RAM);
+- `_fallback_semantic_chunks` caps windows per file (default 80, evenly sampled)
+  so one large data file cannot dominate the knowledge base.
+
+Retrieval is auditable: the pre-planner `knowledge_get` writes a structured record
+to the session log (each retrieved chunk's source path, symbol, line range, scores,
+and a snippet) and prints a compact source-file list to the CLI/TUI next to the
+`read_file` lines.
+
 The knowledge layer is intentionally optional. Failure to build or query it
 should degrade the answer, not crash the run.
+
+> Note: the knowledge base only rebuilds automatically when it is empty. After
+> adding files (or changing these size rules), force a fresh build with
+> `/knowledge rebuild force` so existing projects pick up the new chunks.
 
 ## Model Calls And Compression
 

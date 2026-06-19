@@ -40,7 +40,11 @@ search result becomes structured evidence or a structured observation.
 
 The search layer ignores heavy and generated directories, including `.git`,
 `.kratos`, `.claude`, `node_modules`, virtualenvs, build output, cache folders,
-and model directories. It skips binary files and very large files.
+and model directories. It skips binary files. Note that interactive content
+search (`### SEARCH` / `### GREP`) still skips files larger than ~2 MB to stay
+responsive — but those files are not invisible: the indexer and the knowledge
+base ingest files of any size (large ones are seek-sampled), so big data files
+remain listed, retrievable via `knowledge_get`, and readable with `### READ_RANGE`.
 
 `glob_files` accepts a single glob or several OR-ed patterns separated by commas
 or pipes, mirroring ripgrep's repeated `-g` filters and PowerShell's

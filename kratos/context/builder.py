@@ -81,7 +81,11 @@ class ContextBuilder:
         if entry.content is not None:
             return
         try:
-            raw = entry.path.read_text(encoding="utf-8", errors="replace")
+            # Bounded read: the index may contain arbitrarily large files now, so
+            # read at most _MAX_FILE_BYTES (+1 to detect overflow) instead of
+            # pulling the whole file into memory and truncating afterwards.
+            with entry.path.open("r", encoding="utf-8", errors="replace") as fh:
+                raw = fh.read(_MAX_FILE_BYTES + 1)
             if len(raw) > _MAX_FILE_BYTES:
                 raw = raw[:_MAX_FILE_BYTES] + "\n... (truncated)"
             entry.content = raw

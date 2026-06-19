@@ -203,6 +203,18 @@ Kratos keeps several local, project-scoped stores:
 The knowledge index uses LanceDB when installed. If LanceDB is unavailable,
 Kratos falls back to a JSON index and still runs.
 
+There is no file-size limit on indexing or knowledge ingestion — handling a
+project of any size is the point of the vector store. It stays memory-safe by
+reading proportionally rather than excluding files: files up to 4 MB are read and
+chunked in full, while larger files are seek-sampled (only ~80 small windows at
+evenly-spaced offsets are read), so even a multi-GB `.jsonl` is indexed and
+retrievable with peak memory in the low hundreds of KB. The pre-planner retrieval
+also records which sources/chunks it pulled — to the session log in full and as a
+compact source list in the CLI — so the vector-DB step is auditable.
+
+The knowledge base rebuilds automatically only when empty; after adding files,
+force a refresh with `/knowledge rebuild force`.
+
 ## Safety
 
 All command and file-write surfaces call `kratos/safety.py`. The guard blocks

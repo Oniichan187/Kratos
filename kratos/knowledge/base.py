@@ -57,6 +57,12 @@ from ..config import KratosConfig, _project_dir
 from ..memory import MemoryManager
 from ..llm.tokens import estimate  # rough token helper for budgets
 
+# Files up to this size are read whole and chunked normally. Larger files are
+# NOT skipped — they are seek-sampled (a few KB per window) so a file of any size
+# is ingested without being loaded into memory. There is deliberately no upper
+# size limit on what the knowledge base will ingest.
+_FULL_READ_BYTES = 4_000_000   # 4 MB
+
 
 @dataclass
 class RetrievedChunk:
@@ -363,11 +369,36 @@ class ProjectKnowledge:
             except Exception:
                 continue
 
-            # Skip huge binaries / generated
             try:
-                if path.stat().st_size > 200_000:
-                    continue
+                size = path.stat().st_size
             except Exception:
+                continue
+
+            # No size cap — handling projects of ANY size is exactly what the
+            # vector DB is for. But stay memory-safe: files up to _FULL_READ_BYTES
+            # are read whole and chunked normally; bigger files are represented by
+            # evenly-spaced windows read via seek (a few KB each), so a file of any
+            # size is ingested across its whole length without loading it into RAM.
+            if size > _FULL_READ_BYTES:
+                for fc in self._sampled_big_file_chunks(path, max_chunks=80):
+                    cid = f"{rel}:bytes:{fc['offset']}"
+                    if cid in seen:
+                        continue
+                    seen.add(cid)
+                    records.append(
+                        _ChunkRecord(
+                            id=cid,
+                            rel_path=rel,
+                            symbol=None,
+                            kind="chunk",
+                            start_line=None,
+                            end_line=None,
+                            text=fc["text"],
+                            summary="",
+                            mtime=mtime,
+                            metadata={"priority": self._priority_for(rel), "sampled": True},
+                        )
+                    )
                 continue
 
             try:
@@ -397,9 +428,11 @@ class ProjectKnowledge:
                     )
                 )
 
-            # Fallback / additional semantic chunks for non-code or large files
+            # Fallback / additional semantic chunks for non-code or large files.
+            # Bound per-file windows so a multi-MB data file can't dominate the KB;
+            # the sampler spreads them across the whole file.
             if not sym_chunks or len(text) > 4000:
-                for fc in self._fallback_semantic_chunks(rel, text):
+                for fc in self._fallback_semantic_chunks(rel, text, max_chunks=80):
                     cid = f"{rel}:chunk:{fc['start']}"
                     if cid in seen:
                         continue
@@ -513,25 +546,84 @@ class ProjectKnowledge:
                     break  # next line
         return chunks
 
-    def _fallback_semantic_chunks(self, rel_path: str, text: str) -> list[dict]:
-        """Overlapping chunks for files without clear symbols or that are very long."""
+    def _fallback_semantic_chunks(self, rel_path: str, text: str,
+                                  max_chunks: int = 0) -> list[dict]:
+        """Overlapping chunks for files without clear symbols or that are very long.
+
+        ``max_chunks`` bounds the number of windows produced for one file. When a
+        file would yield more windows than that (e.g. a multi-MB ``.jsonl`` log),
+        the windows are sampled evenly across the WHOLE file instead of taking
+        only the head, so the data is represented end-to-end without exploding the
+        knowledge base. ``0`` means unbounded (original behavior)."""
         chunks = []
         lines = text.splitlines(keepends=True)
         if not lines:
             return chunks
         size = 35
         overlap = 8
-        for start in range(0, len(lines), size - overlap):
+        starts = list(range(0, len(lines), size - overlap))
+        if max_chunks and len(starts) > max_chunks:
+            if max_chunks >= 2:
+                sampled = {
+                    starts[(i * (len(starts) - 1)) // (max_chunks - 1)]
+                    for i in range(max_chunks)
+                }
+                starts = sorted(sampled)
+            else:
+                starts = starts[:1]
+        for start in starts:
             end = min(len(lines), start + size)
             chunk_text = "".join(lines[start:end]).rstrip()
-            chunks.append({
-                "start": start + 1,
-                "end": end,
-                "text": chunk_text,
-            })
-            if end >= len(lines):
-                break
+            if chunk_text:
+                chunks.append({
+                    "start": start + 1,
+                    "end": end,
+                    "text": chunk_text,
+                })
         return chunks
+
+    def _sampled_big_file_chunks(self, path: Path, max_chunks: int = 80,
+                                 window_bytes: int = 4096) -> list[dict]:
+        """Memory-safe representative chunks for an arbitrarily large file.
+
+        Only small windows at evenly-spaced byte offsets are read (never the whole
+        file), so a file of ANY size — a multi-GB ``.jsonl`` log included — is
+        represented across its entire length while peak memory stays at roughly
+        ``max_chunks * window_bytes``. Returns ``[{"offset": int, "text": str}]``."""
+        out: list[dict] = []
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return out
+        if size <= 0:
+            return out
+        n = max(1, max_chunks)
+        seen: set[str] = set()
+        try:
+            with path.open("rb") as fh:
+                for i in range(n):
+                    offset = (size * i) // n
+                    fh.seek(offset)
+                    if offset > 0:
+                        fh.readline()  # discard partial line → align to a line start
+                    raw = fh.read(window_bytes)
+                    if not raw:
+                        continue
+                    block = raw.decode("utf-8", errors="replace")
+                    lines = block.splitlines()
+                    if len(lines) > 1:
+                        lines = lines[:-1]   # drop trailing partial line
+                    chunk_text = "\n".join(lines).strip()
+                    if not chunk_text:
+                        continue
+                    key = chunk_text[:160]
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append({"offset": offset, "text": chunk_text})
+        except OSError:
+            return out
+        return out
 
     def _priority_for(self, rel_path: str) -> int:
         # Lightweight reuse of the spirit of the old rules (from context/indexer.py)
